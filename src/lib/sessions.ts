@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { query, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { InputChannel, makeUserMessage } from "./input-channel";
-import { getProject, getTask, taskDir, WORKSPACE_ROOT, listProjects, projectDir } from "./fs";
+import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir } from "./fs";
 import { buildCommentsMcp } from "./comments-mcp";
 import { buildSessionMcp } from "./session-mcp";
 import { buildPlanningMcp, PLANNING_SYSTEM_PROMPT } from "./planning-mcp";
@@ -22,7 +22,7 @@ async function buildContextSystemPrompt(
 
   // Read project.md
   try {
-    const projectMdPath = path.join(WORKSPACE_ROOT, `wip-${projectSlug}`, "files", "project.md");
+    const projectMdPath = path.join(PROJECTS_DIR, `wip-${projectSlug}`, "files", "project.md");
     const projectContent = await fs.readFile(projectMdPath, "utf8");
     if (projectContent.trim()) {
       parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
@@ -30,7 +30,7 @@ async function buildContextSystemPrompt(
   } catch {
     // Try done- prefix
     try {
-      const projectMdPath = path.join(WORKSPACE_ROOT, `done-${projectSlug}`, "files", "project.md");
+      const projectMdPath = path.join(PROJECTS_DIR, `done-${projectSlug}`, "files", "project.md");
       const projectContent = await fs.readFile(projectMdPath, "utf8");
       if (projectContent.trim()) {
         parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
@@ -45,7 +45,7 @@ async function buildContextSystemPrompt(
       if (project) {
         const task = project.tasks.find((t) => t.slug === taskSlug);
         if (task) {
-          const taskMdPath = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "files", "task.md");
+          const taskMdPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "files", "task.md");
           const taskContent = await fs.readFile(taskMdPath, "utf8");
           if (taskContent.trim()) {
             parts.push(`<task-context>\n# Task: ${taskSlug}\n\n${taskContent.trim()}\n</task-context>`);
@@ -199,11 +199,11 @@ export async function renameLiveSession(id: string, newName: string): Promise<bo
     if (project) {
       let sessionDir: string;
       if (!s.taskSlug) {
-        sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", id);
+        sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
       } else {
         const task = project.tasks.find((t) => t.slug === s.taskSlug);
         if (task) {
-          sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", id);
+          sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
         } else {
           return true; // In-memory update succeeded, disk update not possible
         }
@@ -278,8 +278,8 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
 }
 
 // Walk workspace for session folders so they persist across restarts.
-// Includes project-level sessions (`tasks/<project>/sessions/`) and
-// task-level sessions (`tasks/<project>/<task>/sessions/`).
+// Includes project-level sessions (`projects/<project>/sessions/`) and
+// task-level sessions (`projects/<project>/<task>/sessions/`).
 export async function listAllSessions(): Promise<SessionSummary[]> {
   const live = listLiveSessions();
   const liveIds = new Set(live.map((s) => s.id));
@@ -289,12 +289,12 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
   for (const p of projects) {
     // Project-level sessions
     out.push(...await discoverFromDir(
-      path.join(WORKSPACE_ROOT, p.folderName, "sessions"),
+      path.join(PROJECTS_DIR, p.folderName, "sessions"),
       p.slug, "", liveIds,
     ));
     for (const t of p.tasks) {
       out.push(...await discoverFromDir(
-        path.join(WORKSPACE_ROOT, p.folderName, t.folderName, "sessions"),
+        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
         p.slug, t.slug, liveIds,
       ));
     }
@@ -316,11 +316,11 @@ export async function readSessionHistory(
   if (!project) return null;
   let file: string;
   if (!taskSlug) {
-    file = path.join(WORKSPACE_ROOT, project.folderName, "sessions", id, "events.jsonl");
+    file = path.join(PROJECTS_DIR, project.folderName, "sessions", id, "events.jsonl");
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return null;
-    file = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", id, "events.jsonl");
+    file = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id, "events.jsonl");
   }
   try {
     const raw = await fs.readFile(file, "utf8");
@@ -348,13 +348,13 @@ export async function restoreSession(
   let sessionDir: string;
   let cwd: string;
   if (!taskSlug) {
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", id);
-    cwd = path.join(WORKSPACE_ROOT, project.folderName);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
+    cwd = path.join(PROJECTS_DIR, project.folderName);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return null;
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", id);
-    cwd = path.join(WORKSPACE_ROOT, project.folderName, task.folderName);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
+    cwd = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   }
 
   // Read meta.json
@@ -472,6 +472,10 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     prompt: input,
     options: {
       cwd,
+      // Grant access to the whole workspace root so agents can read shared
+      // resources (CLAUDE.md, skills/, scripts/, etc.) while keeping their
+      // cwd at the task folder where outputs naturally land.
+      additionalDirectories: [WORKSPACE_ROOT],
       // Localhost personal use — full trust by default. We still listen for
       // end_turn to flip awaiting_input.
       permissionMode: p.permissionMode ?? "bypassPermissions",
@@ -548,11 +552,11 @@ async function persistSdkSessionId(s: RuntimeSession): Promise<void> {
 
     let sessionDir: string;
     if (!s.taskSlug) {
-      sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", s.id);
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
     } else {
       const task = project.tasks.find((t) => t.slug === s.taskSlug);
       if (!task) return;
-      sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", s.id);
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
     }
 
     const metaPath = path.join(sessionDir, "meta.json");
@@ -666,7 +670,7 @@ export function relocateSessionsForTask(
 
 // Promote an ephemeral planning session into the project that was just
 // created from its proposal. We write the conversation history that's been
-// accumulating in memory out to `tasks/<project>/sessions/<id>/`, redirect
+// accumulating in memory out to `projects/<project>/sessions/<id>/`, redirect
 // the session's log streams there for any further events, and re-key the
 // in-memory entry so the project's sessions list picks it up.
 export async function adoptSessionToProject(id: string, projectSlug: string): Promise<boolean> {
@@ -675,7 +679,7 @@ export async function adoptSessionToProject(id: string, projectSlug: string): Pr
   const project = await getProject(projectSlug);
   if (!project) return false;
 
-  const newCwd = path.join(WORKSPACE_ROOT, project.folderName);
+  const newCwd = path.join(PROJECTS_DIR, project.folderName);
   const sessionDir = path.join(newCwd, "sessions", id);
   await fs.mkdir(sessionDir, { recursive: true });
 
@@ -737,7 +741,7 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
 }
 
 // Project-level session — cwd is the project folder, sessions persist to
-// `tasks/<project>/sessions/<id>/`. Uses the same on-disk layout as task
+// `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
 // sessions but at one level up.
 export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string }): Promise<RuntimeSession> {
   const project = await getProject(p.projectSlug);
@@ -745,7 +749,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
 
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}--${randomUUID().slice(0, 6)}`;
   const name = generateSessionLabel(p.firstMessage);
-  const cwd = path.join(WORKSPACE_ROOT, project.folderName);
+  const cwd = path.join(PROJECTS_DIR, project.folderName);
   const sessionDir = path.join(cwd, "sessions", id);
   await fs.mkdir(sessionDir, { recursive: true });
 
@@ -782,6 +786,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     prompt: input,
     options: {
       cwd,
+      additionalDirectories: [WORKSPACE_ROOT],
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       mcpServers: {
@@ -827,10 +832,10 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
 export async function startPlanningSession(firstMessage: string): Promise<RuntimeSession> {
   const id = `plan-${randomUUID().slice(0, 8)}`;
   const name = generateSessionLabel(firstMessage);
-  // cwd = repo root (one above WORKSPACE_ROOT) so the agent can read both
-  // CLAUDE.md (for workspace conventions) and walk `tasks/` to discover what
-  // projects already exist before proposing a new one.
-  const cwd = path.resolve(WORKSPACE_ROOT, "..");
+  // Planning sessions run at the workspace root so the agent can read shared
+  // resources (CLAUDE.md, skills/, scripts/, etc.) and walk `projects/` to
+  // discover what already exists before proposing a new project.
+  const cwd = WORKSPACE_ROOT;
   const input = new InputChannel();
   const events = new EventEmitter();
   events.setMaxListeners(0);
@@ -926,11 +931,11 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
 
     let sessionDir: string;
     if (!s.taskSlug) {
-      sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", s.id);
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
     } else {
       const task = project.tasks.find((t) => t.slug === s.taskSlug);
       if (!task) throw new Error("Task not found");
-      sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", s.id);
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
     }
 
     // Re-create log streams
@@ -949,6 +954,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
       prompt: s.input,
       options: {
         cwd: s.cwd,
+        additionalDirectories: [WORKSPACE_ROOT],
         resume: s.sdkSessionId,
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
@@ -1033,11 +1039,11 @@ export async function markSessionSeen(
   let sessionDir: string;
   if (!taskSlug) {
     // Project-level session
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return false;
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
   }
 
   const metaPath = path.join(sessionDir, "meta.json");
@@ -1073,11 +1079,11 @@ export async function renameSession(
 
   let sessionDir: string;
   if (!taskSlug) {
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return false;
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
   }
 
   const metaPath = path.join(sessionDir, "meta.json");
@@ -1107,11 +1113,11 @@ export async function deleteSession(
 
   let sessionDir: string;
   if (!taskSlug) {
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return false;
-    sessionDir = path.join(WORKSPACE_ROOT, project.folderName, task.folderName, "sessions", sessionId);
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
   }
 
   try {

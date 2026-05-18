@@ -39,13 +39,13 @@ export const PLANNING_SYSTEM_PROMPT = `You are helping the user set up a new pro
 
 A project is a folder of related work. Each project contains tasks. Each task is a coherent piece of work an AI agent can help with later.
 
-The workspace structure and conventions are documented in the repo's CLAUDE.md — read it if you haven't already. The folder names under \`tasks/\` are the source of truth for what projects and tasks exist (there is no separate index).
+The workspace structure and conventions are documented in the repo's CLAUDE.md — read it if you haven't already. The folder names under \`projects/\` are the source of truth for what projects and tasks exist (there is no separate index).
 
 **Naming convention**: project and task names are **human-readable, with proper case and spaces** — they are the literal folder names. Use "House Sale" not "house-sale". Use "Buy in Paris" not "buy-in-paris". Capitalize like a title (keep articles/prepositions lowercase mid-name). Keep names short (2-4 words).
 
 Before proposing anything:
-- Run \`ls tasks/\` to see existing projects.
-- For any that look related to what the user wants, read \`cat tasks/<project-folder>/files/project.md\` and skim \`ls tasks/<project-folder>/\` to understand them.
+- Run \`ls projects/\` to see existing projects.
+- For any that look related to what the user wants, read \`cat projects/<project-folder>/files/project.md\` and skim \`ls projects/<project-folder>/\` to understand them.
 - Avoid name collisions and avoid creating a new project for something that fits naturally under an existing one (in which case, tell the user and suggest they add tasks there instead).
 
 Your job:

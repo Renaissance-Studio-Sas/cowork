@@ -3,13 +3,22 @@ import path from "node:path";
 import matter from "gray-matter";
 import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
 
-// Workspace root: directory holding `wip-<project>/` and `done-<project>/` folders.
-// Set WORKSPACE_ROOT in `.env` to point at any directory; defaults to `../../tasks`
+// Workspace root: the user's own repo / folder that contains `projects/` plus any
+// shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get read/write
+// access to this whole tree via `additionalDirectories` so they can pull in
+// context from anywhere in the repo.
+//
+// Set WORKSPACE_ROOT in `.env` to point at any directory; defaults to `../..`
 // relative to cwd (the legacy layout where this app lived inside a monorepo).
-// Convention: <root>/<project>/<task>/{files,sessions,task.md}
 export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
   ? path.resolve(process.env.WORKSPACE_ROOT)
-  : path.resolve(process.cwd(), "..", "..", "tasks");
+  : path.resolve(process.cwd(), "..", "..");
+
+// Directory holding `wip-<project>/` and `done-<project>/` folders. Lives
+// inside the workspace root so the rest of the repo can host CLAUDE.md and
+// other shared files.
+// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,sessions,task.md}
+export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, "projects");
 
 export type Status = "wip" | "done";
 
@@ -76,18 +85,18 @@ async function writeMarkdown(filePath: string, description: string, fm: Frontmat
 }
 
 export async function ensureWorkspace(): Promise<void> {
-  await fs.mkdir(WORKSPACE_ROOT, { recursive: true });
+  await fs.mkdir(PROJECTS_DIR, { recursive: true });
   // Bootstrap a default `wip-todo/` catch-all ONLY when the workspace has no
   // projects at all (fresh install). Once the user has any project, we never
   // auto-create — they're free to rename, delete, or replace the catch-all.
   let hasAnyProject = false;
   try {
-    const entries = await fs.readdir(WORKSPACE_ROOT, { withFileTypes: true });
+    const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
     hasAnyProject = entries.some((e) => e.isDirectory() && /^(wip|done)-/.test(e.name));
   } catch { /* empty or missing — treat as no projects */ }
   if (hasAnyProject) return;
 
-  const todoPath = path.join(WORKSPACE_ROOT, "wip-todo");
+  const todoPath = path.join(PROJECTS_DIR, "wip-todo");
   await fs.mkdir(path.join(todoPath, "files"), { recursive: true });
   await writeMarkdown(
     path.join(todoPath, "files", "project.md"),
@@ -98,13 +107,13 @@ export async function ensureWorkspace(): Promise<void> {
 
 export async function listProjects(): Promise<Project[]> {
   await ensureWorkspace();
-  const entries = await fs.readdir(WORKSPACE_ROOT, { withFileTypes: true });
+  const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
   const projects: Project[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
     const parsed = parsePrefixed(e.name);
     if (!parsed) continue;
-    const projectDir = path.join(WORKSPACE_ROOT, e.name);
+    const projectDir = path.join(PROJECTS_DIR, e.name);
     // project.md lives inside files/ so it shows up as a regular artifact
     // (same convention as task.md). Fall back to the legacy root location.
     let parsed_md = await readMarkdown(path.join(projectDir, "files", "project.md"));
@@ -130,7 +139,7 @@ export async function listProjects(): Promise<Project[]> {
 }
 
 async function listTasks(projectFolder: string): Promise<Task[]> {
-  const projectDir = path.join(WORKSPACE_ROOT, projectFolder);
+  const projectDir = path.join(PROJECTS_DIR, projectFolder);
   const projectSlug = parsePrefixed(projectFolder)!.slug;
   const out: Task[] = [];
   let entries: import("node:fs").Dirent[];
@@ -174,17 +183,17 @@ export async function getTask(projectSlug: string, taskSlug: string): Promise<Ta
 }
 
 export function projectDir(project: Project): string {
-  return path.join(WORKSPACE_ROOT, project.folderName);
+  return path.join(PROJECTS_DIR, project.folderName);
 }
 export function taskDir(project: Project, task: Task): string {
-  return path.join(WORKSPACE_ROOT, project.folderName, task.folderName);
+  return path.join(PROJECTS_DIR, project.folderName, task.folderName);
 }
 
 export async function createProject(slug: string, description = ""): Promise<Project> {
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
   const folder = `wip-${clean}`;
-  const dir = path.join(WORKSPACE_ROOT, folder);
+  const dir = path.join(PROJECTS_DIR, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
   await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
   await writeMarkdown(path.join(dir, "files", "project.md"), description, {
@@ -200,7 +209,7 @@ export async function createTask(projectSlug: string, slug: string, description 
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
   const folder = `wip-${clean}`;
-  const dir = path.join(WORKSPACE_ROOT, project.folderName, folder);
+  const dir = path.join(PROJECTS_DIR, project.folderName, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
   await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
   await writeMarkdown(path.join(dir, "files", "task.md"), description, {
@@ -216,8 +225,8 @@ export async function setProjectStatus(slug: string, status: Status): Promise<vo
   if (project.status === status) return;
   const newFolder = `${status}-${slug}`;
   await fs.rename(
-    path.join(WORKSPACE_ROOT, project.folderName),
-    path.join(WORKSPACE_ROOT, newFolder),
+    path.join(PROJECTS_DIR, project.folderName),
+    path.join(PROJECTS_DIR, newFolder),
   );
 }
 
@@ -231,8 +240,8 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
   if (existing) throw new Error(`project "${clean}" already exists`);
   const newFolder = `${project.status}-${clean}`;
   await fs.rename(
-    path.join(WORKSPACE_ROOT, project.folderName),
-    path.join(WORKSPACE_ROOT, newFolder),
+    path.join(PROJECTS_DIR, project.folderName),
+    path.join(PROJECTS_DIR, newFolder),
   );
   relocateSessionsForProject(slug, clean);
 }
@@ -240,14 +249,14 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
 export async function deleteProject(slug: string): Promise<void> {
   const project = await getProject(slug);
   if (!project) throw new Error(`unknown project ${slug}`);
-  await fs.rm(path.join(WORKSPACE_ROOT, project.folderName), { recursive: true, force: true });
+  await fs.rm(path.join(PROJECTS_DIR, project.folderName), { recursive: true, force: true });
 }
 
 export async function deleteTask(projectSlug: string, taskSlug: string): Promise<void> {
   const project = await getProject(projectSlug);
   const task = project?.tasks.find((t) => t.slug === taskSlug);
   if (!project || !task) throw new Error("not found");
-  await fs.rm(path.join(WORKSPACE_ROOT, project.folderName, task.folderName), { recursive: true, force: true });
+  await fs.rm(path.join(PROJECTS_DIR, project.folderName, task.folderName), { recursive: true, force: true });
 }
 
 export async function setTaskStatus(projectSlug: string, taskSlug: string, status: Status): Promise<void> {
@@ -257,8 +266,8 @@ export async function setTaskStatus(projectSlug: string, taskSlug: string, statu
   if (task.status === status) return;
   const newFolder = `${status}-${taskSlug}`;
   await fs.rename(
-    path.join(WORKSPACE_ROOT, project.folderName, task.folderName),
-    path.join(WORKSPACE_ROOT, project.folderName, newFolder),
+    path.join(PROJECTS_DIR, project.folderName, task.folderName),
+    path.join(PROJECTS_DIR, project.folderName, newFolder),
   );
 }
 
@@ -277,8 +286,8 @@ export async function moveTask(projectSlug: string, taskSlug: string, toProjectS
   }
   const newFolder = `${task.status}-${finalSlug}`;
   await fs.rename(
-    path.join(WORKSPACE_ROOT, project.folderName, task.folderName),
-    path.join(WORKSPACE_ROOT, dest.folderName, newFolder),
+    path.join(PROJECTS_DIR, project.folderName, task.folderName),
+    path.join(PROJECTS_DIR, dest.folderName, newFolder),
   );
   relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
   return { project: toProjectSlug, task: finalSlug };
@@ -295,8 +304,8 @@ export async function renameTask(projectSlug: string, taskSlug: string, newSlug:
   if (collision) throw new Error(`task "${clean}" already exists`);
   const newFolder = `${task.status}-${clean}`;
   await fs.rename(
-    path.join(WORKSPACE_ROOT, project.folderName, task.folderName),
-    path.join(WORKSPACE_ROOT, project.folderName, newFolder),
+    path.join(PROJECTS_DIR, project.folderName, task.folderName),
+    path.join(PROJECTS_DIR, project.folderName, newFolder),
   );
   relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
 }
@@ -349,7 +358,7 @@ export async function writeFileText(projectSlug: string, taskSlug: string, rel: 
 
 // ---------------------------------------------------------------------------
 // Project-level files (artifacts attached to the project itself, distinct
-// from any one task). They live in `tasks/<project>/files/`.
+// from any one task). They live in `projects/<project>/files/`.
 // ---------------------------------------------------------------------------
 
 export async function listProjectFiles(projectSlug: string): Promise<string[]> {
