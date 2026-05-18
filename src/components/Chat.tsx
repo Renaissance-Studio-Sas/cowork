@@ -320,37 +320,31 @@ export function Chat({ session, onChange, onBack }: Props) {
   );
 }
 
-// Composer for past sessions: spawn a fresh live session in the same task and
-// seed it with a brief recap of the prior conversation so the agent has
-// context to continue from.
-function ContinueComposer({ session, messages }: { session: SessionSummaryDTO; messages: SDKMessageLite[] }) {
+// Composer for past sessions: resume the existing session via the SDK resume
+// mechanism, which preserves full conversation context natively.
+function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: SDKMessageLite[] }) {
   const router = useRouter();
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const start = async () => {
+  const resume = async () => {
     if (!draft.trim() || busy) return;
     setBusy(true);
     try {
-      const recap = buildRecap(messages);
-      const fullMessage =
-        `Continuing a prior conversation${recap ? `:\n\n${recap}\n\n` : ". "}` +
-        `My next message:\n\n${draft.trim()}`;
-      const isProjectScope = !session.taskSlug;
-      const url = isProjectScope
-        ? `/api/projects/${encodeURIComponent(session.projectSlug)}/sessions`
-        : `/api/projects/${encodeURIComponent(session.projectSlug)}/tasks/${encodeURIComponent(session.taskSlug)}/sessions`;
-      const r = await fetch(url, {
+      // Send to the existing session's input endpoint — this will resume it via SDK
+      const r = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: fullMessage }),
+        body: JSON.stringify({
+          message: draft.trim(),
+          projectSlug: session.projectSlug,
+          taskSlug: session.taskSlug,
+        }),
       });
       const j = await r.json();
-      if (!j.id) { alert(j.error ?? "failed to start"); return; }
-      const route = isProjectScope
-        ? projectSessionRoute(session.projectSlug, j.id)
-        : taskSessionRoute(session.projectSlug, session.taskSlug, j.id);
-      router.push(route);
+      if (!j.ok) { alert(j.error ?? "failed to resume"); return; }
+      // Refresh the page to reconnect to SSE stream
+      router.refresh();
       setDraft("");
     } finally {
       setBusy(false);
@@ -360,13 +354,13 @@ function ContinueComposer({ session, messages }: { session: SessionSummaryDTO; m
   return (
     <div className="space-y-2">
       <div className="text-[11.5px] text-[var(--muted)] px-1">
-        This is a past conversation. Sending will spawn a fresh live session in the same task, seeded with a recap of this chat so the agent can pick up where it left off.
+        This session is paused. Sending a message will resume it with full conversation context.
       </div>
       <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
         <textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="Continue the conversation in a new live session…"
+          placeholder="Continue the conversation…"
           rows={2}
           style={{ maxHeight: 200 }}
           onInput={(e) => {
@@ -374,44 +368,18 @@ function ContinueComposer({ session, messages }: { session: SessionSummaryDTO; m
             el.style.height = "auto";
             el.style.height = Math.min(el.scrollHeight, 200) + "px";
           }}
-          onKeyDown={(e) => handleComposerEnter(e, start)}
+          onKeyDown={(e) => handleComposerEnter(e, resume)}
           className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
         />
         <button
-          onClick={start}
+          onClick={resume}
           disabled={!draft.trim() || busy}
           className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-          title="Continue in a new session (↵)"
+          title="Resume session (↵)"
         >↑</button>
       </div>
     </div>
   );
-}
-
-// Build a short, structural recap of the past conversation for the new agent
-// to read. We cap the size so we don't blow the context window.
-function buildRecap(messages: SDKMessageLite[]): string {
-  const MAX = 6000; // chars
-  const parts: string[] = [];
-  for (const m of messages) {
-    const t = (m as { type?: string }).type;
-    if (t === "user") {
-      const text = extractText((m as { message?: { content?: unknown } }).message?.content).trim();
-      if (text) parts.push(`User: ${text}`);
-    } else if (t === "assistant") {
-      const content = ((m as { message?: { content?: unknown[] } }).message?.content ?? []) as Array<{ type?: string; text?: string; name?: string }>;
-      const text = content.filter((p) => p.type === "text").map((p) => p.text ?? "").join("").trim();
-      const tools = content.filter((p) => p.type === "tool_use").map((p) => p.name).filter(Boolean);
-      const summary = [text, tools.length ? `(tools: ${tools.join(", ")})` : ""].filter(Boolean).join(" ");
-      if (summary) parts.push(`Assistant: ${summary}`);
-    }
-  }
-  let joined = parts.join("\n\n");
-  if (joined.length > MAX) {
-    // Keep tail (most recent) since it's most relevant.
-    joined = "…(truncated)…\n\n" + joined.slice(joined.length - MAX);
-  }
-  return joined;
 }
 
 // Flatten the message stream into render items, batching consecutive tool

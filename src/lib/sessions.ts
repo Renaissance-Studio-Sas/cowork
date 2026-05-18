@@ -484,6 +484,8 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id),
       },
+      // Enable Claude in Chrome integration for browser automation
+      extraArgs: { chrome: null },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -793,6 +795,8 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id),
       },
+      // Enable Claude in Chrome integration for browser automation
+      extraArgs: { chrome: null },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -853,6 +857,8 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       systemPrompt: { type: "preset", preset: "claude_code", append: PLANNING_SYSTEM_PROMPT },
       settingSources: ["project", "user"],
       mcpServers: { "workbench-planning": planningMcp },
+      // Enable Claude in Chrome integration for browser automation
+      extraArgs: { chrome: null },
     },
   });
 
@@ -962,6 +968,8 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
           "workbench-comments": commentsMcp,
           "workbench-session": buildSessionMcp(s.id),
         },
+        // Enable Claude in Chrome integration for browser automation
+        extraArgs: { chrome: null },
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },

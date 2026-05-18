@@ -7,7 +7,7 @@ import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { StatusChip } from "./StatusChip";
-import { projectRoute, taskRoute } from "@/lib/routes";
+import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute } from "@/lib/routes";
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
 
@@ -64,6 +64,16 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
       unread: list.filter((s) => s.unread).length,
     };
   };
+
+  // Check if a project has any unread sessions (across all its tasks)
+  const projectHasUnread = (projectSlug: string) => {
+    return sessions.some((s) => s.projectSlug === projectSlug && s.unread);
+  };
+
+  // Get the 10 most recent sessions sorted by lastActivity
+  const recentSessions = [...sessions]
+    .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
+    .slice(0, 10);
 
   const startRenameTask = (projectSlug: string, taskSlug: string) => {
     setRenaming({ kind: "task", project: projectSlug, task: taskSlug });
@@ -200,6 +210,24 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 pb-4">
+        {/* Recent Sessions */}
+        {recentSessions.length > 0 && (
+          <div className="mb-3">
+            <div className="px-2 py-1.5 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
+              Recent Sessions
+            </div>
+            <div className="space-y-0.5">
+              {recentSessions.map((s) => (
+                <RecentSessionRow key={s.id} session={s} selected={pathname.includes(`/session/${s.id}`)} />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Projects */}
+        <div className="px-2 py-1.5 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
+          Projects
+        </div>
         {visibleProjects.length === 0 && (
           <div className="px-3 py-4 text-[12.5px] text-[var(--muted)]">No projects yet.</div>
         )}
@@ -266,7 +294,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                 ) : (
                   <Link
                     href={projectRoute(p.slug)}
-                    className={`flex-1 text-left text-[12px] uppercase tracking-wider font-semibold truncate transition px-1 ${projectDone ? "text-[var(--muted)] line-through" : "text-[var(--text-soft)] hover:text-[var(--text)]"}`}
+                    className={`flex-1 text-left text-[12px] uppercase tracking-wider truncate transition px-1 ${projectDone ? "text-[var(--muted)] line-through font-semibold" : projectHasUnread(p.slug) ? "text-[var(--text)] font-bold" : "text-[var(--text-soft)] hover:text-[var(--text)] font-semibold"}`}
                     title={`Open project ${label}`}
                   >
                     {label}
@@ -366,7 +394,7 @@ function TaskRow({
       ) : (
         <div className="flex items-center gap-2" title={tooltip || undefined}>
           <StatusChip status={task.status} />
-          <span className={`text-[13.5px] truncate flex-1 ${task.status === "done" ? "text-[var(--muted)] line-through" : ""}`}>{task.slug}</span>
+          <span className={`text-[13.5px] truncate flex-1 ${task.status === "done" ? "text-[var(--muted)] line-through" : counts.unread > 0 ? "font-semibold" : ""}`}>{task.slug}</span>
           {counts.unread > 0 && (
             <span className="text-[9px] bg-[var(--accent)] text-[var(--accent-text)] font-semibold rounded px-1 py-0.5" title={`${counts.unread} unread`}>
               {counts.unread}
@@ -395,4 +423,61 @@ function parsePathname(pathname: string): { project?: string; task?: string } {
     };
   }
   return {};
+}
+
+function RecentSessionRow({ session, selected }: { session: SessionSummaryDTO; selected: boolean }) {
+  const href = session.taskSlug
+    ? taskSessionRoute(session.projectSlug, session.taskSlug, session.id)
+    : projectSessionRoute(session.projectSlug, session.id);
+
+  // Format relative time
+  const formatRelativeTime = (isoDate: string) => {
+    const date = new Date(isoDate);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return "just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+  };
+
+  const stateIcon = () => {
+    switch (session.state) {
+      case "running":
+        return <span className="text-[var(--accent)]" title="Running">●</span>;
+      case "awaiting_input":
+        return <span className="pulse text-[var(--warn)]" title="Awaiting input">●</span>;
+      case "error":
+        return <span className="text-red-500" title="Error">●</span>;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <Link
+      href={href}
+      className={`block w-full text-left rounded-lg px-3 py-1.5 transition cursor-pointer ${
+        selected ? "bg-[var(--panel-2)]" : "hover:bg-[var(--panel)]"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        {stateIcon()}
+        <span className={`text-[12.5px] truncate flex-1 ${session.unread ? "font-semibold" : "text-[var(--text-soft)]"}`}>
+          {session.title || "Untitled"}
+        </span>
+        {session.unread && (
+          <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" title="Unread" />
+        )}
+      </div>
+      <div className="text-[10.5px] text-[var(--muted)] truncate mt-0.5">
+        {session.taskSlug || session.projectSlug} · {formatRelativeTime(session.lastActivity)}
+      </div>
+    </Link>
+  );
 }
