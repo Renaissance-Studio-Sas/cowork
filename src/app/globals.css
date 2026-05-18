@@ -1,0 +1,90 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root {
+  --bg: #ffffff;
+  --bg-2: #f7f7f8;
+  --panel: #ffffff;
+  --panel-2: #ececef;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --text: #1a1a1f;
+  --text-soft: #3a3a45;
+  --muted: #6b6b78;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --accent-soft: rgba(37, 99, 235, 0.10);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.14);
+  --ok: #16a34a;
+  --user-bubble: #eaf0ff;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14.5px;
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+
+button { cursor: pointer; }
+
+.pulse {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+/* Working/thinking — used in agent stream */
+.dots::after {
+  content: "";
+  display: inline-block;
+  width: 1ch;
+  text-align: left;
+  animation: dots 1.4s steps(4, end) infinite;
+}
+@keyframes dots {
+  0%   { content: ""; }
+  25%  { content: "."; }
+  50%  { content: ".."; }
+  75%  { content: "..."; }
+  100% { content: ""; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, transparent, rgba(37, 99, 235, 0.18), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes shimmer {
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.22); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Inline comment highlights */
+mark[data-comment-id] {
+  background: var(--accent-soft);
+  color: inherit;
+  border-bottom: 1.5px solid var(--accent);
+  padding: 0 1px;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+mark[data-comment-id]:hover {
+  background: rgba(37, 99, 235, 0.20);
+}
+mark[data-comment-id].active {
+  background: rgba(37, 99, 235, 0.28);
+}

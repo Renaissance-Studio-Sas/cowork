@@ -1,0 +1,858 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+// rehype-raw intentionally omitted — see Chat.tsx for rationale.
+import {
+  captureSelectionAnchor,
+  clearHighlights,
+  locateAnchor,
+  wrapRangeInMarks,
+  type TextAnchor,
+} from "@/lib/comment-anchor";
+import { buildEnhancedHtml } from "@/lib/iframe-enhancer";
+import { resolveRelative } from "@/lib/relative-path";
+import { AgentPanel } from "./AgentPanel";
+import { ChatPanel } from "./ChatPanel";
+import { Resizer } from "./Resizer";
+import { handleComposerEnter } from "@/lib/composer";
+import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute } from "@/lib/routes";
+import { useWorkspace } from "@/lib/workspace-context";
+
+const CHAT_PANEL_WIDTH_KEY = "wb-chat-panel-width";
+const DEFAULT_CHAT_WIDTH = 380;
+const MIN_CHAT_WIDTH = 280;
+const MAX_CHAT_WIDTH = 600;
+
+interface Props {
+  projectSlug: string;
+  taskSlug: string;
+  filePath: string;
+  onBack: () => void;
+}
+
+interface CommentRow {
+  id: number;
+  body: string;
+  author: string;
+  createdAt: string | number;
+  resolvedAt: string | number | null;
+  anchorType: "md" | "html";
+  anchorData: Partial<TextAnchor> & { quote?: string };
+}
+
+interface ResolvedComment extends CommentRow {
+  anchor: TextAnchor | null;
+  resolved: { start: number; end: number } | null;
+  obsolete: boolean;
+}
+
+function extOf(p: string): string {
+  const i = p.lastIndexOf(".");
+  return i < 0 ? "" : p.slice(i + 1).toLowerCase();
+}
+
+const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+const TEXT_EXT = new Set(["md", "markdown", "txt", "json", "csv", "yaml", "yml", "log"]);
+
+export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
+  const router = useRouter();
+  const [text, setText] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [comments, setComments] = useState<CommentRow[]>([]);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [activeId, setActiveId] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+  const [pendingAnchor, setPendingAnchor] = useState<TextAnchor | null>(null);
+  const [popover, setPopover] = useState<{ x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  // For HTML files, the iframe tells us which comments it could anchor.
+  const [htmlObsoleteIds, setHtmlObsoleteIds] = useState<Set<number>>(new Set());
+  // Chat panel state
+  const [chatPanelOpen, setChatPanelOpen] = useState(false);
+  const [chatPanelWidth, setChatPanelWidth] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_CHAT_WIDTH;
+    const stored = localStorage.getItem(CHAT_PANEL_WIDTH_KEY);
+    return stored ? parseInt(stored, 10) : DEFAULT_CHAT_WIDTH;
+  });
+  const contentRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
+  const ext = extOf(filePath);
+  const isImage = IMAGE_EXT.has(ext);
+  const isPdf = ext === "pdf";
+  const isHtml = ext === "html" || ext === "htm";
+  const isMd = ext === "md" || ext === "markdown";
+  const isText = TEXT_EXT.has(ext);
+  const supportsComments = isMd || isHtml;
+  const rawUrl = `/api/files/raw?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`;
+
+  const { sessions } = useWorkspace();
+
+  // --- Load file content --------------------------------------------------
+  const refreshFile = useCallback(() => {
+    if (isImage || isPdf) return;
+    fetch(`/api/files?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`)
+      .then(async (r) => {
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? "failed");
+        setText(j.content ?? "");
+      })
+      .catch((e) => setError(String(e)));
+  }, [projectSlug, taskSlug, filePath, isImage, isPdf]);
+
+  useEffect(() => {
+    setText(null);
+    setError(null);
+    refreshFile();
+  }, [refreshFile]);
+
+  // --- Comments fetch -----------------------------------------------------
+  const refreshComments = useCallback(async () => {
+    if (!supportsComments) return;
+    const r = await fetch(`/api/comments?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`);
+    const j = await r.json();
+    setComments(j.comments ?? []);
+  }, [projectSlug, taskSlug, filePath, supportsComments]);
+
+  // --- Auto-refresh when an agent modifies this file ----------------------
+  // Subscribe to SSE streams from any live sessions in this project/task.
+  // When a file_changed event matches our filePath, refresh the content.
+  useEffect(() => {
+    const liveSessions = sessions.filter(
+      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && s.isLive
+    );
+    if (liveSessions.length === 0) return;
+
+    const eventSources: EventSource[] = [];
+    for (const sess of liveSessions) {
+      const es = new EventSource(`/api/sessions/${sess.id}/stream`);
+      es.addEventListener("file_changed", (ev) => {
+        try {
+          const data = JSON.parse((ev as MessageEvent).data) as { path?: string };
+          // Compare paths: the event path is absolute from SDK, filePath is relative
+          // Check if the event path ends with our filePath
+          if (data.path && (data.path === filePath || data.path.endsWith(`/${filePath}`))) {
+            refreshFile();
+            refreshComments();
+          }
+        } catch { /* ignore parse errors */ }
+      });
+      eventSources.push(es);
+    }
+
+    return () => {
+      for (const es of eventSources) es.close();
+    };
+  }, [sessions, projectSlug, taskSlug, filePath, refreshFile, refreshComments]);
+
+  useEffect(() => {
+    refreshComments();
+    setDraft("");
+    setPendingAnchor(null);
+    setPopover(null);
+    setContextMenu(null);
+    setActiveId(null);
+    setHtmlObsoleteIds(new Set());
+  }, [projectSlug, taskSlug, filePath, refreshComments]);
+
+  // --- Markdown: resolve anchors against the visible DOM text ------------
+  const [renderTick, setRenderTick] = useState(0);
+  useEffect(() => { setRenderTick((t) => t + 1); }, [text]);
+
+  const resolvedComments = useMemo<ResolvedComment[]>(() => {
+    void renderTick;
+    if (isHtml) {
+      return comments.map((c) => {
+        const a = normalizeAnchor(c.anchorData);
+        // Doc-wide comments (no anchor) are never obsolete — they apply to
+        // the whole file regardless of edits.
+        if (!a) return { ...c, anchor: null, resolved: null, obsolete: false };
+        const obs = htmlObsoleteIds.has(c.id);
+        return { ...c, anchor: a, resolved: obs ? null : { start: 0, end: 0 }, obsolete: obs };
+      });
+    }
+    const root = contentRef.current;
+    const visible = root?.textContent ?? "";
+    return comments.map((c) => {
+      const a = normalizeAnchor(c.anchorData);
+      if (!a) return { ...c, anchor: null, resolved: null, obsolete: false };
+      const resolved = locateAnchor(visible, a);
+      return { ...c, anchor: a, resolved, obsolete: !resolved };
+    });
+  }, [comments, renderTick, isHtml, htmlObsoleteIds]);
+
+  // --- Markdown: highlight resolved comments in the DOM -------------------
+  useEffect(() => {
+    if (!isMd) return;
+    const root = contentRef.current;
+    if (!root) return;
+    clearHighlights(root);
+    const sorted = [...resolvedComments]
+      .filter((c) => c.resolved !== null && !c.obsolete)
+      .sort((a, b) => b.resolved!.start - a.resolved!.start);
+    for (const c of sorted) {
+      wrapRangeInMarks(root, c.resolved!.start, c.resolved!.end, c.id);
+    }
+  }, [resolvedComments, isMd]);
+
+  // --- Click on a markdown highlight → open panel and focus comment -------
+  useEffect(() => {
+    if (!isMd) return;
+    const root = contentRef.current;
+    if (!root) return;
+    const onClick = (e: Event) => {
+      const target = e.target as HTMLElement;
+      const mark = target.closest("mark[data-comment-id]") as HTMLElement | null;
+      if (!mark) return;
+      const id = Number(mark.dataset.commentId);
+      setActiveId(id);
+      setPanelOpen(true);
+    };
+    root.addEventListener("click", onClick);
+    return () => root.removeEventListener("click", onClick);
+  }, [text, isMd]);
+
+  // --- HTML iframe message bridge -----------------------------------------
+  const sendCommentsToIframe = useCallback(() => {
+    const iframe = iframeRef.current;
+    if (!iframe || !isHtml) return;
+    const payload = comments.map((c) => ({ id: c.id, anchor: normalizeAnchor(c.anchorData) }));
+    iframe.contentWindow?.postMessage({ type: "wb:set-comments", comments: payload }, "*");
+  }, [comments, isHtml]);
+
+  useEffect(() => {
+    if (!isHtml) return;
+    const onMessage = (e: MessageEvent) => {
+      const iframe = iframeRef.current;
+      if (!iframe || e.source !== iframe.contentWindow) return;
+      const data = e.data as { type?: string; [k: string]: unknown };
+      if (!data || typeof data !== "object") return;
+      switch (data.type) {
+        case "wb:ready":
+          sendCommentsToIframe();
+          break;
+        case "wb:comments-applied": {
+          const obs = (data.obsolete as number[] | undefined) ?? [];
+          setHtmlObsoleteIds(new Set(obs));
+          break;
+        }
+        case "wb:selection": {
+          const anchor = data.anchor as TextAnchor;
+          const rect = data.rect as { left: number; top: number; width: number; height: number };
+          setPendingAnchor(anchor);
+          setPopover({ x: rect.left + rect.width / 2, y: rect.top });
+          break;
+        }
+        case "wb:selection-cleared":
+          setPopover(null);
+          break;
+        case "wb:contextmenu":
+          setContextMenu({ x: data.x as number, y: data.y as number });
+          setPopover(null);
+          break;
+        case "wb:typed":
+          setPanelOpen(true);
+          setDraft(String(data.key ?? ""));
+          setPopover(null);
+          requestAnimationFrame(() => {
+            const ta = composerRef.current;
+            if (ta) {
+              ta.focus();
+              // Move cursor to end so the already-captured key doesn't get re-inserted at start
+              ta.selectionStart = ta.selectionEnd = ta.value.length;
+            }
+          });
+          break;
+        case "wb:mark-click": {
+          const id = Number(data.commentId);
+          setActiveId(id);
+          setPanelOpen(true);
+          break;
+        }
+        case "wb:open-relative": {
+          const href = String(data.href ?? "");
+          const target = resolveRelative(filePath, href);
+          if (target) {
+            const route = taskSlug
+              ? taskFileRoute(projectSlug, taskSlug, target)
+              : projectFileRoute(projectSlug, target);
+            router.push(route);
+          }
+          break;
+        }
+        case "wb:open-external": {
+          const href = String(data.href ?? "");
+          window.open(href, "_blank", "noopener");
+          break;
+        }
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [isHtml, sendCommentsToIframe, filePath, projectSlug, taskSlug]);
+
+  // Push fresh comments to iframe whenever they change after load.
+  useEffect(() => { sendCommentsToIframe(); }, [sendCommentsToIframe]);
+
+  // --- Markdown selection handlers ----------------------------------------
+  const captureFromSelection = useCallback(() => {
+    const root = contentRef.current;
+    if (!root) return null;
+    return captureSelectionAnchor(root);
+  }, []);
+
+  const onMouseUp = useCallback(() => {
+    if (!isMd) return;
+    setTimeout(() => {
+      const c = captureFromSelection();
+      if (!c) { setPopover(null); return; }
+      setPopover({ x: c.rect.left + c.rect.width / 2, y: c.rect.top });
+      setPendingAnchor(c.anchor);
+    }, 0);
+  }, [captureFromSelection, isMd]);
+
+  const onContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!isMd) return;
+    const c = captureFromSelection();
+    if (!c) return;
+    e.preventDefault();
+    setPendingAnchor(c.anchor);
+    setContextMenu({ x: e.clientX, y: e.clientY });
+    setPopover(null);
+  }, [captureFromSelection, isMd]);
+
+  // Type-while-selected in the markdown body
+  useEffect(() => {
+    if (!isMd) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key.length !== 1) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      const c = captureFromSelection();
+      if (!c) return;
+      e.preventDefault();
+      setPendingAnchor(c.anchor);
+      setPanelOpen(true);
+      setDraft(e.key);
+      setPopover(null);
+      requestAnimationFrame(() => {
+        const ta = composerRef.current;
+        if (ta) {
+          ta.focus();
+          // Move cursor to end so the already-captured key doesn't get re-inserted at start
+          ta.selectionStart = ta.selectionEnd = ta.value.length;
+        }
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [captureFromSelection, isMd]);
+
+  useEffect(() => {
+    const onClick = () => { setContextMenu(null); };
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { setPopover(null); setContextMenu(null); }
+    };
+    window.addEventListener("click", onClick);
+    window.addEventListener("keydown", onEsc);
+    return () => { window.removeEventListener("click", onClick); window.removeEventListener("keydown", onEsc); };
+  }, []);
+
+  const startCommentFromPopover = () => {
+    setPopover(null);
+    setPanelOpen(true);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
+  const startCommentFromContextMenu = () => {
+    setContextMenu(null);
+    setPanelOpen(true);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
+  const postComment = async () => {
+    if (!draft.trim()) return;
+    await fetch(`/api/comments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project: projectSlug,
+        task: taskSlug,
+        path: filePath,
+        anchorType: isHtml ? "html" : "md",
+        anchor: pendingAnchor ?? {},
+        body: draft.trim(),
+      }),
+    });
+    setDraft("");
+    setPendingAnchor(null);
+    refreshComments();
+  };
+
+  const deleteComment = async (id: number) => {
+    await fetch(`/api/comments/${id}?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`, { method: "DELETE" });
+    refreshComments();
+  };
+
+  // Live agent session for this file — opens inline as a right column so the
+  // user can keep reading/marking the doc while the agent works.
+  const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
+  const [sendingToAgent, setSendingToAgent] = useState(false);
+  const sendCommentsToAgent = async () => {
+    const live = resolvedComments.filter((c) => !c.obsolete);
+    if (live.length === 0 || sendingToAgent) return;
+    setSendingToAgent(true);
+    try {
+      const message = buildAgentMessage(filePath, live);
+      const r = await fetch("/api/sessions", { cache: "no-store" });
+      const j = await r.json();
+      const sessions: Array<{
+        id: string;
+        projectSlug: string;
+        taskSlug: string;
+        state: string;
+        isLive: boolean;
+      }> = j.sessions ?? [];
+      const target = sessions.find(
+        (s) =>
+          s.projectSlug === projectSlug &&
+          s.taskSlug === taskSlug &&
+          s.isLive &&
+          s.state !== "stopped" &&
+          s.state !== "error",
+      );
+      if (target) {
+        await fetch(`/api/sessions/${target.id}/input`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+        setAgentSessionId(target.id);
+      } else {
+        const res = await fetch(
+          `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message }),
+          },
+        );
+        const created = await res.json();
+        if (created.id) setAgentSessionId(created.id);
+        else alert(created.error ?? "failed to start session");
+      }
+    } finally {
+      setSendingToAgent(false);
+    }
+  };
+
+  // While the agent is working, the comment list may change underneath us
+  // (the agent's `resolve_comment` deletes rows). Poll every 2s while the
+  // panel is open so the highlights / counts stay in sync.
+  useEffect(() => {
+    if (!agentSessionId) return;
+    const t = setInterval(() => { refreshComments(); }, 2000);
+    return () => clearInterval(t);
+  }, [agentSessionId, refreshComments]);
+
+  // Markdown link component: rewrite relative paths to hash-route navigation.
+  const MarkdownLink = useCallback(
+    ({ href, children, ...rest }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
+      const target = href ? resolveRelative(filePath, href) : null;
+      if (target === null) {
+        // External / anchor — open external in new tab; let anchors behave.
+        const isExternal = href ? /^(?:[a-z]+:)|^\/\//i.test(href) : false;
+        return (
+          <a
+            href={href}
+            target={isExternal ? "_blank" : undefined}
+            rel={isExternal ? "noreferrer" : undefined}
+            {...rest}
+          >{children}</a>
+        );
+      }
+      const route = taskSlug
+        ? taskFileRoute(projectSlug, taskSlug, target)
+        : projectFileRoute(projectSlug, target);
+      return (
+        <a
+          href={route}
+          {...rest}
+        >{children}</a>
+      );
+    },
+    [filePath, projectSlug, taskSlug],
+  );
+
+  const liveCount = resolvedComments.filter((c) => !c.obsolete).length;
+  const obsoleteCount = resolvedComments.filter((c) => c.obsolete).length;
+
+  return (
+    <>
+      <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
+        <button
+          onClick={onBack}
+          className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"
+        >← Task</button>
+        <div className="flex-1 min-w-0">
+          <div className="text-[14px] truncate font-mono">{filePath}</div>
+          <div className="text-[11.5px] text-[var(--muted)]">
+            {projectSlug} · {taskSlug}
+          </div>
+        </div>
+        {supportsComments && (
+          <button
+            onClick={() => setPanelOpen((v) => !v)}
+            className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${panelOpen ? "bg-[var(--panel-2)]" : ""}`}
+            title="Comments — select text in the doc first, or write a comment on the whole document"
+          >
+            💬 {liveCount > 0 || obsoleteCount > 0
+              ? `${liveCount}${obsoleteCount > 0 ? ` · ${obsoleteCount} obsolete` : ""}`
+              : "Add"}
+          </button>
+        )}
+        {taskSlug && (
+          <button
+            onClick={() => setChatPanelOpen((v) => !v)}
+            className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${chatPanelOpen ? "bg-[var(--panel-2)]" : ""}`}
+            title="Chat with an agent about this file"
+          >
+            🤖 Chat
+          </button>
+        )}
+        <a
+          href={rawUrl}
+          download
+          className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
+        >Download</a>
+      </header>
+
+      <div className="flex-1 min-h-0 flex">
+        {/* Iframe-style viewers fill the available area without page scroll */}
+        {isHtml && text !== null ? (
+          <div className="flex-1 min-w-0 flex flex-col p-4">
+            <iframe
+              ref={iframeRef}
+              srcDoc={buildEnhancedHtml(text)}
+              sandbox="allow-same-origin allow-scripts"
+              className="flex-1 w-full rounded-xl border border-[var(--border)] bg-white"
+              title={filePath}
+            />
+          </div>
+        ) : isPdf ? (
+          <div className="flex-1 min-w-0 flex flex-col p-4">
+            <iframe
+              src={rawUrl}
+              className="flex-1 w-full rounded-xl border border-[var(--border)] bg-white"
+              title={filePath}
+            />
+          </div>
+        ) : (
+          <div
+            className="flex-1 min-w-0 overflow-y-auto"
+            onMouseUp={onMouseUp}
+            onContextMenu={onContextMenu}
+          >
+            <div className="w-full px-8 py-6">
+              {error && <div className="text-[13px] text-[#dc2626]">{error}</div>}
+
+              {isImage && (
+                <img src={rawUrl} alt={filePath} className="max-w-full mx-auto rounded-xl border border-[var(--border)]" />
+              )}
+
+              {isMd && text !== null && (
+                <article ref={contentRef} className="prose max-w-3xl mx-auto text-[15px] leading-relaxed prose-pre:bg-[var(--panel-2)] prose-pre:border prose-pre:border-[var(--border)] prose-code:text-[var(--accent)] prose-code:before:content-none prose-code:after:content-none">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    skipHtml
+                    components={{ a: MarkdownLink }}
+                  >{text}</ReactMarkdown>
+                </article>
+              )}
+
+              {isText && !isMd && !isHtml && text !== null && (
+                <pre className="text-[12.5px] bg-[var(--panel-2)] border border-[var(--border)] rounded-xl p-4 overflow-x-auto whitespace-pre-wrap break-words">{text}</pre>
+              )}
+
+              {!isImage && !isPdf && !isHtml && !isMd && !isText && (
+                <div className="text-[13px] text-[var(--muted)]">
+                  No preview for <span className="font-mono">.{ext}</span> files.{" "}
+                  <a href={rawUrl} download className="text-[var(--accent)] hover:underline">Download</a>.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {supportsComments && panelOpen && (
+          <CommentPanel
+            comments={resolvedComments}
+            activeId={activeId}
+            onActiveChange={setActiveId}
+            composerRef={composerRef}
+            draft={draft}
+            pendingAnchor={pendingAnchor}
+            onDraft={setDraft}
+            onClearPending={() => setPendingAnchor(null)}
+            onPost={postComment}
+            onDelete={deleteComment}
+            onSendToAgent={sendCommentsToAgent}
+            sendingToAgent={sendingToAgent}
+          />
+        )}
+
+        {agentSessionId && (
+          <AgentPanel
+            sessionId={agentSessionId}
+            projectSlug={projectSlug}
+            taskSlug={taskSlug}
+            onClose={() => setAgentSessionId(null)}
+            onOpenFull={() => {
+              const route = taskSlug
+                ? taskSessionRoute(projectSlug, taskSlug, agentSessionId)
+                : projectSessionRoute(projectSlug, agentSessionId);
+              router.push(route);
+            }}
+          />
+        )}
+
+        {chatPanelOpen && taskSlug && (
+          <>
+            <Resizer
+              direction="horizontal"
+              minSize={MIN_CHAT_WIDTH}
+              maxSize={MAX_CHAT_WIDTH}
+              onResize={(size) => {
+                setChatPanelWidth(size);
+                localStorage.setItem(CHAT_PANEL_WIDTH_KEY, String(size));
+              }}
+            />
+            <ChatPanel
+              projectSlug={projectSlug}
+              taskSlug={taskSlug}
+              filePath={filePath}
+              width={chatPanelWidth}
+              onClose={() => setChatPanelOpen(false)}
+              onOpenFull={(sessionId) => {
+                const route = taskSessionRoute(projectSlug, taskSlug, sessionId);
+                router.push(route);
+              }}
+            />
+          </>
+        )}
+      </div>
+
+      {popover && (
+        <SelectionPopover x={popover.x} y={popover.y} onComment={startCommentFromPopover} />
+      )}
+      {contextMenu && (
+        <ContextMenu x={contextMenu.x} y={contextMenu.y} onComment={startCommentFromContextMenu} />
+      )}
+    </>
+  );
+}
+
+function buildAgentMessage(filePath: string, comments: ResolvedComment[]): string {
+  const lines: string[] = [];
+  lines.push(`Please address the following comments on \`${filePath}\`:`);
+  lines.push("");
+  for (const c of comments) {
+    const quote = c.anchor?.exact?.trim() ?? "";
+    lines.push(`- [comment #${c.id}] on "${quote}" — ${c.body.trim().replace(/\n/g, " ")}`);
+  }
+  lines.push("");
+  lines.push(
+    "After addressing each one, call the `workbench-comments.resolve_comment` tool with its `comment_id` so it disappears from the user's view. " +
+    "You may also use `workbench-comments.add_comment` to flag anything you want them to review. " +
+    "When you're done, give a one-line summary of what changed.",
+  );
+  return lines.join("\n");
+}
+
+function normalizeAnchor(d: Partial<TextAnchor> & { quote?: string } | undefined): TextAnchor | null {
+  if (!d) return null;
+  if (typeof d.exact === "string" && d.exact.length > 0) {
+    return { prefix: d.prefix ?? "", exact: d.exact, suffix: d.suffix ?? "" };
+  }
+  if (typeof d.quote === "string" && d.quote.length > 0) {
+    return { prefix: "", exact: d.quote, suffix: "" };
+  }
+  return null;
+}
+
+function SelectionPopover({ x, y, onComment }: { x: number; y: number; onComment: () => void }) {
+  return (
+    <div
+      className="fixed z-40"
+      style={{ left: x, top: y - 8, transform: "translate(-50%, -100%)" }}
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      <button
+        onClick={onComment}
+        className="bg-[var(--text)] text-[var(--bg)] rounded-full px-3 py-1.5 text-[12.5px] font-medium shadow-lg hover:opacity-90 flex items-center gap-1.5"
+      >💬 Comment</button>
+    </div>
+  );
+}
+
+function ContextMenu({ x, y, onComment }: { x: number; y: number; onComment: () => void }) {
+  return (
+    <div
+      className="fixed z-50 bg-[var(--bg)] border border-[var(--border-strong)] rounded-lg shadow-xl py-1 min-w-[180px]"
+      style={{ left: x, top: y }}
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      <button onClick={onComment} className="w-full text-left px-3 py-1.5 text-[13px] hover:bg-[var(--panel-2)]">
+        💬 Comment on selection
+      </button>
+    </div>
+  );
+}
+
+function CommentPanel({
+  comments, activeId, onActiveChange, composerRef, draft, pendingAnchor,
+  onDraft, onClearPending, onPost, onDelete, onSendToAgent, sendingToAgent,
+}: {
+  comments: ResolvedComment[];
+  activeId: number | null;
+  onActiveChange: (id: number | null) => void;
+  composerRef: React.RefObject<HTMLTextAreaElement | null>;
+  draft: string;
+  pendingAnchor: TextAnchor | null;
+  onDraft: (v: string) => void;
+  onClearPending: () => void;
+  onPost: () => void;
+  onDelete: (id: number) => void;
+  onSendToAgent: () => void;
+  sendingToAgent: boolean;
+}) {
+  const live = comments.filter((c) => !c.obsolete);
+  const obsolete = comments.filter((c) => c.obsolete);
+
+  return (
+    <aside className="w-[340px] shrink-0 border-l border-[var(--border)] bg-[var(--bg-2)] flex flex-col">
+      <div className="px-4 py-3 border-b border-[var(--border)] flex items-center gap-2">
+        <div className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold flex-1">Comments</div>
+        {live.length > 0 && (
+          <button
+            onClick={onSendToAgent}
+            disabled={sendingToAgent}
+            className="text-[11.5px] bg-[var(--accent)] text-[var(--accent-text)] font-medium rounded-md px-2.5 py-1 hover:brightness-110 disabled:opacity-50"
+            title="Append the open comments to a live agent session, or start a new one"
+          >
+            {sendingToAgent ? "Sending…" : `→ Send to agent (${live.length})`}
+          </button>
+        )}
+      </div>
+
+      <div className="p-3 border-b border-[var(--border)]">
+        {pendingAnchor ? (
+          <div className="text-[11.5px] mb-2 bg-[var(--accent-soft)] border-l-2 border-[var(--accent)] px-2 py-1.5 rounded-r">
+            <div className="text-[var(--text-soft)] line-clamp-3 italic">&ldquo;{pendingAnchor.exact}&rdquo;</div>
+            <button onClick={onClearPending} className="text-[10.5px] text-[var(--muted)] hover:text-[var(--text)] mt-0.5">clear · comment on whole doc instead</button>
+          </div>
+        ) : (
+          <div className="text-[10.5px] mb-2 text-[var(--muted)]">
+            Comment will attach to the whole document. Select text first to anchor it.
+          </div>
+        )}
+        <div className="rounded-xl border border-[var(--border-strong)] bg-[var(--panel)] focus-within:border-[var(--accent)] transition">
+          <textarea
+            ref={composerRef}
+            value={draft}
+            onChange={(e) => onDraft(e.target.value)}
+            placeholder={pendingAnchor ? "Comment on selection…" : "Comment on the whole document…"}
+            rows={3}
+            onKeyDown={(e) => handleComposerEnter(e, onPost)}
+            className="w-full resize-none bg-transparent outline-none text-[13.5px] px-3 py-2 leading-relaxed"
+          />
+          <div className="flex justify-end px-2 pb-2">
+            <button
+              onClick={onPost}
+              disabled={!draft.trim()}
+              className="bg-[var(--accent)] text-[var(--accent-text)] rounded-md px-3 py-1 text-[12px] font-medium disabled:opacity-40 hover:brightness-110"
+            >Post ↵</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+        {comments.length === 0 && (
+          <div className="text-[12.5px] text-[var(--muted)] italic">No comments yet. Select text to anchor one, or write a comment on the whole document above.</div>
+        )}
+
+        {live.filter((c) => !c.anchor).length > 0 && (
+          <>
+            <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-semibold px-1">On the document</div>
+            {live.filter((c) => !c.anchor).map((c) => (
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} />
+            ))}
+          </>
+        )}
+        {live.filter((c) => c.anchor).length > 0 && (
+          <>
+            {live.filter((c) => !c.anchor).length > 0 && (
+              <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-semibold px-1 pt-2">On selections</div>
+            )}
+            {live.filter((c) => c.anchor).map((c) => (
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} />
+            ))}
+          </>
+        )}
+
+        {obsolete.length > 0 && (
+          <>
+            <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-semibold mt-3 px-1 pt-3 border-t border-[var(--border)]">
+              Obsolete · {obsolete.length}
+            </div>
+            <div className="text-[11.5px] text-[var(--muted)] px-1 mb-1">
+              The text these comments were attached to is no longer in the document.
+            </div>
+            {obsolete.map((c) => (
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} dim />
+            ))}
+          </>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function CommentCard({
+  c, active, onClick, onDelete, dim,
+}: {
+  c: ResolvedComment;
+  active: boolean;
+  onClick: () => void;
+  onDelete: (id: number) => void;
+  dim?: boolean;
+}) {
+  const quote = c.anchor?.exact;
+  return (
+    <div
+      onClick={onClick}
+      className={`rounded-xl border border-[var(--border)] bg-[var(--panel)] px-3 py-2.5 text-[13px] cursor-pointer transition ${active ? "ring-2 ring-[var(--accent)]" : ""} ${dim ? "opacity-60" : ""}`}
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="font-medium">{c.author}</span>
+        <span className="text-[11px] text-[var(--muted)]">{new Date(c.createdAt).toLocaleString()}</span>
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(c.id); }}
+          className="ml-auto text-[var(--muted)] hover:text-[#dc2626] text-[11px]"
+          title="Delete"
+        >×</button>
+      </div>
+      {quote && (
+        <div className={`text-[11.5px] italic border-l-2 ${dim ? "border-[var(--border-strong)] text-[var(--muted)]" : "border-[var(--accent)] text-[var(--text-soft)]"} pl-2 mb-1.5 line-clamp-3`}>
+          &ldquo;{quote}&rdquo;
+        </div>
+      )}
+      <div className="whitespace-pre-wrap">{c.body}</div>
+    </div>
+  );
+}
