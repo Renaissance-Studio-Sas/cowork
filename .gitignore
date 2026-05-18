@@ -5,3 +5,5 @@ next-env.d.ts
 workbench.db
 workbench.db-journal
 .DS_Store
+.env
+.env*.local

@@ -3,9 +3,13 @@ import path from "node:path";
 import matter from "gray-matter";
 import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
 
-// Workspace root lives one level above apps/agent-workbench (i.e. the repo root).
-// Convention: tasks/<project>/<task>/{files,sessions,task.md}
-export const WORKSPACE_ROOT = path.resolve(process.cwd(), "..", "..", "tasks");
+// Workspace root: directory holding `wip-<project>/` and `done-<project>/` folders.
+// Set WORKSPACE_ROOT in `.env` to point at any directory; defaults to `../../tasks`
+// relative to cwd (the legacy layout where this app lived inside a monorepo).
+// Convention: <root>/<project>/<task>/{files,sessions,task.md}
+export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
+  ? path.resolve(process.env.WORKSPACE_ROOT)
+  : path.resolve(process.cwd(), "..", "..", "tasks");
 
 export type Status = "wip" | "done";
 
