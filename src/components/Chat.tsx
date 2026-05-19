@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { handleComposerEnter } from "@/lib/composer";
 import ReactMarkdown from "react-markdown";
@@ -10,6 +10,18 @@ import remarkGfm from "remark-gfm";
 // as unknown custom elements. skipHtml strips them cleanly.
 import type { SessionSummaryDTO } from "@/lib/types";
 import { taskSessionRoute, projectSessionRoute } from "@/lib/routes";
+import { TodoList, extractTodosFromMessages } from "./TodoList";
+import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
+
+interface UploadedFile {
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+}
+
+// Number of messages to load initially and per batch
+const PAGE_SIZE = 50;
 
 type SDKMessageLite =
   | { type: "user"; message: { role: "user"; content: unknown }; uuid?: string }
@@ -50,15 +62,94 @@ export function Chat({ session, onChange, onBack }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
+  // File attachment state
+  const [attachments, setAttachments] = useState<FileAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+
+  // Lazy loading state
+  const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const isAtBottomRef = useRef(true);
+  const prevScrollHeightRef = useRef(0);
+  const isInitialLoadRef = useRef(true);
+
+  // Check if user is scrolled to bottom (within threshold)
+  const checkIfAtBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return true;
+    const threshold = 100;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  }, []);
+
+  // Update isAtBottomRef on scroll
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const handleScroll = () => {
+      isAtBottomRef.current = checkIfAtBottom();
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, [checkIfAtBottom]);
+
+  // After prepending older messages, restore scroll position
+  useEffect(() => {
+    if (isLoadingMore || isInitialLoadRef.current) return;
+    const el = scrollRef.current;
+    if (!el || prevScrollHeightRef.current === 0) return;
+    const heightDiff = el.scrollHeight - prevScrollHeightRef.current;
+    if (heightDiff > 0) {
+      el.scrollTop += heightDiff;
+    }
+    prevScrollHeightRef.current = 0;
+  }, [messages.length, isLoadingMore]);
+
+  // Stable reference to onChange to avoid re-running the effect
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
   useEffect(() => {
     setMessages([]);
     setState(session.state);
     setStreamConnected(false);
+    setHistoryMeta(null);
+    isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
     // the session might actually be live (race condition with API polling)
-    const es = new EventSource(`/api/sessions/${session.id}/stream`);
+    const es = new EventSource(
+      `/api/sessions/${session.id}/stream?limit=${PAGE_SIZE}&project=${encodeURIComponent(session.projectSlug)}&task=${encodeURIComponent(session.taskSlug)}`,
+    );
     let connected = false;
+    let initialMessages: SDKMessageLite[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushInitial = () => {
+      if (initialMessages.length > 0 && isInitialLoadRef.current) {
+        setMessages(initialMessages);
+        isInitialLoadRef.current = false;
+        // Scroll to bottom after initial render (no jump — content appears at bottom)
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) {
+            el.scrollTop = el.scrollHeight;
+            isAtBottomRef.current = true;
+          }
+        });
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flushInitial, 50);
+    };
+
+    es.addEventListener("history_meta", (ev) => {
+      try {
+        const meta = JSON.parse((ev as MessageEvent).data);
+        setHistoryMeta(meta);
+      } catch { /* ignore */ }
+    });
 
     es.addEventListener("message", (ev) => {
       try {
@@ -66,7 +157,22 @@ export function Chat({ session, onChange, onBack }: Props) {
           connected = true;
           setStreamConnected(true);
         }
-        setMessages((p) => [...p, JSON.parse((ev as MessageEvent).data)]);
+        const msg = JSON.parse((ev as MessageEvent).data);
+
+        if (isInitialLoadRef.current) {
+          // Batch initial messages and flush after a brief delay
+          initialMessages.push(msg);
+          scheduleFlush();
+        } else {
+          // Append new message and auto-scroll if at bottom
+          setMessages((p) => [...p, msg]);
+          if (isAtBottomRef.current) {
+            requestAnimationFrame(() => {
+              const el = scrollRef.current;
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+          }
+        }
       } catch { /* ignore */ }
     });
     es.addEventListener("state", (ev) => {
@@ -77,7 +183,7 @@ export function Chat({ session, onChange, onBack }: Props) {
         }
         const { state: st } = JSON.parse((ev as MessageEvent).data);
         setState(st);
-        onChange();
+        onChangeRef.current();
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -85,21 +191,69 @@ export function Chat({ session, onChange, onBack }: Props) {
       if (!connected) {
         es.close();
         setStreamConnected(false);
-        // Load from disk
-        fetch(`/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}`)
+        // Load from disk with pagination
+        fetch(`/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=0`)
           .then((r) => r.json())
           .then((j) => {
-            if (j.events) setMessages(j.events);
+            if (j.events) {
+              setMessages(j.events);
+              setHistoryMeta({
+                total: j.total,
+                hasMore: j.hasMore,
+                offset: j.total - j.events.length,
+              });
+            }
+            isInitialLoadRef.current = false;
+            // Scroll to bottom after loading
+            requestAnimationFrame(() => {
+              const el = scrollRef.current;
+              if (el) {
+                el.scrollTop = el.scrollHeight;
+                isAtBottomRef.current = true;
+              }
+            });
           });
       }
       // If we were connected before, SSE will auto-reconnect
     };
-    return () => es.close();
-  }, [session.id, session.projectSlug, session.taskSlug, session.state, onChange]);
+    return () => {
+      es.close();
+      if (flushTimer) clearTimeout(flushTimer);
+    };
+    // Only reconnect SSE when session.id changes, not on state changes
+    // State updates come via the SSE stream itself
+  }, [session.id, session.projectSlug, session.taskSlug]);
 
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages.length]);
+  // Load more (older) messages when scrolling to top
+  const loadMore = useCallback(async () => {
+    if (!historyMeta || !historyMeta.hasMore || isLoadingMore) return;
+
+    setIsLoadingMore(true);
+    if (scrollRef.current) {
+      prevScrollHeightRef.current = scrollRef.current.scrollHeight;
+    }
+
+    try {
+      const r = await fetch(
+        `/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=${messages.length}`
+      );
+      const j = await r.json();
+
+      if (j.events && j.events.length > 0) {
+        // Prepend older messages
+        setMessages((p) => [...j.events, ...p]);
+        setHistoryMeta({
+          total: j.total,
+          hasMore: j.hasMore,
+          offset: historyMeta.offset + PAGE_SIZE,
+        });
+      }
+    } catch (err) {
+      console.error("Failed to load more messages:", err);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [historyMeta, isLoadingMore, session.id, session.projectSlug, session.taskSlug, messages.length]);
 
   useEffect(() => {
     if (composerRef.current) composerRef.current.focus();
@@ -108,18 +262,70 @@ export function Chat({ session, onChange, onBack }: Props) {
   // Use streamConnected OR session.isLive to determine if we can interact
   const isLive = streamConnected || session.isLive;
 
+  // Extract todos from the message stream
+  const todos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+
+  // Todo panel visibility (defaults to shown when there are todos)
+  const [showTodos, setShowTodos] = useState(true);
+
+  // Handle file drop/paste
+  const handleFiles = useCallback((files: FileAttachment[]) => {
+    setAttachments((prev) => [...prev, ...files]);
+  }, []);
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  // Upload files and return their server paths
+  const uploadFiles = async (files: FileAttachment[]): Promise<UploadedFile[]> => {
+    const uploaded: UploadedFile[] = [];
+    for (const att of files) {
+      const formData = new FormData();
+      formData.append("file", att.file);
+      const res = await fetch(
+        `/api/files/upload?project=${session.projectSlug}&task=${session.taskSlug}`,
+        { method: "POST", body: formData }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        uploaded.push({
+          name: data.name,
+          path: data.path,
+          mimeType: data.mimeType,
+          size: data.size,
+        });
+      }
+    }
+    return uploaded;
+  };
+
   const send = async () => {
-    if (!isLive || !draft.trim() || sending) return;
+    if (!isLive || (!draft.trim() && attachments.length === 0) || sending || uploading) return;
     setSending(true);
+    setUploading(attachments.length > 0);
     try {
+      // Upload attachments first
+      let uploadedFiles: UploadedFile[] = [];
+      if (attachments.length > 0) {
+        uploadedFiles = await uploadFiles(attachments);
+      }
+
       await fetch(`/api/sessions/${session.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: draft.trim() }),
+        body: JSON.stringify({
+          message: draft.trim() || "(attached files)",
+          projectSlug: session.projectSlug,
+          taskSlug: session.taskSlug,
+          files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
+        }),
       });
       setDraft("");
+      setAttachments([]);
     } finally {
       setSending(false);
+      setUploading(false);
     }
   };
 
@@ -168,11 +374,10 @@ export function Chat({ session, onChange, onBack }: Props) {
 
   const isWorking = state === "running";
   const isAwaiting = state === "awaiting_input";
-  const isDone = state === "idle";
+  const isDone = state === "idle" || state === "stopped"; // stopped sessions seamlessly resume, treat as done
   const stateLabel =
     isAwaiting ? "needs your reply" :
     isWorking ? "working" :
-    state === "stopped" ? "stopped" :
     state === "error" ? "error" :
     isDone ? "done" : "idle";
   const stateColor =
@@ -261,6 +466,18 @@ export function Chat({ session, onChange, onBack }: Props) {
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="max-w-[760px] mx-auto px-6 py-8 space-y-5">
+          {/* Load more button at top for older messages */}
+          {historyMeta?.hasMore && (
+            <div className="text-center">
+              <button
+                onClick={loadMore}
+                disabled={isLoadingMore}
+                className="text-[12px] text-[var(--accent)] hover:text-[var(--text)] disabled:opacity-50 px-3 py-1.5 rounded-lg border border-[var(--border)] hover:border-[var(--accent)] transition"
+              >
+                {isLoadingMore ? "Loading…" : `Load older messages (${historyMeta.total - messages.length} more)`}
+              </button>
+            </div>
+          )}
           <MessageStream messages={messages} />
           {messages.length === 0 && (
             <div className="text-[var(--muted)] text-[13px]">Waiting for the agent to start…</div>
@@ -274,43 +491,93 @@ export function Chat({ session, onChange, onBack }: Props) {
         </div>
       </div>
 
+      {/* Todo list above input when present */}
+      {todos.length > 0 && (
+        <div className="border-t border-[var(--border)] bg-[var(--bg)]">
+          <div className="max-w-[760px] mx-auto px-6">
+            {showTodos ? (
+              <div className="py-3">
+                <div className="relative">
+                  <TodoList todos={todos} />
+                  <button
+                    onClick={() => setShowTodos(false)}
+                    className="absolute top-2 right-2 text-[var(--muted)] hover:text-[var(--text)] p-1.5 rounded hover:bg-[var(--panel-2)] transition"
+                    title="Hide tasks"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="py-2 flex items-center">
+                <button
+                  onClick={() => setShowTodos(true)}
+                  className="flex items-center gap-2 text-[12px] text-[var(--muted)] hover:text-[var(--text)] transition"
+                  title="Show tasks"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M9 11l3 3L22 4" />
+                    <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
+                  </svg>
+                  <span>
+                    {todos.filter(t => t.status === "completed").length}/{todos.length} tasks completed
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="border-t border-[var(--border)] px-6 py-4 bg-[var(--bg)]">
         <div className="max-w-[760px] mx-auto">
-          {isLive ? (
-            <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
-              <textarea
-                ref={composerRef}
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                placeholder={state === "awaiting_input" ? "Reply to your agent…" : "Send a message…"}
-                rows={1}
-                style={{ maxHeight: 200 }}
-                onInput={(e) => {
-                  const el = e.currentTarget;
-                  el.style.height = "auto";
-                  el.style.height = Math.min(el.scrollHeight, 200) + "px";
-                }}
-                onKeyDown={(e) => handleComposerEnter(e, send)}
-                className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
-              />
-              <button
-                onClick={send}
-                disabled={!draft.trim() || sending}
-                className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-                title="Send (↵)"
-              >↑</button>
-              {isWorking && (
-                <button
-                  onClick={stop}
-                  className="rounded-lg border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[#dc2626] hover:border-[#dc2626] w-9 h-9 flex items-center justify-center transition shrink-0"
-                  title="Stop"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="6" y="6" width="12" height="12" rx="2" />
-                  </svg>
-                </button>
+          {/* Show ContinueComposer for stopped/error sessions that need resuming,
+              even if they're in the registry (isLive). For truly live sessions
+              (running, idle, awaiting_input), show the regular composer. */}
+          {isLive && state !== "stopped" && state !== "error" ? (
+            <FileDropZone onFiles={handleFiles} className="rounded-2xl">
+              {attachments.length > 0 && (
+                <div className="px-3 pt-2">
+                  <AttachmentPreview attachments={attachments} onRemove={removeAttachment} />
+                </div>
               )}
-            </div>
+              <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
+                <textarea
+                  ref={composerRef}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  placeholder={state === "awaiting_input" ? "Reply to your agent…" : "Drop files or type a message…"}
+                  rows={1}
+                  style={{ maxHeight: 200 }}
+                  onInput={(e) => {
+                    const el = e.currentTarget;
+                    el.style.height = "auto";
+                    el.style.height = Math.min(el.scrollHeight, 200) + "px";
+                  }}
+                  onKeyDown={(e) => handleComposerEnter(e, send)}
+                  className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
+                />
+                <button
+                  onClick={send}
+                  disabled={(!draft.trim() && attachments.length === 0) || sending || uploading}
+                  className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
+                  title="Send (↵)"
+                >{uploading ? "…" : "↑"}</button>
+                {isWorking && (
+                  <button
+                    onClick={stop}
+                    className="rounded-lg border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[#dc2626] hover:border-[#dc2626] w-9 h-9 flex items-center justify-center transition shrink-0"
+                    title="Stop"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </FileDropZone>
           ) : (
             <ContinueComposer session={session} messages={messages} />
           )}

@@ -5,11 +5,18 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { query, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { InputChannel, makeUserMessage } from "./input-channel";
+import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir } from "./fs";
 import { buildCommentsMcp } from "./comments-mcp";
 import { buildSessionMcp } from "./session-mcp";
 import { buildPlanningMcp, PLANNING_SYSTEM_PROMPT } from "./planning-mcp";
+import {
+  type SessionState,
+  isValidTransition,
+  shouldPersistState,
+  canOverwriteWithStopped,
+  stateAfterResult,
+} from "./session-state-machine";
 
 // Build a system prompt that includes project.md and task.md context so the
 // agent knows what project/task it's working in. Returns undefined if no
@@ -95,7 +102,8 @@ function generateSessionLabel(firstMessage: string): string {
   return label || "New session";
 }
 
-export type SessionState = "running" | "idle" | "awaiting_input" | "stopped" | "error";
+// Re-export SessionState for consumers who import from sessions.ts
+export type { SessionState } from "./session-state-machine";
 
 interface RuntimeSession {
   id: string;
@@ -105,6 +113,7 @@ interface RuntimeSession {
   title: string;                 // short label derived from first message (e.g. "Add dark mode")
   startedAt: Date;
   lastActivity: Date;
+  seenAt: Date | null;           // when user last viewed this session (null = never seen)
   q: Query;
   input: InputChannel;
   events: EventEmitter;          // emits 'event' (SDKMessage) and 'state' (SessionState)
@@ -138,25 +147,78 @@ declare global {
   var __wb_session_registry: Map<string, RuntimeSession> | undefined;
   // eslint-disable-next-line no-var
   var __wb_watchdog_interval: ReturnType<typeof setInterval> | undefined;
+  // eslint-disable-next-line no-var
+  var __wb_session_registry_events: EventEmitter | undefined;
 }
 const registry: Map<string, RuntimeSession> =
   globalThis.__wb_session_registry ?? (globalThis.__wb_session_registry = REGISTRY);
 
-// Watchdog: auto-stop sessions that have been "running" with no activity for
-// too long. This catches cases where the SDK iterator stalls without erroring.
-const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes with no events
+// Fires "added" with the new RuntimeSession when a session is added to the
+// registry. Lets multiplexed SSE endpoints attach listeners to sessions that
+// appear after the client connected.
+const sessionRegistryEvents: EventEmitter =
+  globalThis.__wb_session_registry_events ??
+  (globalThis.__wb_session_registry_events = (() => {
+    const ee = new EventEmitter();
+    ee.setMaxListeners(0);
+    return ee;
+  })());
+
+function registerSession(s: RuntimeSession): void {
+  registry.set(s.id, s);
+  sessionRegistryEvents.emit("added", s);
+}
+
+// Subscribe to file_changed events from every live session matching
+// (projectSlug, taskSlug), including sessions added after this call. Returns
+// an unsubscribe function. Used by the multiplexed /api/file-events/stream
+// endpoint so one browser connection covers all sessions on a task.
+export function subscribeFileChanges(
+  projectSlug: string,
+  taskSlug: string,
+  listener: (data: { path: string; sessionId: string }) => void,
+): () => void {
+  const attached = new Map<string, (data: { path: string }) => void>();
+  const attach = (s: RuntimeSession) => {
+    if (s.projectSlug !== projectSlug || s.taskSlug !== taskSlug) return;
+    if (attached.has(s.id)) return;
+    const wrapper = (data: { path: string }) =>
+      listener({ ...data, sessionId: s.id });
+    s.events.on("file_changed", wrapper);
+    attached.set(s.id, wrapper);
+  };
+  for (const s of registry.values()) attach(s);
+  const onAdded = (s: RuntimeSession) => attach(s);
+  sessionRegistryEvents.on("added", onAdded);
+  return () => {
+    sessionRegistryEvents.off("added", onAdded);
+    for (const [id, wrapper] of attached) {
+      const s = registry.get(id);
+      if (s) s.events.off("file_changed", wrapper);
+    }
+    attached.clear();
+  };
+}
+
+const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback with error emit
+const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 
+// Runtime contract: any session whose streams have been closed MUST be in
+// state "stopped". sendInput dispatches by state — "running"/"idle" goes to
+// the live-write path that pushes into the InputChannel and writes to
+// inputLog. If streams are closed but state still says "idle", that write
+// silently no-ops and the agent never sees the message — that's the "session
+// stuck after 5 min" symptom. So the watchdog closes streams AND transitions
+// state to stopped together. resumeSession is responsible for re-opening
+// streams when the user sends another message.
 function runWatchdog() {
   const now = Date.now();
   for (const s of registry.values()) {
-    if (s.state !== "running") continue;
-    const idleMs = now - s.lastActivity.getTime();
-    if (idleMs > STALE_THRESHOLD_MS) {
-      console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(idleMs / 1000)}s — auto-stopping`);
+    const sinceActivity = now - s.lastActivity.getTime();
+    if (s.state === "running" && sinceActivity > STALE_THRESHOLD_MS) {
+      console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(sinceActivity / 1000)}s — auto-stopping`);
       try {
-        s.state = "stopped";
-        s.events.emit("state", "stopped");
         s.events.emit("event", {
           type: "system",
           subtype: "error",
@@ -165,6 +227,15 @@ function runWatchdog() {
         s.input.close();
         s.log.end();
         s.inputLog.end();
+        setState(s, "stopped");
+      } catch { /* best effort */ }
+    } else if (s.state === "idle" && sinceActivity > IDLE_EVICT_MS) {
+      console.log(`[watchdog] Session ${s.id} idle for ${Math.round(sinceActivity / 1000)}s — closing (resumable on next message)`);
+      try {
+        s.input.close();
+        s.log.end();
+        s.inputLog.end();
+        setState(s, "stopped");
       } catch { /* best effort */ }
     }
   }
@@ -222,17 +293,20 @@ export async function renameLiveSession(id: string, newName: string): Promise<bo
 }
 
 export function listLiveSessions(): SessionSummary[] {
-  return [...registry.values()].map((s) => ({
-    id: s.id,
-    projectSlug: s.projectSlug,
-    taskSlug: s.taskSlug,
-    state: s.state,
-    title: s.title,
-    startedAt: s.startedAt.toISOString(),
-    lastActivity: s.lastActivity.toISOString(),
-    isLive: true,
-    unread: false, // live sessions are being watched in real-time
-  }));
+  return [...registry.values()].map((s) => {
+    const unread = !s.seenAt || s.lastActivity > s.seenAt;
+    return {
+      id: s.id,
+      projectSlug: s.projectSlug,
+      taskSlug: s.taskSlug,
+      state: s.state,
+      title: s.title,
+      startedAt: s.startedAt.toISOString(),
+      lastActivity: s.lastActivity.toISOString(),
+      isLive: true,
+      unread,
+    };
+  });
 }
 
 async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: string, liveIds: Set<string>): Promise<SessionSummary[]> {
@@ -245,7 +319,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -255,18 +329,24 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
         if (first) title = (JSON.parse(first).text as string).trim().slice(0, 120);
       } catch { /* missing */ }
     }
-    let lastActivity = meta.startedAt ?? new Date(0).toISOString();
-    try {
-      const st = await fs.stat(path.join(sessDir, id, "events.jsonl"));
-      lastActivity = st.mtime.toISOString();
-    } catch { /* missing */ }
+    // Prefer persisted lastActivity from meta.json (reliable); fall back to file mtime (unreliable across restarts)
+    let lastActivity = meta.lastActivity ?? meta.startedAt ?? new Date(0).toISOString();
+    if (!meta.lastActivity) {
+      try {
+        const st = await fs.stat(path.join(sessDir, id, "events.jsonl"));
+        lastActivity = st.mtime.toISOString();
+      } catch { /* missing */ }
+    }
     // Session is unread if it hasn't been seen, or if there's activity after seenAt
     const unread = !meta.seenAt || (meta.seenAt < lastActivity);
+    // Use persisted finalState if available (idle = done, error = error),
+    // otherwise fall back to "idle" (assume completed) for historical sessions
+    const state: SessionState = meta.finalState ?? "idle";
     out.push({
       id,
       projectSlug,
       taskSlug,
-      state: "stopped",
+      state,
       title,
       startedAt: meta.startedAt ?? lastActivity,
       lastActivity,
@@ -307,11 +387,22 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
 // Read a historical session's events.jsonl from disk for clients viewing a
 // stopped session. Handles both project-level (taskSlug === "") and task-
 // level locations.
+//
+// Pagination support for lazy loading:
+// - limit: maximum number of events to return (undefined = all)
+// - offset: how many events to skip from the END (0 = most recent)
+//
+// Example: total 200 events, limit=50, offset=0 → returns events 150-199 (newest 50)
+//          total 200 events, limit=50, offset=50 → returns events 100-149 (next 50 older)
+//
+// Returns { events, total, hasMore } for pagination context.
 export async function readSessionHistory(
   projectSlug: string,
   taskSlug: string,
   id: string,
-): Promise<{ events: unknown[] } | null> {
+  limit?: number,
+  offset: number = 0,
+): Promise<{ events: unknown[]; total: number; hasMore: boolean } | null> {
   const project = await getProject(projectSlug);
   if (!project) return null;
   let file: string;
@@ -324,8 +415,29 @@ export async function readSessionHistory(
   }
   try {
     const raw = await fs.readFile(file, "utf8");
-    const events = raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-    return { events };
+    const allEvents = raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const total = allEvents.length;
+
+    // If no limit specified, return all events
+    if (limit === undefined) {
+      return { events: allEvents, total, hasMore: false };
+    }
+
+    // Calculate slice indices from the end
+    // offset=0, limit=50 with 200 total → start=150, end=200 → events[150:200]
+    // offset=50, limit=50 with 200 total → start=100, end=150 → events[100:150]
+    const end = total - offset;
+    const start = Math.max(0, end - limit);
+
+    if (end <= 0) {
+      // Offset is beyond the total events
+      return { events: [], total, hasMore: false };
+    }
+
+    const events = allEvents.slice(start, end);
+    const hasMore = start > 0;
+
+    return { events, total, hasMore };
   } catch {
     return null;
   }
@@ -365,6 +477,9 @@ export async function restoreSession(
     sdkSessionId?: string;
     permissionMode?: string;
     model?: string;
+    finalState?: SessionState;
+    seenAt?: string;
+    lastActivity?: string;
   } = {};
   try {
     const raw = await fs.readFile(metaPath, "utf8");
@@ -399,21 +514,23 @@ export async function restoreSession(
     cwd,
     title: meta.name ?? "(untitled)",
     startedAt: meta.startedAt ? new Date(meta.startedAt) : new Date(),
-    lastActivity: new Date(),
+    lastActivity: meta.lastActivity ? new Date(meta.lastActivity) : new Date(),
+    seenAt: meta.seenAt ? new Date(meta.seenAt) : null,
     q: null as unknown as Query, // Placeholder — replaced on resume
     input,
     events,
     log: sink,
     inputLog: sink,
     history,
-    state: "stopped",
+    // Use persisted finalState if available, default to "idle" (done) for restored sessions
+    state: meta.finalState ?? "idle",
     pendingPermission: null,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
   };
 
-  registry.set(id, session);
+  registerSession(session);
   return session;
 }
 
@@ -500,6 +617,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     title: name,
     startedAt: now,
     lastActivity: now,
+    seenAt: null, // New session — never seen
     q,
     input,
     events,
@@ -512,7 +630,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
   };
-  registry.set(id, session);
+  registerSession(session);
 
   // Echo the first user message into history + events.jsonl so the UI shows
   // the user's prompt (the SDK doesn't echo typed inputs in streaming mode).
@@ -593,11 +711,8 @@ async function pumpEvents(s: RuntimeSession) {
         s.events.emit("file_changed", { path: modifiedPath });
       }
 
-      // A `result` event ends the turn. We distinguish two outcomes:
-      //   awaiting_input — the agent actually asked something and is blocked
-      //   idle           — the agent finished what was asked and is just idle
-      // Simple heuristic: if the last assistant text ends with a question
-      // mark, treat as awaiting; otherwise idle (done).
+      // A `result` event ends the turn. Use the state machine to determine
+      // the next state based on whether the agent asked a question.
       if (msg.type === "result") {
         const resultMsg = msg as { subtype?: string; error?: string };
         // Check for error results
@@ -611,13 +726,21 @@ async function pumpEvents(s: RuntimeSession) {
         }
         const text = lastAssistantText(s.history);
         const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
-        setState(s, isQuestion ? "awaiting_input" : "idle");
+        setState(s, stateAfterResult(isQuestion));
       } else if (msg.type === "assistant" || msg.type === "user") {
         if (s.state !== "running") setState(s, "running");
       }
     }
-    setState(s, "stopped");
+    // Only transition to "stopped" if the state machine allows it.
+    // This prevents overwriting "idle" (completed) or "running" (resumed).
+    if (canOverwriteWithStopped(s.state)) {
+      setState(s, "stopped");
+    }
   } catch (err) {
+    // If session is already running (resumed) or stopped (interrupted),
+    // this is a stale pumpEvents — don't touch state
+    if (s.state === "running" || s.state === "stopped") return;
+
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error(`[session ${s.id}] Error in pumpEvents:`, errorMsg);
     s.events.emit("event", {
@@ -628,8 +751,12 @@ async function pumpEvents(s: RuntimeSession) {
     s.log.write(JSON.stringify({ type: "system", subtype: "error", message: errorMsg }) + "\n");
     setState(s, "error");
   } finally {
-    s.log.end();
-    s.inputLog.end();
+    // Don't close streams if session was resumed (new streams were created)
+    // or if it was cleanly stopped (interrupt already closed them or will)
+    if (s.state !== "running" && s.state !== "stopped") {
+      s.log.end();
+      s.inputLog.end();
+    }
   }
 }
 
@@ -649,8 +776,52 @@ function lastAssistantText(history: SDKMessage[]): string {
 
 function setState(s: RuntimeSession, state: SessionState) {
   if (s.state === state) return;
+
+  // Validate state transition
+  if (!isValidTransition(s.state, state)) {
+    console.warn(
+      `[session ${s.id}] Invalid state transition ${s.state} → ${state}, ignoring`
+    );
+    return;
+  }
+
   s.state = state;
   s.events.emit("state", state);
+
+  // Persist certain states to meta.json so they survive restarts
+  if (shouldPersistState(state)) {
+    void persistSessionState(s, state);
+  }
+}
+
+// Persist the final state to meta.json for recovery after server restart
+async function persistSessionState(s: RuntimeSession, state: SessionState): Promise<void> {
+  // Skip for planning sessions (they write to /dev/null)
+  if (s.projectSlug === "__planning__") return;
+
+  try {
+    const project = await getProject(s.projectSlug);
+    if (!project) return;
+
+    let sessionDir: string;
+    if (!s.taskSlug) {
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
+    } else {
+      const task = project.tasks.find((t) => t.slug === s.taskSlug);
+      if (!task) return;
+      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
+    }
+
+    const metaPath = path.join(sessionDir, "meta.json");
+    const raw = await fs.readFile(metaPath, "utf8");
+    const meta = JSON.parse(raw);
+    meta.finalState = state;
+    // Persist lastActivity so unread detection doesn't rely on file mtime
+    meta.lastActivity = s.lastActivity.toISOString();
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+  } catch {
+    // Ignore errors — best effort
+  }
 }
 
 // Called from fs.ts after a task or project is moved/renamed. Keeps the
@@ -812,6 +983,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     title: name,
     startedAt: now,
     lastActivity: now,
+    seenAt: null, // New session — never seen
     q,
     input,
     events,
@@ -824,7 +996,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
   };
-  registry.set(id, session);
+  registerSession(session);
   session.log.write(JSON.stringify(firstUserEcho) + "\n");
   session.events.emit("event", firstUserEcho);
   void pumpEvents(session);
@@ -874,6 +1046,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     title: name,
     startedAt: now,
     lastActivity: now,
+    seenAt: null, // Planning sessions don't track seen state
     q,
     input,
     events,
@@ -886,7 +1059,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     permissionMode: "bypassPermissions",
     model: null,
   };
-  registry.set(id, session);
+  registerSession(session);
   session.events.emit("event", firstUserEcho);
   void pumpEvents(session);
   return session;
@@ -917,6 +1090,87 @@ export async function sendInput(id: string, text: string): Promise<boolean> {
   return true;
 }
 
+// Extended file attachment info
+export interface FileAttachmentInfo {
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+}
+
+// Send input with optional image attachments
+export async function sendInputWithFiles(
+  id: string,
+  text: string,
+  files: FileAttachmentInfo[],
+  projectSlug: string,
+  taskSlug: string
+): Promise<boolean> {
+  const s = registry.get(id);
+  if (!s) return false;
+
+  // Separate images from other files
+  const imageFiles = files.filter((f) => f.mimeType.startsWith("image/"));
+  const otherFiles = files.filter((f) => !f.mimeType.startsWith("image/"));
+
+  // Build the text message with non-image file references
+  let messageText = text;
+  if (otherFiles.length > 0) {
+    const fileRefs = otherFiles
+      .map((f) => `[Attached file: ${f.path}]`)
+      .join("\n");
+    messageText = `${fileRefs}\n\n${text}`;
+  }
+
+  // If session is stopped/error, resume it with the message
+  if (s.state === "stopped" || s.state === "error") {
+    // For resumed sessions, we can't easily add images to the resume flow
+    // Just include the text with file references
+    const resumed = await resumeSession(s, messageText);
+    return resumed;
+  }
+
+  // Read images and convert to base64
+  const images: ImageContent[] = [];
+  if (imageFiles.length > 0) {
+    const project = await getProject(projectSlug);
+    if (project) {
+      const task = project.tasks.find((t) => t.slug === taskSlug);
+      if (task) {
+        const filesDir = path.join(taskDir(project, task), "files");
+        for (const imgFile of imageFiles) {
+          try {
+            const imgPath = path.join(filesDir, imgFile.path);
+            const data = await fs.readFile(imgPath);
+            const base64 = data.toString("base64");
+            images.push({ mimeType: imgFile.mimeType, base64 });
+          } catch (err) {
+            console.error(`Failed to read image ${imgFile.path}:`, err);
+          }
+        }
+      }
+    }
+  }
+
+  // Create the appropriate message type
+  let msg;
+  if (images.length > 0) {
+    msg = makeUserMessageWithImages(messageText, images, id);
+  } else {
+    msg = makeUserMessage(messageText, id);
+  }
+
+  // Log and emit the message
+  s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: messageText, files }) + "\n");
+  s.history.push(msg);
+  s.log.write(JSON.stringify(msg) + "\n");
+  s.events.emit("event", msg);
+  s.input.push(msg);
+  s.lastActivity = new Date();
+  setState(s, "running");
+  return true;
+}
+
 // Resume a stopped session by creating a new SDK query with the resume option
 async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boolean> {
   // Need the SDK session ID to resume
@@ -928,6 +1182,17 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
       message: "Cannot resume: session has no SDK session ID. Please start a new session.",
     } as unknown as SDKMessage);
     return false;
+  }
+
+  // Interrupt any existing query to stop the old pumpEvents loop.
+  // This prevents race conditions where the old loop overwrites state after
+  // the new one has already set it.
+  if (s.q) {
+    try {
+      await s.q.interrupt();
+    } catch {
+      // Ignore errors — query may already be done
+    }
   }
 
   try {
@@ -1035,14 +1300,23 @@ export function forceStop(id: string): boolean {
 }
 
 // Mark a session as seen by updating its meta.json with a seenAt timestamp.
+// Also updates the in-memory seenAt for live sessions.
 // Returns true if successful, false if session not found.
 export async function markSessionSeen(
   projectSlug: string,
   taskSlug: string,
   sessionId: string,
 ): Promise<boolean> {
+  const now = new Date();
+
+  // Update in-memory seenAt for live sessions
+  const liveSession = registry.get(sessionId);
+  if (liveSession) {
+    liveSession.seenAt = now;
+  }
+
   const project = await getProject(projectSlug);
-  if (!project) return false;
+  if (!project) return !!liveSession; // Return true if we at least updated in-memory
 
   let sessionDir: string;
   if (!taskSlug) {
@@ -1050,7 +1324,7 @@ export async function markSessionSeen(
     sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
+    if (!task) return !!liveSession;
     sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
   }
 
@@ -1058,11 +1332,11 @@ export async function markSessionSeen(
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
-    meta.seenAt = new Date().toISOString();
+    meta.seenAt = now.toISOString();
     await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
     return true;
   } catch {
-    return false;
+    return !!liveSession; // Return true if we at least updated in-memory
   }
 }
 

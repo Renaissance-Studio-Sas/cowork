@@ -14,8 +14,13 @@ export function buildEnhancedHtml(userHtml: string): string {
     padding: 0 1px;
     border-radius: 2px;
     cursor: pointer;
+    transition: background 120ms ease, border-bottom-color 120ms ease;
   }
   mark[data-wb-comment]:hover { background: rgba(37, 99, 235, 0.24); }
+  mark[data-wb-comment].active {
+    background: rgba(251, 191, 36, 0.35);
+    border-bottom-color: #f59e0b;
+  }
 </style>
 </head><body>
 ${userHtml}
@@ -292,6 +297,20 @@ ${userHtml}
   window.addEventListener("message", function (e) {
     if (!e.data || typeof e.data !== "object") return;
     if (e.data.type === "wb:set-comments") applyComments(e.data.comments || []);
+    if (e.data.type === "wb:set-active-comment") {
+      // Clear previous active
+      document.querySelectorAll("mark[data-wb-comment].active").forEach(function (el) {
+        el.classList.remove("active");
+      });
+      const id = e.data.commentId;
+      if (id !== null) {
+        const mark = document.querySelector('mark[data-wb-comment="' + id + '"]');
+        if (mark) {
+          mark.classList.add("active");
+          mark.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
+    }
   });
 
   document.addEventListener("click", function (e) {

@@ -1,19 +1,25 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, usePathname } from "next/navigation";
 import { Chat } from "@/components/Chat";
 import { useWorkspace } from "@/lib/workspace-context";
-import { taskRoute } from "@/lib/routes";
+import { taskRoute, saveTaskPath } from "@/lib/routes";
 
 export default function TaskSessionPage() {
   const params = useParams();
   const router = useRouter();
+  const pathname = usePathname();
   const projectSlug = decodeURIComponent(params.slug as string);
   const taskSlug = decodeURIComponent(params.taskSlug as string);
   const sessionId = decodeURIComponent(params.sessionId as string);
 
   const { sessions, refresh } = useWorkspace();
+
+  // Save the current path to localStorage for task state persistence
+  useEffect(() => {
+    saveTaskPath(projectSlug, taskSlug, pathname);
+  }, [pathname, projectSlug, taskSlug]);
   const [notFoundTimeout, setNotFoundTimeout] = useState(false);
   const markedSeenRef = useRef(false);
 

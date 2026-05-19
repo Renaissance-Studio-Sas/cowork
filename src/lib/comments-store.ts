@@ -9,7 +9,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, taskDir } from "./fs";
+import { getProject, taskDir, projectDir } from "./fs";
 
 export interface StoredComment {
   id: number;
@@ -19,6 +19,7 @@ export interface StoredComment {
   body: string;
   author: string;
   createdAt: string;        // ISO timestamp
+  updatedAt: string | null; // ISO timestamp, set when body is edited
   resolvedAt: string | null;
 }
 
@@ -27,10 +28,21 @@ interface CommentsFile {
   comments: StoredComment[];
 }
 
+// Returns the path to the .comments.json file for a project or task.
+// - If taskSlug is provided, returns the task-level comments file.
+// - If taskSlug is empty/null, returns the project-level comments file.
 async function pathFor(projectSlug: string, taskSlug: string): Promise<string | null> {
   const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) return null;
+  if (!project) return null;
+
+  // Project-level comments (no task)
+  if (!taskSlug) {
+    return path.join(projectDir(project), ".comments.json");
+  }
+
+  // Task-level comments
+  const task = project.tasks.find((t) => t.slug === taskSlug);
+  if (!task) return null;
   return path.join(taskDir(project, task), ".comments.json");
 }
 
@@ -70,7 +82,7 @@ export async function commentCounts(projectSlug: string, taskSlug: string): Prom
 export async function addComment(
   projectSlug: string,
   taskSlug: string,
-  input: Omit<StoredComment, "id" | "createdAt" | "resolvedAt"> & { createdAt?: string },
+  input: Omit<StoredComment, "id" | "createdAt" | "updatedAt" | "resolvedAt"> & { createdAt?: string },
 ): Promise<StoredComment> {
   const p = await pathFor(projectSlug, taskSlug);
   if (!p) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
@@ -84,6 +96,7 @@ export async function addComment(
     body: input.body,
     author: input.author,
     createdAt: input.createdAt ?? new Date().toISOString(),
+    updatedAt: null,
     resolvedAt: null,
   };
   f.comments.push(created);
@@ -111,4 +124,16 @@ export async function setResolved(projectSlug: string, taskSlug: string, id: num
   if (!c) return;
   c.resolvedAt = resolved ? new Date().toISOString() : null;
   await write(p, f);
+}
+
+export async function updateComment(projectSlug: string, taskSlug: string, id: number, body: string): Promise<StoredComment | null> {
+  const p = await pathFor(projectSlug, taskSlug);
+  if (!p) return null;
+  const f = await read(p);
+  const c = f.comments.find((x) => x.id === id);
+  if (!c) return null;
+  c.body = body;
+  c.updatedAt = new Date().toISOString();
+  await write(p, f);
+  return c;
 }

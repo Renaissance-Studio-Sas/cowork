@@ -9,16 +9,31 @@ export const dynamic = "force-dynamic";
 function mimeFor(p: string): string {
   const ext = path.extname(p).toLowerCase();
   switch (ext) {
+    case ".css": return "text/css; charset=utf-8";
+    case ".js": case ".mjs": return "text/javascript; charset=utf-8";
+    case ".ts": case ".tsx": return "text/typescript; charset=utf-8";
     case ".md": case ".txt": return "text/plain; charset=utf-8";
     case ".html": case ".htm": return "text/html; charset=utf-8";
     case ".json": return "application/json";
+    case ".xml": return "application/xml";
+    case ".woff": return "font/woff";
+    case ".woff2": return "font/woff2";
+    case ".ttf": return "font/ttf";
+    case ".otf": return "font/otf";
+    case ".eot": return "application/vnd.ms-fontobject";
     case ".png": return "image/png";
     case ".jpg": case ".jpeg": return "image/jpeg";
     case ".gif": return "image/gif";
     case ".webp": return "image/webp";
     case ".svg": return "image/svg+xml";
+    case ".ico": return "image/x-icon";
     case ".pdf": return "application/pdf";
     case ".csv": return "text/csv; charset=utf-8";
+    case ".mp4": return "video/mp4";
+    case ".webm": return "video/webm";
+    case ".mp3": return "audio/mpeg";
+    case ".wav": return "audio/wav";
+    case ".zip": return "application/zip";
     default: return "application/octet-stream";
   }
 }

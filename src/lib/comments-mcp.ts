@@ -5,7 +5,7 @@
 
 import { tool, createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { addComment, deleteComment, listComments } from "./comments-store";
+import { addComment, deleteComment, listComments, updateComment } from "./comments-store";
 
 export function buildCommentsMcp(projectSlug: string, taskSlug: string): McpSdkServerConfigWithInstance {
   return createSdkMcpServer({
@@ -68,6 +68,27 @@ export function buildCommentsMcp(projectSlug: string, taskSlug: string): McpSdkS
           });
           return {
             content: [{ type: "text", text: `Added comment ${created.id} on ${file_path}.` }],
+          };
+        },
+      ),
+
+      tool(
+        "edit_comment",
+        "Edit the body of an existing comment. Use this to update a comment you previously made, for example to add more information or correct a mistake.",
+        {
+          comment_id: z.number().int(),
+          body: z.string(),
+        },
+        async ({ comment_id, body }) => {
+          const updated = await updateComment(projectSlug, taskSlug, comment_id, body);
+          if (!updated) {
+            return {
+              content: [{ type: "text", text: `No comment with id ${comment_id} in this task.` }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: "text", text: `Updated comment ${comment_id}.` }],
           };
         },
       ),

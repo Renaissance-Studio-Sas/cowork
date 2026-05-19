@@ -1,9 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useWorkspace } from "@/lib/workspace-context";
 import { handleComposerEnter } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
+import { TodoList, extractTodosFromMessages } from "./TodoList";
+import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
+
+interface UploadedFile {
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+}
+
+// Number of messages to load initially and per batch
+const PAGE_SIZE = 50;
 
 interface Props {
   projectSlug: string;
@@ -37,14 +49,14 @@ const STATE_LABEL: Record<string, string> = {
   awaiting_input: "needs reply",
   running: "working",
   idle: "done",
-  stopped: "stopped",
+  stopped: "done", // stopped sessions seamlessly resume, show as done
   error: "error",
 };
 const STATE_COLOR: Record<string, string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
   idle: "var(--ok)",
-  stopped: "var(--muted)",
+  stopped: "var(--ok)", // same as idle/done
   error: "#dc2626",
 };
 
@@ -464,15 +476,94 @@ function LiveChat({
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
+  // File attachment state
+  const [attachments, setAttachments] = useState<FileAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+
+  // Lazy loading state
+  const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const isAtBottomRef = useRef(true);
+  const prevScrollHeightRef = useRef(0);
+  const isInitialLoadRef = useRef(true);
+
+  // Check if user is scrolled to bottom
+  const checkIfAtBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return true;
+    const threshold = 50;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  }, []);
+
+  // Update isAtBottomRef on scroll
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const handleScroll = () => {
+      isAtBottomRef.current = checkIfAtBottom();
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, [checkIfAtBottom]);
+
+  // After prepending older messages, restore scroll position
+  useEffect(() => {
+    if (isLoadingMore || isInitialLoadRef.current) return;
+    const el = scrollRef.current;
+    if (!el || prevScrollHeightRef.current === 0) return;
+    const heightDiff = el.scrollHeight - prevScrollHeightRef.current;
+    if (heightDiff > 0) {
+      el.scrollTop += heightDiff;
+    }
+    prevScrollHeightRef.current = 0;
+  }, [messages.length, isLoadingMore]);
+
+  // Stable reference to onRefresh to avoid re-running the effect
+  const onRefreshRef = useRef(onRefresh);
+  onRefreshRef.current = onRefresh;
+
   useEffect(() => {
     setMessages([]);
     setState(session.state);
     setStreamConnected(false);
+    setHistoryMeta(null);
+    isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
     // the session might actually be live (race condition with API polling)
-    const es = new EventSource(`/api/sessions/${session.id}/stream`);
+    const es = new EventSource(
+      `/api/sessions/${session.id}/stream?limit=${PAGE_SIZE}&project=${encodeURIComponent(session.projectSlug)}&task=${encodeURIComponent(session.taskSlug)}`,
+    );
     let connected = false;
+    let initialMessages: SDKMessageLite[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushInitial = () => {
+      if (initialMessages.length > 0 && isInitialLoadRef.current) {
+        setMessages(initialMessages);
+        isInitialLoadRef.current = false;
+        // Scroll to bottom after initial render
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) {
+            el.scrollTop = el.scrollHeight;
+            isAtBottomRef.current = true;
+          }
+        });
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flushInitial, 50);
+    };
+
+    es.addEventListener("history_meta", (ev) => {
+      try {
+        const meta = JSON.parse((ev as MessageEvent).data);
+        setHistoryMeta(meta);
+      } catch { /* ignore */ }
+    });
 
     es.addEventListener("message", (ev) => {
       try {
@@ -480,7 +571,20 @@ function LiveChat({
           connected = true;
           setStreamConnected(true);
         }
-        setMessages((p) => [...p, JSON.parse((ev as MessageEvent).data)]);
+        const msg = JSON.parse((ev as MessageEvent).data);
+
+        if (isInitialLoadRef.current) {
+          initialMessages.push(msg);
+          scheduleFlush();
+        } else {
+          setMessages((p) => [...p, msg]);
+          if (isAtBottomRef.current) {
+            requestAnimationFrame(() => {
+              const el = scrollRef.current;
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+          }
+        }
       } catch { /* ignore */ }
     });
     es.addEventListener("state", (ev) => {
@@ -491,7 +595,7 @@ function LiveChat({
         }
         const { state: st } = JSON.parse((ev as MessageEvent).data);
         setState(st);
-        onRefresh();
+        onRefreshRef.current();
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -499,42 +603,137 @@ function LiveChat({
       if (!connected) {
         es.close();
         setStreamConnected(false);
-        // Load from disk
-        fetch(`/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}`)
+        // Load from disk with pagination
+        fetch(`/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=0`)
           .then((r) => r.json())
           .then((j) => {
-            if (j.events) setMessages(j.events);
+            if (j.events) {
+              setMessages(j.events);
+              setHistoryMeta({
+                total: j.total,
+                hasMore: j.hasMore,
+                offset: j.total - j.events.length,
+              });
+            }
+            isInitialLoadRef.current = false;
+            // Scroll to bottom after loading
+            requestAnimationFrame(() => {
+              const el = scrollRef.current;
+              if (el) {
+                el.scrollTop = el.scrollHeight;
+                isAtBottomRef.current = true;
+              }
+            });
           });
       }
       // If we were connected before, SSE will auto-reconnect
     };
-    return () => es.close();
-  }, [session.id, session.projectSlug, session.taskSlug, session.state, onRefresh]);
+    return () => {
+      es.close();
+      if (flushTimer) clearTimeout(flushTimer);
+    };
+    // Only reconnect SSE when session.id changes, not on state changes
+    // State updates come via the SSE stream itself
+  }, [session.id, session.projectSlug, session.taskSlug]);
 
-  useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages.length]);
+  // Load more (older) messages
+  const loadMore = useCallback(async () => {
+    if (!historyMeta || !historyMeta.hasMore || isLoadingMore) return;
+
+    setIsLoadingMore(true);
+    if (scrollRef.current) {
+      prevScrollHeightRef.current = scrollRef.current.scrollHeight;
+    }
+
+    try {
+      const r = await fetch(
+        `/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=${messages.length}`
+      );
+      const j = await r.json();
+
+      if (j.events && j.events.length > 0) {
+        setMessages((p) => [...j.events, ...p]);
+        setHistoryMeta({
+          total: j.total,
+          hasMore: j.hasMore,
+          offset: historyMeta.offset + PAGE_SIZE,
+        });
+      }
+    } catch (err) {
+      console.error("Failed to load more messages:", err);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [historyMeta, isLoadingMore, session.id, session.projectSlug, session.taskSlug, messages.length]);
 
   // Use streamConnected OR session.isLive to determine if we can interact
   const isLive = streamConnected || session.isLive;
 
+  // Extract todos from the message stream
+  const todos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+
+  // Todo panel visibility (defaults to shown when there are todos)
+  const [showTodos, setShowTodos] = useState(true);
+
+  // Handle file drop/paste
+  const handleFiles = useCallback((files: FileAttachment[]) => {
+    setAttachments((prev) => [...prev, ...files]);
+  }, []);
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  // Upload files and return their server paths
+  const uploadFiles = async (files: FileAttachment[]): Promise<UploadedFile[]> => {
+    const uploaded: UploadedFile[] = [];
+    for (const att of files) {
+      const formData = new FormData();
+      formData.append("file", att.file);
+      const res = await fetch(
+        `/api/files/upload?project=${session.projectSlug}&task=${session.taskSlug}`,
+        { method: "POST", body: formData }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        uploaded.push({
+          name: data.name,
+          path: data.path,
+          mimeType: data.mimeType,
+          size: data.size,
+        });
+      }
+    }
+    return uploaded;
+  };
+
   const send = async () => {
-    if (!draft.trim() || sending) return;
+    if ((!draft.trim() && attachments.length === 0) || sending || uploading) return;
     setSending(true);
+    setUploading(attachments.length > 0);
     try {
+      // Upload attachments first
+      let uploadedFiles: UploadedFile[] = [];
+      if (attachments.length > 0) {
+        uploadedFiles = await uploadFiles(attachments);
+      }
+
       const contextPrefix = filePath ? `[Re: ${filePath}]\n\n` : "";
       await fetch(`/api/sessions/${session.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: contextPrefix + draft.trim(),
+          message: contextPrefix + (draft.trim() || "(attached files)"),
           projectSlug: session.projectSlug,
           taskSlug: session.taskSlug,
+          files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
         }),
       });
       setDraft("");
+      setAttachments([]);
     } finally {
       setSending(false);
+      setUploading(false);
     }
   };
 
@@ -548,6 +747,18 @@ function LiveChat({
   return (
     <>
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+        {/* Load more button at top for older messages */}
+        {historyMeta?.hasMore && (
+          <div className="text-center">
+            <button
+              onClick={loadMore}
+              disabled={isLoadingMore}
+              className="text-[11px] text-[var(--accent)] hover:text-[var(--text)] disabled:opacity-50 px-2 py-1 rounded border border-[var(--border)] hover:border-[var(--accent)] transition"
+            >
+              {isLoadingMore ? "Loading…" : `Load more (${historyMeta.total - messages.length})`}
+            </button>
+          </div>
+        )}
         <PanelMessageStream messages={messages} />
         {messages.length === 0 && (
           <div className="text-[var(--muted)] text-[12.5px]">
@@ -562,45 +773,90 @@ function LiveChat({
         )}
       </div>
 
-      <div className="border-t border-[var(--border)] p-2.5 bg-[var(--bg-2)]">
-        <div className="rounded-xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-2 py-1.5 focus-within:border-[var(--accent)] transition">
-          <textarea
-            ref={composerRef}
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder={isAwaiting ? "Reply…" : state === "stopped" || state === "error" ? "Continue this session…" : "Send a message…"}
-            rows={1}
-            style={{ maxHeight: 140 }}
-            onInput={(e) => {
-              const el = e.currentTarget;
-              el.style.height = "auto";
-              el.style.height = Math.min(el.scrollHeight, 140) + "px";
-            }}
-            onKeyDown={(e) => handleComposerEnter(e, send)}
-            className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
-          />
-          <button
-            onClick={send}
-            disabled={!draft.trim() || sending}
-            className="rounded-md bg-[var(--accent)] text-[var(--accent-text)] w-8 h-8 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 shrink-0"
-            title={state === "stopped" || state === "error" ? "Resume session (↵)" : "Send (↵)"}
-          >
-            ↑
-          </button>
-          {isWorking && (
-            <button
-              onClick={stop}
-              className="rounded-md border border-[var(--border-strong)] text-[var(--muted)] hover:text-[#dc2626] hover:border-[#dc2626] w-8 h-8 flex items-center justify-center transition shrink-0"
-              title="Stop"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="6" y="6" width="12" height="12" rx="2" />
-              </svg>
-            </button>
+      {/* Todo list above input when present */}
+      {todos.length > 0 && (
+        <div className="border-t border-[var(--border)] bg-[var(--bg-2)]">
+          {showTodos ? (
+            <div className="px-2.5 pt-2.5 pb-1">
+              <div className="relative">
+                <TodoList todos={todos} compact />
+                <button
+                  onClick={() => setShowTodos(false)}
+                  className="absolute top-1 right-1 text-[var(--muted)] hover:text-[var(--text)] p-1 rounded hover:bg-[var(--panel-2)] transition"
+                  title="Hide tasks"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M18 6L6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="px-2.5 py-1.5 flex items-center justify-between">
+              <button
+                onClick={() => setShowTodos(true)}
+                className="flex items-center gap-1.5 text-[11px] text-[var(--muted)] hover:text-[var(--text)] transition"
+                title="Show tasks"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M9 11l3 3L22 4" />
+                  <path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
+                </svg>
+                <span>
+                  {todos.filter(t => t.status === "completed").length}/{todos.length} tasks
+                </span>
+              </button>
+            </div>
           )}
         </div>
+      )}
+
+      <div className="border-t border-[var(--border)] p-2.5 bg-[var(--bg-2)]">
+        <FileDropZone onFiles={handleFiles} className="rounded-xl">
+          {attachments.length > 0 && (
+            <div className="px-2 pt-1.5">
+              <AttachmentPreview attachments={attachments} onRemove={removeAttachment} compact />
+            </div>
+          )}
+          <div className="rounded-xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-2 py-1.5 focus-within:border-[var(--accent)] transition">
+            <textarea
+              ref={composerRef}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder={isAwaiting ? "Reply…" : state === "stopped" || state === "error" ? "Continue…" : "Drop files or message…"}
+              rows={1}
+              style={{ maxHeight: 140 }}
+              onInput={(e) => {
+                const el = e.currentTarget;
+                el.style.height = "auto";
+                el.style.height = Math.min(el.scrollHeight, 140) + "px";
+              }}
+              onKeyDown={(e) => handleComposerEnter(e, send)}
+              className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
+            />
+            <button
+              onClick={send}
+              disabled={(!draft.trim() && attachments.length === 0) || sending || uploading}
+              className="rounded-md bg-[var(--accent)] text-[var(--accent-text)] w-8 h-8 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 shrink-0"
+              title={state === "stopped" || state === "error" ? "Resume session (↵)" : "Send (↵)"}
+            >
+              {uploading ? "…" : "↑"}
+            </button>
+            {isWorking && (
+              <button
+                onClick={stop}
+                className="rounded-md border border-[var(--border-strong)] text-[var(--muted)] hover:text-[#dc2626] hover:border-[#dc2626] w-8 h-8 flex items-center justify-center transition shrink-0"
+                title="Stop"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </FileDropZone>
         <div className="text-[10.5px] text-[var(--muted)] px-1 pt-1">
-          {state === "stopped" ? "Session paused — send a message to resume" : state === "error" ? "Session ended with error — send a message to resume" : `${session.projectSlug} · ${session.taskSlug}`}
+          {state === "error" ? "Session ended with error — send a message to resume" : `${session.projectSlug} · ${session.taskSlug}`}
         </div>
       </div>
     </>

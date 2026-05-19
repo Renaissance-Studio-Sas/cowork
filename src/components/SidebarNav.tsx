@@ -1,13 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { StatusChip } from "./StatusChip";
-import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute } from "@/lib/routes";
+import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
 
@@ -360,10 +360,29 @@ function TaskRow({
   onRenameCancel: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
+  const router = useRouter();
   const tooltip = (task.description || "").split("\n")[0].replace(/^#+\s*/, "");
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (renaming !== null) return; // Let input handle clicks
+    e.preventDefault();
+    // Navigate to the last visited path for this task, or task root
+    const targetRoute = getTaskRestoreRoute(projectSlug, task.slug);
+    router.push(targetRoute);
+  };
+
   return (
-    <Link
-      href={taskRoute(projectSlug, task.slug)}
+    <div
+      role="link"
+      tabIndex={0}
+      onClick={handleClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && renaming === null) {
+          e.preventDefault();
+          const targetRoute = getTaskRestoreRoute(projectSlug, task.slug);
+          router.push(targetRoute);
+        }
+      }}
       onContextMenu={onContextMenu}
       draggable={!renaming}
       onDragStart={(e) => {
@@ -409,7 +428,7 @@ function TaskRow({
           ) : null}
         </div>
       )}
-    </Link>
+    </div>
   );
 }
 

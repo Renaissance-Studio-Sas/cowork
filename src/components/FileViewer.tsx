@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 // rehype-raw intentionally omitted — see Chat.tsx for rationale.
@@ -18,7 +18,7 @@ import { AgentPanel } from "./AgentPanel";
 import { ChatPanel } from "./ChatPanel";
 import { Resizer } from "./Resizer";
 import { handleComposerEnter } from "@/lib/composer";
-import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute } from "@/lib/routes";
+import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute, saveTaskPath } from "@/lib/routes";
 import { useWorkspace } from "@/lib/workspace-context";
 
 const CHAT_PANEL_WIDTH_KEY = "wb-chat-panel-width";
@@ -38,6 +38,7 @@ interface CommentRow {
   body: string;
   author: string;
   createdAt: string | number;
+  updatedAt: string | number | null;
   resolvedAt: string | number | null;
   anchorType: "md" | "html";
   anchorData: Partial<TextAnchor> & { quote?: string };
@@ -59,10 +60,17 @@ const TEXT_EXT = new Set(["md", "markdown", "txt", "json", "csv", "yaml", "yml",
 
 export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // Initialize sidebar states from URL search params
+  const initialCommentsPanelOpen = searchParams.get("comments") === "1";
+  const initialChatPanelOpen = searchParams.get("chat") === "1";
+
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
-  const [panelOpen, setPanelOpen] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(initialCommentsPanelOpen);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [pendingAnchor, setPendingAnchor] = useState<TextAnchor | null>(null);
@@ -71,12 +79,30 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
   // For HTML files, the iframe tells us which comments it could anchor.
   const [htmlObsoleteIds, setHtmlObsoleteIds] = useState<Set<number>>(new Set());
   // Chat panel state
-  const [chatPanelOpen, setChatPanelOpen] = useState(false);
+  const [chatPanelOpen, setChatPanelOpen] = useState(initialChatPanelOpen);
   const [chatPanelWidth, setChatPanelWidth] = useState(() => {
     if (typeof window === "undefined") return DEFAULT_CHAT_WIDTH;
     const stored = localStorage.getItem(CHAT_PANEL_WIDTH_KEY);
     return stored ? parseInt(stored, 10) : DEFAULT_CHAT_WIDTH;
   });
+
+  // Update URL and save task path when sidebar states change
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (panelOpen) params.set("comments", "1");
+    if (chatPanelOpen) params.set("chat", "1");
+    const search = params.toString();
+    const fullPath = search ? `${pathname}?${search}` : pathname;
+
+    // Update URL without navigation (replace state)
+    const newUrl = search ? `${pathname}?${search}` : pathname;
+    window.history.replaceState(null, "", newUrl);
+
+    // Save to localStorage for task state persistence
+    if (taskSlug) {
+      saveTaskPath(projectSlug, taskSlug, fullPath);
+    }
+  }, [panelOpen, chatPanelOpen, pathname, projectSlug, taskSlug]);
   const contentRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -119,35 +145,25 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
   }, [projectSlug, taskSlug, filePath, supportsComments]);
 
   // --- Auto-refresh when an agent modifies this file ----------------------
-  // Subscribe to SSE streams from any live sessions in this project/task.
-  // When a file_changed event matches our filePath, refresh the content.
+  // Subscribe to one multiplexed stream covering every live session in this
+  // project/task. (Originally we opened one EventSource per session, which
+  // exhausted the browser's per-origin connection limit on busy tasks.)
   useEffect(() => {
-    const liveSessions = sessions.filter(
-      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && s.isLive
+    const es = new EventSource(
+      `/api/file-events/stream?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`,
     );
-    if (liveSessions.length === 0) return;
-
-    const eventSources: EventSource[] = [];
-    for (const sess of liveSessions) {
-      const es = new EventSource(`/api/sessions/${sess.id}/stream`);
-      es.addEventListener("file_changed", (ev) => {
-        try {
-          const data = JSON.parse((ev as MessageEvent).data) as { path?: string };
-          // Compare paths: the event path is absolute from SDK, filePath is relative
-          // Check if the event path ends with our filePath
-          if (data.path && (data.path === filePath || data.path.endsWith(`/${filePath}`))) {
-            refreshFile();
-            refreshComments();
-          }
-        } catch { /* ignore parse errors */ }
-      });
-      eventSources.push(es);
-    }
-
-    return () => {
-      for (const es of eventSources) es.close();
-    };
-  }, [sessions, projectSlug, taskSlug, filePath, refreshFile, refreshComments]);
+    es.addEventListener("file_changed", (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { path?: string };
+        // Event path is absolute from the SDK; filePath is relative to cwd.
+        if (data.path && (data.path === filePath || data.path.endsWith(`/${filePath}`))) {
+          refreshFile();
+          refreshComments();
+        }
+      } catch { /* ignore parse errors */ }
+    });
+    return () => es.close();
+  }, [projectSlug, taskSlug, filePath, refreshFile, refreshComments]);
 
   useEffect(() => {
     refreshComments();
@@ -215,6 +231,27 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
     root.addEventListener("click", onClick);
     return () => root.removeEventListener("click", onClick);
   }, [text, isMd]);
+
+  // --- Scroll to and highlight active comment ------------------------------
+  useEffect(() => {
+    if (isMd) {
+      const root = contentRef.current;
+      if (!root) return;
+      // Clear previous active
+      root.querySelectorAll("mark[data-comment-id].active").forEach((el) => el.classList.remove("active"));
+      if (activeId !== null) {
+        const mark = root.querySelector(`mark[data-comment-id="${activeId}"]`) as HTMLElement | null;
+        if (mark) {
+          mark.classList.add("active");
+          mark.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
+    } else if (isHtml) {
+      const iframe = iframeRef.current;
+      if (!iframe) return;
+      iframe.contentWindow?.postMessage({ type: "wb:set-active-comment", commentId: activeId }, "*");
+    }
+  }, [activeId, isMd, isHtml]);
 
   // --- HTML iframe message bridge -----------------------------------------
   const sendCommentsToIframe = useCallback(() => {
@@ -399,6 +436,15 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
     refreshComments();
   };
 
+  const editComment = async (id: number, body: string) => {
+    await fetch(`/api/comments/${id}?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body }),
+    });
+    refreshComments();
+  };
+
   // Live agent session for this file — opens inline as a right column so the
   // user can keep reading/marking the doc while the agent works.
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
@@ -409,30 +455,30 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
     setSendingToAgent(true);
     try {
       const message = buildAgentMessage(filePath, live);
-      const r = await fetch("/api/sessions", { cache: "no-store" });
-      const j = await r.json();
-      const sessions: Array<{
-        id: string;
-        projectSlug: string;
-        taskSlug: string;
-        state: string;
-        isLive: boolean;
-      }> = j.sessions ?? [];
-      const target = sessions.find(
-        (s) =>
-          s.projectSlug === projectSlug &&
-          s.taskSlug === taskSlug &&
-          s.isLive &&
-          s.state !== "stopped" &&
-          s.state !== "error",
-      );
-      if (target) {
-        await fetch(`/api/sessions/${target.id}/input`, {
+      // Only reuse a session if one is already open in a side panel.
+      // Otherwise, always create a new session.
+      // Check 1: AgentPanel is open with a session
+      let targetSessionId = agentSessionId;
+      // Check 2: ChatPanel is open — use its active live session if any
+      if (!targetSessionId && chatPanelOpen && taskSlug) {
+        const taskSessions = sessions.filter(
+          (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug,
+        );
+        const liveSession = taskSessions.find(
+          (s) => s.isLive && s.state !== "stopped" && s.state !== "error",
+        );
+        if (liveSession) {
+          targetSessionId = liveSession.id;
+        }
+      }
+      if (targetSessionId) {
+        await fetch(`/api/sessions/${targetSessionId}/input`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message }),
         });
-        setAgentSessionId(target.id);
+        // Ensure AgentPanel shows this session
+        if (!agentSessionId) setAgentSessionId(targetSessionId);
       } else {
         const res = await fetch(
           `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`,
@@ -601,6 +647,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
             onClearPending={() => setPendingAnchor(null)}
             onPost={postComment}
             onDelete={deleteComment}
+            onEdit={editComment}
             onSendToAgent={sendCommentsToAgent}
             sendingToAgent={sendingToAgent}
           />
@@ -716,7 +763,7 @@ function ContextMenu({ x, y, onComment }: { x: number; y: number; onComment: () 
 
 function CommentPanel({
   comments, activeId, onActiveChange, composerRef, draft, pendingAnchor,
-  onDraft, onClearPending, onPost, onDelete, onSendToAgent, sendingToAgent,
+  onDraft, onClearPending, onPost, onDelete, onEdit, onSendToAgent, sendingToAgent,
 }: {
   comments: ResolvedComment[];
   activeId: number | null;
@@ -728,6 +775,7 @@ function CommentPanel({
   onClearPending: () => void;
   onPost: () => void;
   onDelete: (id: number) => void;
+  onEdit: (id: number, body: string) => void;
   onSendToAgent: () => void;
   sendingToAgent: boolean;
 }) {
@@ -790,7 +838,7 @@ function CommentPanel({
           <>
             <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-semibold px-1">On the document</div>
             {live.filter((c) => !c.anchor).map((c) => (
-              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} />
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} onEdit={onEdit} />
             ))}
           </>
         )}
@@ -800,7 +848,7 @@ function CommentPanel({
               <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-semibold px-1 pt-2">On selections</div>
             )}
             {live.filter((c) => c.anchor).map((c) => (
-              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} />
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} onEdit={onEdit} />
             ))}
           </>
         )}
@@ -814,7 +862,7 @@ function CommentPanel({
               The text these comments were attached to is no longer in the document.
             </div>
             {obsolete.map((c) => (
-              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} dim />
+              <CommentCard key={c.id} c={c} active={activeId === c.id} onClick={() => onActiveChange(c.id)} onDelete={onDelete} onEdit={onEdit} dim />
             ))}
           </>
         )}
@@ -824,15 +872,41 @@ function CommentPanel({
 }
 
 function CommentCard({
-  c, active, onClick, onDelete, dim,
+  c, active, onClick, onDelete, onEdit, dim,
 }: {
   c: ResolvedComment;
   active: boolean;
   onClick: () => void;
   onDelete: (id: number) => void;
+  onEdit: (id: number, body: string) => void;
   dim?: boolean;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState(c.body);
   const quote = c.anchor?.exact;
+
+  const handleSave = () => {
+    if (editDraft.trim() && editDraft.trim() !== c.body) {
+      onEdit(c.id, editDraft.trim());
+    }
+    setEditing(false);
+  };
+
+  const handleCancel = () => {
+    setEditDraft(c.body);
+    setEditing(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      handleSave();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      handleCancel();
+    }
+  };
+
   return (
     <div
       onClick={onClick}
@@ -840,19 +914,55 @@ function CommentCard({
     >
       <div className="flex items-center gap-2 mb-1.5">
         <span className="font-medium">{c.author}</span>
-        <span className="text-[11px] text-[var(--muted)]">{new Date(c.createdAt).toLocaleString()}</span>
-        <button
-          onClick={(e) => { e.stopPropagation(); onDelete(c.id); }}
-          className="ml-auto text-[var(--muted)] hover:text-[#dc2626] text-[11px]"
-          title="Delete"
-        >×</button>
+        <span className="text-[11px] text-[var(--muted)]">
+          {new Date(c.createdAt).toLocaleString()}
+          {c.updatedAt && " (edited)"}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          {!editing && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setEditing(true); }}
+              className="text-[var(--muted)] hover:text-[var(--text)] text-[11px]"
+              title="Edit"
+            >Edit</button>
+          )}
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(c.id); }}
+            className="text-[var(--muted)] hover:text-[#dc2626] text-[11px]"
+            title="Delete"
+          >×</button>
+        </div>
       </div>
       {quote && (
         <div className={`text-[11.5px] italic border-l-2 ${dim ? "border-[var(--border-strong)] text-[var(--muted)]" : "border-[var(--accent)] text-[var(--text-soft)]"} pl-2 mb-1.5 line-clamp-3`}>
           &ldquo;{quote}&rdquo;
         </div>
       )}
-      <div className="whitespace-pre-wrap">{c.body}</div>
+      {editing ? (
+        <div onClick={(e) => e.stopPropagation()}>
+          <textarea
+            value={editDraft}
+            onChange={(e) => setEditDraft(e.target.value)}
+            onKeyDown={handleKeyDown}
+            className="w-full resize-none bg-[var(--bg)] border border-[var(--border-strong)] rounded-lg outline-none text-[13px] px-2 py-1.5 leading-relaxed focus:border-[var(--accent)]"
+            rows={3}
+            autoFocus
+          />
+          <div className="flex justify-end gap-2 mt-1.5">
+            <button
+              onClick={handleCancel}
+              className="text-[11px] text-[var(--muted)] hover:text-[var(--text)]"
+            >Cancel</button>
+            <button
+              onClick={handleSave}
+              disabled={!editDraft.trim()}
+              className="text-[11px] bg-[var(--accent)] text-[var(--accent-text)] rounded px-2 py-0.5 disabled:opacity-40 hover:brightness-110"
+            >Save</button>
+          </div>
+        </div>
+      ) : (
+        <div className="whitespace-pre-wrap">{c.body}</div>
+      )}
     </div>
   );
 }

@@ -12,6 +12,8 @@ export default function TaskFilePage() {
   const pathParts = params.path as string[];
   const filePath = pathParts.map(decodeURIComponent).join("/");
 
+  // Note: FileViewer handles saveTaskPath with sidebar state params
+
   const handleBack = () => {
     // Go back to the parent folder or task root
     const lastSlash = filePath.lastIndexOf("/");

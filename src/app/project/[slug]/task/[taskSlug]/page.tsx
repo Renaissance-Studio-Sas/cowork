@@ -1,14 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams, usePathname } from "next/navigation";
 import Link from "next/link";
 import type { SessionSummaryDTO } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { StatusChip } from "@/components/StatusChip";
 import { handleComposerEnter } from "@/lib/composer";
-import { taskSessionRoute, taskFileRoute, taskDirRoute, projectRoute } from "@/lib/routes";
+import { taskSessionRoute, taskFileRoute, taskDirRoute, projectRoute, saveTaskPath } from "@/lib/routes";
+import { FileDropZone, type FileAttachment } from "@/components/FileDropZone";
 
 interface Entry {
   type: "file" | "folder";
@@ -46,12 +47,19 @@ const STATE_COLOR: Record<SessionSummaryDTO["state"], string> = {
 export default function TaskPage() {
   const params = useParams();
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   const projectSlug = decodeURIComponent(params.slug as string);
   const taskSlug = decodeURIComponent(params.taskSlug as string);
   const dirPath = searchParams.get("dir") ?? "";
 
   const { projects, sessions, refresh } = useWorkspace();
+
+  // Save the current path to localStorage for task state persistence
+  useEffect(() => {
+    const fullPath = dirPath ? `${pathname}?dir=${encodeURIComponent(dirPath)}` : pathname;
+    saveTaskPath(projectSlug, taskSlug, fullPath);
+  }, [pathname, dirPath, projectSlug, taskSlug]);
 
   const project = useMemo(
     () => projects.find((p) => p.slug === projectSlug) ?? null,
@@ -77,6 +85,7 @@ export default function TaskPage() {
   const [renameValue, setRenameValue] = useState("");
   const [renamingSession, setRenamingSession] = useState<string | null>(null);
   const [sessionRenameValue, setSessionRenameValue] = useState("");
+  const [uploading, setUploading] = useState(false);
 
   const refreshFiles = useCallback(async () => {
     if (!projectSlug || !taskSlug) return;
@@ -84,6 +93,25 @@ export default function TaskPage() {
     const j = await r.json();
     setFiles(j.files ?? []);
   }, [projectSlug, taskSlug]);
+
+  // Handle file drop for artifact upload
+  const handleFileDrop = useCallback(async (attachments: FileAttachment[]) => {
+    if (attachments.length === 0 || !projectSlug || !taskSlug) return;
+    setUploading(true);
+    try {
+      for (const att of attachments) {
+        const formData = new FormData();
+        formData.append("file", att.file);
+        // Upload to current directory (dirPath) or root
+        const subdir = dirPath || "";
+        const url = `/api/files/upload?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}${subdir ? `&subdir=${encodeURIComponent(subdir)}` : "&subdir="}`;
+        await fetch(url, { method: "POST", body: formData });
+      }
+      refreshFiles();
+    } finally {
+      setUploading(false);
+    }
+  }, [projectSlug, taskSlug, dirPath, refreshFiles]);
 
   const refreshCommentCounts = useCallback(async () => {
     if (!projectSlug || !taskSlug) return;
@@ -309,7 +337,7 @@ export default function TaskPage() {
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-[760px] mx-auto px-6 py-6 space-y-6">
-          <div>
+          <FileDropZone onFiles={handleFileDrop} disabled={uploading}>
             <div className="flex items-center gap-1.5 mb-2 px-1 text-[12px] uppercase tracking-wider text-[var(--muted)] font-medium">
               {breadcrumb.map((b, i) => (
                 <span key={i} className="flex items-center gap-1.5">
@@ -321,11 +349,13 @@ export default function TaskPage() {
                   >{i === 0 ? "Artifacts" : b.name}</button>
                 </span>
               ))}
-              <span className="ml-2 text-[var(--muted)] normal-case tracking-normal">· {entries.length}</span>
+              <span className="ml-2 text-[var(--muted)] normal-case tracking-normal">· {entries.length}{uploading && " (uploading…)"}</span>
             </div>
 
             {entries.length === 0 ? (
-              <div className="text-[13px] text-[var(--muted)] italic px-1">Empty folder.</div>
+              <div className="text-[13px] text-[var(--muted)] italic px-1">
+                Drop files here or start empty.
+              </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {entries.map((e) => {
@@ -390,7 +420,7 @@ export default function TaskPage() {
                 })}
               </div>
             )}
-          </div>
+          </FileDropZone>
 
           {!dirPath && (
             <div>

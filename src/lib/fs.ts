@@ -1,7 +1,41 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import matter from "gray-matter";
 import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
+
+// The Claude Agent SDK stores per-session transcripts under
+// `~/.claude/projects/<encoded-cwd>/<sdkSessionId>.jsonl`, where encoded-cwd
+// is the absolute cwd with `/` swapped for `-`. When we rename or move a
+// project/task folder, the cwd of every session in it changes — and the SDK
+// won't find the prior transcript at the new encoded path. Resuming silently
+// fails: only an `init` event is emitted and the agent never replies. Rename
+// the SDK transcript directories alongside the project/task folders so resume
+// keeps working.
+async function relocateSdkTranscripts(oldAbsPath: string, newAbsPath: string): Promise<void> {
+  const encode = (p: string) => p.replaceAll("/", "-");
+  const base = path.join(os.homedir(), ".claude", "projects");
+  const oldPrefix = encode(oldAbsPath);
+  const newPrefix = encode(newAbsPath);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(base);
+  } catch { return; }
+  // Match the project/task itself plus any descendant task dirs whose encoded
+  // names share that prefix (e.g. renaming a project also relocates its tasks).
+  for (const name of entries) {
+    if (name !== oldPrefix && !name.startsWith(oldPrefix + "-")) continue;
+    const renamed = newPrefix + name.slice(oldPrefix.length);
+    try {
+      await fs.rename(path.join(base, name), path.join(base, renamed));
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") {
+        console.warn(`[fs] could not relocate SDK transcripts ${name} → ${renamed}:`, e.message);
+      }
+    }
+  }
+}
 
 // Workspace root: the user's own repo / folder that contains `projects/` plus any
 // shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get read/write
@@ -239,10 +273,10 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
   const existing = await getProject(clean);
   if (existing) throw new Error(`project "${clean}" already exists`);
   const newFolder = `${project.status}-${clean}`;
-  await fs.rename(
-    path.join(PROJECTS_DIR, project.folderName),
-    path.join(PROJECTS_DIR, newFolder),
-  );
+  const oldPath = path.join(PROJECTS_DIR, project.folderName);
+  const newPath = path.join(PROJECTS_DIR, newFolder);
+  await fs.rename(oldPath, newPath);
+  await relocateSdkTranscripts(oldPath, newPath);
   relocateSessionsForProject(slug, clean);
 }
 
@@ -265,10 +299,10 @@ export async function setTaskStatus(projectSlug: string, taskSlug: string, statu
   if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
   if (task.status === status) return;
   const newFolder = `${status}-${taskSlug}`;
-  await fs.rename(
-    path.join(PROJECTS_DIR, project.folderName, task.folderName),
-    path.join(PROJECTS_DIR, project.folderName, newFolder),
-  );
+  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
+  const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
+  await fs.rename(oldPath, newPath);
+  await relocateSdkTranscripts(oldPath, newPath);
 }
 
 export async function moveTask(projectSlug: string, taskSlug: string, toProjectSlug: string): Promise<{ project: string; task: string }> {
@@ -285,10 +319,10 @@ export async function moveTask(projectSlug: string, taskSlug: string, toProjectS
     finalSlug = `${taskSlug}-${i}`;
   }
   const newFolder = `${task.status}-${finalSlug}`;
-  await fs.rename(
-    path.join(PROJECTS_DIR, project.folderName, task.folderName),
-    path.join(PROJECTS_DIR, dest.folderName, newFolder),
-  );
+  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
+  const newPath = path.join(PROJECTS_DIR, dest.folderName, newFolder);
+  await fs.rename(oldPath, newPath);
+  await relocateSdkTranscripts(oldPath, newPath);
   relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
   return { project: toProjectSlug, task: finalSlug };
 }
@@ -303,10 +337,10 @@ export async function renameTask(projectSlug: string, taskSlug: string, newSlug:
   const collision = project.tasks.find((t) => t.slug === clean);
   if (collision) throw new Error(`task "${clean}" already exists`);
   const newFolder = `${task.status}-${clean}`;
-  await fs.rename(
-    path.join(PROJECTS_DIR, project.folderName, task.folderName),
-    path.join(PROJECTS_DIR, project.folderName, newFolder),
-  );
+  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
+  const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
+  await fs.rename(oldPath, newPath);
+  await relocateSdkTranscripts(oldPath, newPath);
   relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
 }
 

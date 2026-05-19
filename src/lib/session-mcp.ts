@@ -13,7 +13,7 @@ export function buildSessionMcp(sessionId: string): McpSdkServerConfigWithInstan
       tool(
         "set_session_title",
         `Set a short, descriptive title for this session that summarizes what was accomplished.
-Call this ONCE at the END of your work, after completing the user's request.
+Call this ONCE at the START of your work, in your first response to the user's request.
 The title should be 3-6 words that capture the main outcome, like:
 - "Added dark mode toggle"
 - "Fixed login validation bug"

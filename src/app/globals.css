@@ -72,6 +72,10 @@ button { cursor: pointer; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.22); }
 ::-webkit-scrollbar-track { background: transparent; }
 
+/* Hide scrollbar in composer textareas */
+textarea::-webkit-scrollbar { display: none; }
+textarea { scrollbar-width: none; -ms-overflow-style: none; }
+
 /* Inline comment highlights */
 mark[data-comment-id] {
   background: var(--accent-soft);
@@ -86,5 +90,6 @@ mark[data-comment-id]:hover {
   background: rgba(37, 99, 235, 0.20);
 }
 mark[data-comment-id].active {
-  background: rgba(37, 99, 235, 0.28);
+  background: rgba(251, 191, 36, 0.35);
+  border-bottom-color: #f59e0b;
 }

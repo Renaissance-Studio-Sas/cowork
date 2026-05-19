@@ -7,9 +7,9 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task");
-  if (!project || !task) {
-    return NextResponse.json({ error: "project, task required" }, { status: 400 });
+  const task = url.searchParams.get("task") ?? "";  // empty = project-level
+  if (!project) {
+    return NextResponse.json({ error: "project required" }, { status: 400 });
   }
   const counts = await commentCounts(project, task);
   return NextResponse.json({ counts });

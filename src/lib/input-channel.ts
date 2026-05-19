@@ -47,3 +47,44 @@ export function makeUserMessage(text: string, sessionId: string): SDKUserMessage
     session_id: sessionId,
   } as SDKUserMessage;
 }
+
+export interface ImageContent {
+  mimeType: string;
+  base64: string;
+}
+
+// Create a multimodal user message with images and text
+export function makeUserMessageWithImages(
+  text: string,
+  images: ImageContent[],
+  sessionId: string
+): SDKUserMessage {
+  const content: Array<
+    | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+    | { type: "text"; text: string }
+  > = [];
+
+  // Add images first
+  for (const img of images) {
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: img.mimeType,
+        data: img.base64,
+      },
+    });
+  }
+
+  // Add text content
+  if (text.trim()) {
+    content.push({ type: "text", text });
+  }
+
+  return {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+    session_id: sessionId,
+  } as SDKUserMessage;
+}

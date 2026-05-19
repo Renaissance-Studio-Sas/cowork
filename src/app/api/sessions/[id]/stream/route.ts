@@ -1,12 +1,33 @@
-import { getSession } from "@/lib/sessions";
+import { getSession, restoreSession } from "@/lib/sessions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Default number of recent messages to send on initial connection
+const INITIAL_MESSAGE_LIMIT = 50;
+
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  const s = getSession(id);
+  const url = new URL(req.url);
+
+  // If session isn't in memory (typical after a server restart), restore it
+  // from disk so the SSE can replay history and pick up future events from a
+  // subsequent resume. Without this, the SSE 404s on first load and the
+  // client falls back to a one-shot history fetch — meaning new messages the
+  // user sends never appear until they reload.
+  let s = getSession(id);
+  if (!s) {
+    const project = url.searchParams.get("project");
+    const task = url.searchParams.get("task");
+    if (project !== null && task !== null) {
+      s = (await restoreSession(project, task, id)) ?? undefined;
+    }
+  }
   if (!s) return new Response("not found", { status: 404 });
+
+  // Check for pagination params (for initial history)
+  const limitStr = url.searchParams.get("limit");
+  const initialLimit = limitStr ? parseInt(limitStr, 10) : INITIAL_MESSAGE_LIMIT;
 
   const encoder = new TextEncoder();
   let cleanup: () => void = () => {};
@@ -20,9 +41,17 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         safeEnqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
 
-      // Replay history so new clients see the full transcript.
+      // Replay recent history so new clients see the transcript.
+      // Send metadata first so client knows total count and can load more.
+      const total = s.history.length;
+      const startIdx = Math.max(0, total - initialLimit);
+      const initialHistory = s.history.slice(startIdx);
+      const hasMore = startIdx > 0;
+
       sendEvent("state", { state: s.state });
-      for (const msg of s.history) sendEvent("message", msg);
+      // Send history metadata so client can implement "load more"
+      sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: total - initialHistory.length });
+      for (const msg of initialHistory) sendEvent("message", msg);
 
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onState = (state: string) => sendEvent("state", { state });

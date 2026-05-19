@@ -38,7 +38,9 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
 
   useEffect(() => {
     setMessages([]);
-    const es = new EventSource(`/api/sessions/${sessionId}/stream`);
+    const es = new EventSource(
+      `/api/sessions/${sessionId}/stream?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`,
+    );
     es.addEventListener("message", (ev) => {
       try { setMessages((p) => [...p, JSON.parse((ev as MessageEvent).data)]); } catch { /* ignore */ }
     });
@@ -74,8 +76,8 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
 
   const isWorking = state === "running";
   const isAwaiting = state === "awaiting_input";
-  const isDone = state === "idle";
-  const label = isAwaiting ? "needs your reply" : isWorking ? "working" : isDone ? "done" : state === "stopped" ? "stopped" : state === "error" ? "error" : "idle";
+  const isDone = state === "idle" || state === "stopped"; // stopped sessions seamlessly resume, treat as done
+  const label = isAwaiting ? "needs your reply" : isWorking ? "working" : isDone ? "done" : state === "error" ? "error" : "idle";
   const color = isAwaiting ? "var(--warn)" : isWorking ? "var(--accent)" : isDone ? "var(--ok)" : state === "error" ? "#dc2626" : "var(--muted)";
 
   return (
