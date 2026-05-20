@@ -25,7 +25,6 @@ import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProject
 import { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./workbench-tools/planning";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
-import { buildEmailTools } from "./workbench-tools/email";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildStaticWorkbenchMcps } from "./claude-chrome-tools";
 import type { WorkbenchTool } from "./workbench-tools/types";
@@ -43,7 +42,6 @@ function buildStaticWorkbenchToolGroups(
   return [
     { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
     { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
-    { name: "workbench-email", tools: buildEmailTools(sessionId) },
   ];
 }
 import {

@@ -26,7 +26,6 @@ import {
 } from "./chrome-bridge";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildCommentsTools } from "./workbench-tools/comments";
-import { buildEmailTools } from "./workbench-tools/email";
 import { buildSessionTools } from "./workbench-tools/session";
 
 // Build the static workbench-MCP map for a session. Used both at session
@@ -40,7 +39,6 @@ export function buildStaticWorkbenchMcps(
   return {
     "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(projectSlug, taskSlug)),
     "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, projectSlug, taskSlug)),
-    "workbench-email": workbenchToolsAsClaudeMcp("workbench-email", buildEmailTools(sessionId)),
     "workbench-chrome": buildClaudeChromeMcp(sessionId, projectSlug, taskSlug),
   };
 }
@@ -59,7 +57,6 @@ export function buildClaudeChromeMcp(
     const map = {
       "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(projectSlug, taskSlug)),
       "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, projectSlug, taskSlug)),
-      "workbench-email": workbenchToolsAsClaudeMcp("workbench-email", buildEmailTools(sessionId)),
       "workbench-chrome": buildClaudeChromeMcp(sessionId, projectSlug, taskSlug),
     };
     return map;

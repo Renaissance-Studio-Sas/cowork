@@ -12,5 +12,4 @@
 export { defineTool, type WorkbenchTool, type ToolCallResult, type ToolCallContent, type ToolSchema } from "./types";
 export { buildCommentsTools } from "./comments";
 export { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./planning";
-export { buildEmailTools } from "./email";
 export { buildSessionTools } from "./session";

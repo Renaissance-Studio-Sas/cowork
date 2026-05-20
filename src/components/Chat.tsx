@@ -12,7 +12,6 @@ import type { SessionSummaryDTO } from "@/lib/types";
 import { taskSessionRoute, projectSessionRoute } from "@/lib/routes";
 import { TodoList, extractTodosFromMessages } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
-import { EmailPreviewCard } from "./EmailPreviewCard";
 
 interface UploadedFile {
   name: string;
@@ -577,7 +576,7 @@ export function Chat({ session, onChange, onBack }: Props) {
               </button>
             </div>
           )}
-          <MessageStream messages={messages} sessionId={session.id} />
+          <MessageStream messages={messages} />
           {/* In-progress streamed text from the current assistant turn. Lives
               outside the persisted message stream — gets cleared and replaced
               by the final assistant message when the turn completes. Rendered
@@ -866,13 +865,12 @@ function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: S
 // Flatten the message stream into render items, batching consecutive tool
 // calls (across messages) into a single inline-flex row of compact chips.
 // Visible text and user messages break the row.
-function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; sessionId: string }) {
+function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
   type Chip = { kind: "tool"; part: Part };
   type Item =
     | { kind: "user"; key: string; text: string }
     | { kind: "asst-text"; key: string; text: string }
     | { kind: "chip-row"; key: string; chips: Chip[] }
-    | { kind: "email-preview"; key: string; part: Part }
     | { kind: "result"; key: string }
     | { kind: "system-info"; key: string; text: string };
 
@@ -901,15 +899,8 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
       const parts = (mm.message?.content as Part[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
-          // Special handling for email preview tools
-          if (p.name === "mcp__workbench-email__compose_email_preview" ||
-              p.name === "mcp__workbench-session__request_send_email") {
-            flush();
-            items.push({ kind: "email-preview", key: `ep-${i}-${j}`, part: p });
-          } else {
-            if (!batch.length) batchKey = `c-${i}-${j}`;
-            batch.push({ kind: "tool", part: p });
-          }
+          if (!batch.length) batchKey = `c-${i}-${j}`;
+          batch.push({ kind: "tool", part: p });
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
@@ -952,34 +943,6 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
           return (
             <div key={it.key} className="flex flex-wrap gap-1">
               {it.chips.map((c, j) => <ToolChip key={j} p={c.part} />)}
-            </div>
-          );
-        }
-        if (it.kind === "email-preview") {
-          // Extract previewId from the tool input
-          const input = it.part.input as Record<string, unknown>;
-          // The previewId comes from the tool result, but we have the input here.
-          // We'll use a hash of the input to identify it, or extract from a subsequent result.
-          // For now, render with initialData from the tool input
-          const previewId = `preview-${it.key}`;
-          return (
-            <div key={it.key} className="my-3">
-              <EmailPreviewCard
-                sessionId={sessionId}
-                previewId={previewId}
-                initialData={{
-                  to: input.to as string,
-                  cc: input.cc as string | undefined,
-                  subject: input.subject as string,
-                  body: input.body as string,
-                  attachments: input.attachments as string[] | undefined,
-                  threadId: input.threadId as string | undefined,
-                  replyToMessageId: input.replyToMessageId as string | undefined,
-                  isForward: input.isForward as boolean | undefined,
-                  isReply: input.isReply as boolean | undefined,
-                  originalThread: input.originalThread as import("./EmailPreviewCard").EmailMessage[] | undefined,
-                }}
-              />
             </div>
           );
         }
