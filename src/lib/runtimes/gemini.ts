@@ -40,13 +40,12 @@ import type {
 import type { WorkbenchTool } from "../workbench-tools/types";
 import { registerWorkbenchToolsInGemini } from "./gemini-tool-adapter";
 
-// "auto-gemini-2.5" is gemini-cli-core's auto-routing alias. With this set
-// as the Config model, cli-core's ModelRouterService picks the actual
-// model per turn (flash for cheap small requests, pro for harder ones)
-// based on request characteristics. Users can still override per session
-// by passing a specific model id (e.g. "gemini-3.5-flash", "gemini-2.5-pro")
-// in StartSessionParams.model.
-const DEFAULT_MODEL = "auto-gemini-2.5";
+// Pinned to gemini-3.5-flash. cli-core has an auto-routing alias
+// ("auto-gemini-2.5") that engages ModelRouterService to pick per-turn,
+// but for now we want the predictable cost/latency of flash for every
+// turn. Switch to auto-routing later if/when we want adaptive picking.
+// Overridable per session via StartSessionParams.model.
+const DEFAULT_MODEL = "gemini-3.5-flash";
 
 class GeminiAgentQuery implements AgentQuery {
   private readonly input: AsyncIterable<AgentUserMessage>;
