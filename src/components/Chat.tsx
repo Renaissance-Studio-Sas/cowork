@@ -907,8 +907,19 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       const parts = (mm.message?.content as Part[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "tool", part: p });
+          // Shell calls get their own row — their command/description tends
+          // to be informative and long, so squeezing them next to other
+          // chips just truncates the useful bit. All other tool calls keep
+          // batching into a compact chip row.
+          const name = (p.name as string) || "";
+          const isShell = name === "Bash" || name.endsWith("run_shell_command");
+          if (isShell) {
+            flush();
+            items.push({ kind: "chip-row", key: `c-${i}-${j}`, chips: [{ kind: "tool", part: p }] });
+          } else {
+            if (!batch.length) batchKey = `c-${i}-${j}`;
+            batch.push({ kind: "tool", part: p });
+          }
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });

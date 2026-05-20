@@ -1005,8 +1005,16 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
       const parts = (mm.message?.content as PanelPart[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "tool", part: p });
+          // Shell calls get their own row (see Chat.tsx for context).
+          const name = (p.name as string) || "";
+          const isShell = name === "Bash" || name.endsWith("run_shell_command");
+          if (isShell) {
+            flush();
+            items.push({ kind: "chip-row", key: `c-${i}-${j}`, chips: [{ kind: "tool", part: p }] });
+          } else {
+            if (!batch.length) batchKey = `c-${i}-${j}`;
+            batch.push({ kind: "tool", part: p });
+          }
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
