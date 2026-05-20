@@ -22,6 +22,7 @@ import {
   ApprovalMode,
   GeminiEventType,
   Scheduler,
+  MCPServerConfig,
   type GeminiClient,
   type GeminiChat,
   type ServerGeminiStreamEvent,
@@ -29,6 +30,7 @@ import {
   type CompletedToolCall,
   type ToolCallRequestInfo,
 } from "@google/gemini-cli-core";
+import { getMCPServerStatus, MCPServerStatus } from "@google/gemini-cli-core/dist/src/tools/mcp-client.js";
 import type {
   AgentRuntime,
   AgentQuery,
@@ -203,13 +205,14 @@ class GeminiAgentQuery implements AgentQuery {
       // we generate a stable mapping per turn.
       const callIdToToolUseId = new Map<string, string>();
       // Cap how many model↔tool round-trips we'll do per user message.
-      // Matches cli-core's own MAX_TURNS=100. Real codebase exploration
-      // can easily run 30-50 rounds (read file → grep → list dir → read
-      // another → …); the previous 25-round cap aborted legitimate work
-      // mid-flight. 100 still catches runaway loops (model stuck
-      // re-grepping the same thing) without strangling normal multi-step
-      // tool sequences.
-      const MAX_TOOL_ROUNDS = 100;
+      // Set generously — 1000 — because a long agent session can run
+      // hundreds of tool calls (codebase exploration + edits + builds +
+      // tests). cli-core's own MAX_TURNS is 100 internally but that's
+      // for its recursive continuation; we count round trips. The cap is
+      // just belt-and-braces against a model that's literally looping
+      // on the same call forever; when we hit it we surface a clear
+      // error in the chat so the user knows why the session stopped.
+      const MAX_TOOL_ROUNDS = 1000;
 
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -492,15 +495,119 @@ class GeminiAgentQuery implements AgentQuery {
     }
   }
 
-  // Step: gemini-cli MCP integration wiring is its own piece of work; today
-  // setMcpServers is a no-op so chrome_connect from a Gemini session doesn't
-  // crash. Chrome support in gemini-cli-core is its own follow-up.
-  async setMcpServers(_servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult> {
-    return { added: [], removed: [], errors: {} };
+  // Step: gemini-cli MCP integration wiring translated from Claude shapes to MCPServerConfig.
+  async setMcpServers(servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult> {
+    const added: string[] = [];
+    const removed: string[] = [];
+    const errors: Record<string, string> = {};
+
+    try {
+      const mcpManager = this.config?.getMcpClientManager() as any;
+      if (!mcpManager) {
+        throw new Error("McpClientManager not initialized");
+      }
+
+      // 1. Identify which servers are currently active vs new ones.
+      const currentServers = this.config?.getMcpServers() || {};
+      const currentKeys = Object.keys(currentServers);
+      const newKeys = Object.keys(servers);
+
+      for (const key of currentKeys) {
+        if (!newKeys.includes(key)) {
+          removed.push(key);
+        }
+      }
+      for (const key of newKeys) {
+        if (!currentKeys.includes(key)) {
+          added.push(key);
+        }
+      }
+
+      // 2. Stop all current clients so we have a clean slate.
+      await mcpManager.stop();
+      if (mcpManager.allServerConfigs) {
+        mcpManager.allServerConfigs.clear();
+      }
+
+      // 3. Translate Claude-shaped servers into Gemini-shaped MCPServerConfig.
+      const translated: Record<string, MCPServerConfig> = {};
+      for (const [name, server] of Object.entries(servers)) {
+        if (server.type === "stdio") {
+          translated[name] = new MCPServerConfig(
+            server.command,
+            server.args,
+            server.env,
+          );
+        } else if (server.type === "sse") {
+          translated[name] = new MCPServerConfig(
+            undefined, // command
+            undefined, // args
+            undefined, // env
+            undefined, // cwd
+            server.url, // url
+            undefined, // httpUrl
+            undefined, // headers
+            undefined, // tcp
+            "sse", // type
+          );
+        } else if (server.type === "http") {
+          translated[name] = new MCPServerConfig(
+            undefined, // command
+            undefined, // args
+            undefined, // env
+            undefined, // cwd
+            undefined, // url
+            (server as any).url || (server as any).httpUrl, // httpUrl
+            (server as any).headers, // headers
+            undefined, // tcp
+            "http", // type
+          );
+        }
+      }
+
+      // 4. Update config and start configured servers
+      this.config!.setMcpServers(translated);
+      await mcpManager.startConfiguredMcpServers();
+
+      // 5. Check if any server failed to start or connect
+      for (const name of Object.keys(translated)) {
+        const status = getMCPServerStatus(name);
+        if (status === MCPServerStatus.DISCONNECTED) {
+          const err = mcpManager.getLastError?.(name) || "Failed to connect to MCP server";
+          errors[name] = err;
+        }
+      }
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[gemini-runtime] setMcpServers failed:", msg);
+      errors["global"] = msg;
+    }
+
+    return { added, removed, errors };
   }
 
   async mcpServerStatus(): Promise<AgentMcpServerStatus[]> {
-    return [];
+    const servers = this.config?.getMcpServers() || {};
+    const statuses: AgentMcpServerStatus[] = [];
+
+    for (const name of Object.keys(servers)) {
+      const status = getMCPServerStatus(name);
+      // Map Gemini's MCPServerStatus to Claude's "connected" | "failed" | "needs-auth" | "pending" | "disabled"
+      let mappedStatus: "connected" | "failed" | "needs-auth" | "pending" | "disabled" = "pending";
+      if (status === MCPServerStatus.CONNECTED) {
+        mappedStatus = "connected";
+      } else if (status === MCPServerStatus.DISCONNECTED) {
+        mappedStatus = "failed";
+      } else if (status === MCPServerStatus.CONNECTING) {
+        mappedStatus = "pending";
+      } else if (status === MCPServerStatus.DISABLED) {
+        mappedStatus = "disabled";
+      }
+      statuses.push({ name, status: mappedStatus });
+    }
+
+    return statuses;
   }
 }
 

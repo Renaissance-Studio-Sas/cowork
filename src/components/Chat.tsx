@@ -872,7 +872,8 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
     | { kind: "asst-text"; key: string; text: string }
     | { kind: "chip-row"; key: string; chips: Chip[] }
     | { kind: "result"; key: string }
-    | { kind: "system-info"; key: string; text: string };
+    | { kind: "system-info"; key: string; text: string }
+    | { kind: "system-error"; key: string; text: string };
 
   const items: Item[] = [];
   let batch: Chip[] = [];
@@ -933,6 +934,9 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       if (sysMsg.subtype === "info" && sysMsg.message) {
         flush();
         items.push({ kind: "system-info", key: `si-${i}`, text: sysMsg.message });
+      } else if (sysMsg.subtype === "error" && sysMsg.message) {
+        flush();
+        items.push({ kind: "system-error", key: `se-${i}`, text: sysMsg.message });
       }
     }
   });
@@ -972,6 +976,15 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
           return (
             <div key={it.key} className="flex justify-center">
               <div className="rounded-lg bg-[var(--ok-soft)] border border-[var(--ok)] text-[var(--ok)] px-3 py-1.5 text-[12.5px] font-medium">
+                {it.text}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "system-error") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-red-500/10 border border-red-500/40 text-red-400 px-3 py-1.5 text-[12.5px] font-medium max-w-[80%] text-center">
                 {it.text}
               </div>
             </div>

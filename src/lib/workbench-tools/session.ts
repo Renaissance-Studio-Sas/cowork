@@ -19,7 +19,10 @@ import {
   expectedProfileBySession,
   lastBoundProfile,
   setLastBoundProfile,
+  boundProfileBySession,
+  CLAUDE_BIN_PATH,
 } from "../chrome-bridge";
+import { buildStaticWorkbenchMcps } from "../claude-chrome-tools";
 import { defineTool, type WorkbenchTool } from "./types";
 
 export function buildSessionTools(
@@ -193,13 +196,14 @@ control. If "Connection: not connected", call chrome_open_profile.`,
 
         const lines: string[] = [];
 
+        const currentBound = boundProfileBySession.get(sessionId) ?? null;
         const connected = socketExists && nativeHostPids.length > 0;
-        if (connected && lastBoundProfile) {
-          lines.push(`Connection: ✅ CONNECTED to ${lastBoundProfile.id} (${lastBoundProfile.email})`);
+        if (connected && currentBound) {
+          lines.push(`Connection: ✅ CONNECTED to ${currentBound.id} (${currentBound.email})`);
         } else if (connected) {
           const guess = localState.lastUsed ? profileById.get(localState.lastUsed) : null;
           lines.push(
-            `Connection: ✅ connected, but profile unknown to cowork`
+            `Connection: ✅ connected, but profile unknown to this session`
               + (guess ? ` (likely ${localState.lastUsed} / ${guess.email} — Chrome's last-focused)` : "")
               + `. To attribute reliably, call chrome_open_profile next time.`,
           );
@@ -229,6 +233,16 @@ control. If "Connection: not connected", call chrome_open_profile.`,
         }
         if (expected) {
           lines.push(`  this session previously asked for: ${expected.id} (${expected.email})`);
+        }
+
+        lines.push(``, `Global Session Bindings:`);
+        if (boundProfileBySession.size === 0) {
+          lines.push(`  No sessions have bound profiles yet.`);
+        } else {
+          for (const [sid, bp] of boundProfileBySession.entries()) {
+            const isThis = sid === sessionId ? " (this session)" : "";
+            lines.push(`  Session "${sid}"${isThis}: profile "${bp.id}" (${bp.email}) [bound at ${bp.boundAt.toISOString()}]`);
+          }
         }
 
         lines.push(``, `Session MCP:`);
@@ -262,43 +276,181 @@ control. If "Connection: not connected", call chrome_open_profile.`,
 
     defineTool(
       "chrome_force_reset",
-      `Hard-reset the Chrome MCP plumbing for this machine. Kills every
-running --chrome-native-host process, removes the socket file, and forgets
-which profile was last bound. Use when chrome_status shows multiple
-native-host PIDs, or chrome_connect keeps returning "failed".
+      `Reset the Chrome MCP plumbing. By default, it clears this session's profile binding and only kills the native-host processes if no other sessions are active (session-scoped reset). If global is set to true, it performs a nuclear reset: SIGKILLs all --chrome-native-host processes and deletes all socket files, affecting all concurrent sessions.
 
 After running this, call chrome_open_profile(profile_id) to spin a fresh
 auto-handshake (no user click needed), then chrome_connect.`,
-      {},
-      async () => {
-        const pids = findNativeHostPids();
-        const killed: number[] = [];
-        for (const pid of pids) {
-          try {
-            process.kill(pid, "SIGTERM");
-            killed.push(pid);
-          } catch { /* already gone */ }
-        }
-        const socketDir = getChromeSocketDir();
-        let socketsRemoved = 0;
-        try {
-          for (const f of listChromeSocketFiles()) {
-            execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" });
-            socketsRemoved++;
-          }
-        } catch { /* ignore */ }
+      {
+        global: z.boolean().optional().describe("Perform a global, nuclear reset across all sessions on the machine.")
+      },
+      async ({ global }) => {
+        boundProfileBySession.delete(sessionId);
         expectedProfileBySession.delete(sessionId);
-        setLastBoundProfile(null);
 
-        const lines = [
-          `Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
-          `Stale .sock files removed: ${socketsRemoved}`,
-          `Last-bound profile: cleared`,
-          ``,
-          `Next: call chrome_open_profile(profile_id) — Chrome auto-handshakes, no user click — then chrome_connect.`,
-        ];
+        const otherSessions = Array.from(boundProfileBySession.keys());
+        const shouldDoNuclear = global || otherSessions.length === 0;
+
+        const lines: string[] = [];
+        if (shouldDoNuclear) {
+          const pids = findNativeHostPids();
+          const killed: number[] = [];
+          for (const pid of pids) {
+            try {
+              process.kill(pid, "SIGTERM");
+              killed.push(pid);
+            } catch { /* already gone */ }
+          }
+          const socketDir = getChromeSocketDir();
+          let socketsRemoved = 0;
+          try {
+            for (const f of listChromeSocketFiles()) {
+              execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" });
+              socketsRemoved++;
+            }
+          } catch { /* ignore */ }
+          
+          boundProfileBySession.clear();
+          setLastBoundProfile(null);
+
+          lines.push(
+            `Performed GLOBAL nuclear reset:`,
+            `  Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
+            `  Stale .sock files removed: ${socketsRemoved}`,
+            `  All session bindings cleared.`,
+            ``,
+            `Next: call chrome_open_profile(profile_id) — Chrome auto-handshakes, no user click — then chrome_connect.`
+          );
+        } else {
+          lines.push(
+            `Performed SCOPED reset for this session:`,
+            `  This session's profile binding is cleared.`,
+            `  Stale native-host processes and socket files were left intact to avoid disrupting other active sessions: ${otherSessions.join(", ")}.`,
+            `  To force-kill all processes and clear all sockets, run chrome_force_reset with { global: true }.`
+          );
+        }
+
         return { content: [{ type: "text", text: lines.join("\n") }] };
       },
+    ),
+
+    defineTool(
+      "chrome_connect",
+      `Wire the running Claude-in-Chrome bridge into THIS session's MCP map so
+the agent can use the 17 Chrome MCP tools (navigate, tabs_context_mcp,
+read_page, find, form_input, etc.). After this returns success the Chrome
+tools (\`mcp__claude-in-chrome__*\`) are immediately callable in the same
+turn — no need to end the turn first.
+
+PREREQUISITE: a Chrome native-messaging socket must already be live. The
+Claude extension auto-handshakes — no user click is needed — but the socket
+only exists after Chrome has been opened to the reconnect URL in a profile
+with the extension installed. Call chrome_open_profile first (it does that
+launch + handshake under the hood). chrome_status will show whether the
+socket is up.
+
+If chrome_connect returns "Not connected" or "failed", the bridge isn't live
+yet — call chrome_open_profile to spin one up, then retry. Do NOT instruct
+the user to click anything; the handshake is automatic.`,
+      {},
+      async () => {
+        const socketDir = getChromeSocketDir();
+        const socketFiles = listChromeSocketFiles();
+        if (socketFiles.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `Chrome native-messaging socket missing (no *.sock files in ${socketDir}). Spin one up by calling chrome_open_profile with the target profile_id — Chrome will launch a new window in that profile and the extension auto-handshakes (no user click). Wait ~2-3s, then call chrome_connect again. Do not instruct the user to click Connect; the extension claims the socket on its own.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const q = getSessionQuery(sessionId);
+        if (!q) {
+          return {
+            content: [{ type: "text", text: `Session not found (id: ${sessionId}). The session may not be fully initialized yet.` }],
+            isError: true,
+          };
+        }
+
+        try {
+          // Force a fresh MCP spawn: remove first (re-set with static-only)
+          // then add (static + claude-in-chrome). A single setMcpServers
+          // with the same config is a no-op — the SDK doesn't retry the
+          // spawn — so we need this two-step.
+          await q.setMcpServers(buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug));
+          const result = await q.setMcpServers({
+            ...buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug),
+            "claude-in-chrome": {
+              type: "stdio" as const,
+              command: CLAUDE_BIN_PATH,
+              args: ["--claude-in-chrome-mcp"],
+            },
+          });
+
+          if (result.errors && Object.keys(result.errors).length > 0) {
+            const errorMsg = Object.values(result.errors)[0];
+            return {
+              content: [{ type: "text", text: `Failed to spawn Chrome MCP: ${errorMsg}\\n\\nCheck chrome_status — if socket is missing, call chrome_open_profile first.` }],
+              isError: true,
+            };
+          }
+
+          const statuses = await q.mcpServerStatus();
+          const cic = statuses.find((s) => s.name === "claude-in-chrome");
+          if (cic && cic.status === "connected") {
+            return {
+              content: [{ type: "text", text: `Chrome MCP wired (status: connected). Browser automation tools (navigate, tabs_context_mcp, read_page, …) are now available.` }],
+            };
+          }
+          if (cic && cic.status === "failed") {
+            return {
+              content: [{ type: "text", text: `Chrome MCP added but failed to connect to the bridge. Run chrome_force_reset, then chrome_open_profile(profile_id), then chrome_connect again.` }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: "text", text: `Chrome MCP wired (status: ${cic ? cic.status : "unknown"}). Wait briefly and call chrome_status to verify it reaches "connected".` }],
+          };
+        } catch (e) {
+          return {
+            content: [{ type: "text", text: `Error connecting Chrome MCP: ${e instanceof Error ? e.message : String(e)}` }],
+            isError: true,
+          };
+        }
+      }
+    ),
+
+    defineTool(
+      "chrome_disconnect",
+      `Disconnect Chrome browser automation from this session.
+Use this to release the Chrome connection, for example before switching to a different Chrome profile.`,
+      {},
+      async () => {
+        const q = getSessionQuery(sessionId);
+        if (!q) {
+          return {
+            content: [{ type: "text", text: "Session not found." }],
+            isError: true,
+          };
+        }
+
+        try {
+          const result = await q.setMcpServers(buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug));
+          expectedProfileBySession.delete(sessionId);
+          boundProfileBySession.delete(sessionId);
+
+          if (result.removed.includes("claude-in-chrome")) {
+            return { content: [{ type: "text", text: "Chrome MCP disconnected." }] };
+          }
+          return { content: [{ type: "text", text: "Chrome MCP was not connected." }] };
+        } catch (e) {
+          return {
+            content: [{ type: "text", text: `Error disconnecting Chrome MCP: ${e instanceof Error ? e.message : String(e)}` }],
+            isError: true,
+          };
+        }
+      }
     ),
   ];
 }
