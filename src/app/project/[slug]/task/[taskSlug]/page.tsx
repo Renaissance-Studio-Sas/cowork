@@ -78,6 +78,7 @@ export default function TaskPage() {
 
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
+  const [runtime, setRuntime] = useState<"claude" | "gemini">("claude");
   const [files, setFiles] = useState<string[]>([]);
   const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
@@ -179,7 +180,7 @@ export default function TaskPage() {
       const r = await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: draft.trim() }),
+        body: JSON.stringify({ message: draft.trim(), runtime }),
       });
       const j = await r.json();
       if (j.id) {
@@ -559,6 +560,17 @@ export default function TaskPage() {
               className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
               title="Start (↵)"
             >↑</button>
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-1.5">
+            <span className="text-[11px] text-[var(--muted)]">Agent:</span>
+            <select
+              value={runtime}
+              onChange={(e) => setRuntime(e.target.value as "claude" | "gemini")}
+              className="text-[11px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1.5 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
+            >
+              <option value="claude">Claude</option>
+              <option value="gemini">Gemini</option>
+            </select>
           </div>
         </div>
       </div>

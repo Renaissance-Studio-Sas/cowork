@@ -33,7 +33,6 @@ type SDKMessageLite =
         content: Array<
           | { type: "text"; text: string }
           | { type: "tool_use"; id: string; name: string; input: unknown }
-          | { type: "thinking"; thinking: string }
         >;
       };
       uuid?: string;
@@ -56,6 +55,12 @@ export function Chat({ session, onChange, onBack }: Props) {
   const [sending, setSending] = useState(false);
   // Track whether we have an active SSE connection (session is truly live)
   const [streamConnected, setStreamConnected] = useState(false);
+  // In-progress streaming text for the current assistant turn. Accumulates
+  // text_delta events from `stream_event` SDK messages; cleared when the
+  // final `assistant` message arrives (which carries the same text and
+  // becomes the canonical bubble). Rendered as an extra asst-text item at
+  // the end of the message list so the user sees text forming live.
+  const [streamingText, setStreamingText] = useState<string>("");
   // Session management state
   const [showMenu, setShowMenu] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
@@ -167,6 +172,29 @@ export function Chat({ session, onChange, onBack }: Props) {
           setStreamConnected(true);
         }
         const msg = JSON.parse((ev as MessageEvent).data);
+
+        // stream_event: per-token delta from the runtime. Accumulate text
+        // into the in-progress bubble; don't push to messages (the final
+        // `assistant` message below carries the canonical text).
+        if (msg?.type === "stream_event") {
+          const delta = msg?.event?.delta;
+          if (delta?.type === "text_delta" && typeof delta.text === "string") {
+            setStreamingText((t) => t + delta.text);
+            if (isAtBottomRef.current) {
+              requestAnimationFrame(() => {
+                const el = scrollRef.current;
+                if (el) el.scrollTop = el.scrollHeight;
+              });
+            }
+          }
+          return;
+        }
+        // Final assistant message (or any non-stream event) — clear the
+        // in-progress bubble so it doesn't double up with the persisted
+        // message about to render.
+        if (msg?.type === "assistant" || msg?.type === "result" || msg?.type === "user") {
+          setStreamingText("");
+        }
 
         if (isInitialLoadRef.current) {
           // Batch initial messages and flush after a brief delay
@@ -488,6 +516,17 @@ export function Chat({ session, onChange, onBack }: Props) {
                 </span>
               </>
             )}
+            {(session.model || session.runtime) && (
+              <>
+                <span>·</span>
+                <span
+                  className="font-mono"
+                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+                >
+                  {session.model ?? session.runtime}
+                </span>
+              </>
+            )}
           </div>
         </div>
         {/* Session menu for stopped sessions */}
@@ -539,10 +578,19 @@ export function Chat({ session, onChange, onBack }: Props) {
             </div>
           )}
           <MessageStream messages={messages} sessionId={session.id} />
-          {messages.length === 0 && (
+          {/* In-progress streamed text from the current assistant turn. Lives
+              outside the persisted message stream — gets cleared and replaced
+              by the final assistant message when the turn completes. */}
+          {streamingText && (
+            <div className="text-[13.5px] whitespace-pre-wrap leading-relaxed opacity-90">
+              {streamingText}
+              <span className="dots ml-0.5" aria-hidden />
+            </div>
+          )}
+          {messages.length === 0 && !streamingText && (
             <div className="text-[var(--muted)] text-[13px]">Waiting for the agent to start…</div>
           )}
-          {isWorking && (
+          {isWorking && !streamingText && (
             <div className="flex items-center gap-2 text-[13px] text-[var(--accent)] pl-1">
               <span className="inline-block w-2 h-2 rounded-full bg-[var(--accent)] pulse" />
               <span>Working<span className="dots" aria-hidden /></span>
@@ -814,12 +862,10 @@ function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: S
 }
 
 // Flatten the message stream into render items, batching consecutive tool
-// calls and thinking blocks (across messages) into a single inline-flex
-// row of compact chips. Visible text and user messages break the row.
+// calls (across messages) into a single inline-flex row of compact chips.
+// Visible text and user messages break the row.
 function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; sessionId: string }) {
-  type Chip =
-    | { kind: "tool"; part: Part }
-    | { kind: "think"; text: string };
+  type Chip = { kind: "tool"; part: Part };
   type Item =
     | { kind: "user"; key: string; text: string }
     | { kind: "asst-text"; key: string; text: string }
@@ -862,9 +908,6 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
             if (!batch.length) batchKey = `c-${i}-${j}`;
             batch.push({ kind: "tool", part: p });
           }
-        } else if (p.type === "thinking") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "think", text: (p.thinking as string) ?? "" });
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
@@ -906,9 +949,7 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
         if (it.kind === "chip-row") {
           return (
             <div key={it.key} className="flex flex-wrap gap-1">
-              {it.chips.map((c, j) => c.kind === "tool"
-                ? <ToolChip key={j} p={c.part} />
-                : <ThinkChip key={j} text={c.text} />)}
+              {it.chips.map((c, j) => <ToolChip key={j} p={c.part} />)}
             </div>
           );
         }
@@ -962,23 +1003,6 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
   );
 }
 
-function ThinkChip({ text }: { text: string }) {
-  return (
-    <details className="group inline-block align-top max-w-full">
-      <summary
-        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11.5px] text-[var(--muted)] italic bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded-md px-2 py-0.5 border border-[var(--border)]"
-        title="model thinking"
-      >
-        <span className="text-[9px] opacity-70 not-italic">▸</span>
-        <span>thinking</span>
-      </summary>
-      <pre className="mt-1 overflow-x-auto text-[11px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 max-w-full whitespace-pre-wrap break-words not-italic">
-        {text}
-      </pre>
-    </details>
-  );
-}
-
 function Bubble({ msg }: { msg: SDKMessageLite }) {
   const m = msg as { type: string; [k: string]: unknown };
 
@@ -1014,14 +1038,6 @@ function Bubble({ msg }: { msg: SDKMessageLite }) {
               <div key={i} className="text-[14px] leading-relaxed">
                 <Markdown text={p.text as string} />
               </div>
-            );
-          }
-          if (p.type === "thinking") {
-            return (
-              <details key={i} className="rounded-xl border border-[var(--border)] bg-[var(--panel)] px-3 py-1.5 text-[12px] text-[var(--muted)] italic">
-                <summary className="cursor-pointer select-none">thinking…</summary>
-                <div className="mt-2 whitespace-pre-wrap not-italic text-[var(--text-soft)]">{p.thinking as string}</div>
-              </details>
             );
           }
           return null;
@@ -1105,7 +1121,7 @@ function CommentBriefBubble({ parsed }: { parsed: NonNullable<ReturnType<typeof 
 }
 
 // Group consecutive `tool_use` parts so we can render them as a row of compact
-// chips. Non-tool parts (text, thinking) stay as standalone blocks.
+// chips. Non-tool parts (text) stay as standalone blocks.
 type Part = { type: string; [k: string]: unknown };
 type AssistantGroup =
   | { type: "tools"; parts: Part[] }

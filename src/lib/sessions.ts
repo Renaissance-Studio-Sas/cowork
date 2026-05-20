@@ -3,7 +3,22 @@ import fs from "node:fs/promises";
 import { createWriteStream, type WriteStream } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { query, type Query, type SDKMessage, type CanUseTool, type PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+// SDKMessage / SDKUserMessage / CanUseTool / PermissionResult are still
+// imported from the Claude SDK because the AgentRuntime interface (see
+// agent-runtime.ts) defines AgentEvent / AgentUserMessage / AgentCanUseTool
+// / AgentPermissionResult as aliases for those today — the UI and
+// pumpEvents already speak that shape. Sessions code imports the AgentXxx
+// aliases so the runtime boundary is the only place tied to Claude SDK
+// types.
+import type {
+  AgentEvent as SDKMessage,
+  AgentUserMessage as SDKUserMessage,
+  AgentCanUseTool as CanUseTool,
+  AgentPermissionResult as PermissionResult,
+  AgentQuery,
+  AgentQueryOptions,
+} from "./agent-runtime";
+import { getRuntime } from "./runtimes";
 
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
@@ -141,7 +156,7 @@ interface RuntimeSession {
   lastActivity: Date;
   seenAt: Date | null;           // when user last viewed this session (null = never seen)
   completedAt: Date | null;      // when session finished (idle/stopped/error) — for unread tracking
-  q: Query;
+  q: AgentQuery;
   input: InputChannel;
   events: EventEmitter;          // emits 'event' (SDKMessage) and 'state' (SessionState)
   log: WriteStream;              // events.jsonl
@@ -177,6 +192,7 @@ export interface SessionSummary {
   isLive: boolean;
   unread: boolean;               // completed session not yet viewed
   runtime: SessionRuntime;
+  model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")
 }
 
 const REGISTRY = new Map<string, RuntimeSession>();
@@ -370,7 +386,7 @@ export function getSession(id: string): RuntimeSession | undefined {
 // setMcpServers() to add or remove dynamic MCP servers mid-conversation.
 // Returns null when the session is unknown or has no live query (e.g. a
 // session restored from disk before resume).
-export function getSessionQuery(id: string): Query | null {
+export function getSessionQuery(id: string): AgentQuery | null {
   const s = registry.get(id);
   if (!s || !s.q) return null;
   return s.q;
@@ -384,25 +400,22 @@ export function getSessionDir(id: string): string | null {
   return path.join(s.cwd, "sessions", s.id);
 }
 
-// Dispatch the query() call by runtime. Today every runtime returns a
-// SDK-shaped Query (AsyncIterable<SDKMessage> + setMcpServers / interrupt /
-// mcpServerStatus). For Claude it's the SDK's own Query verbatim. For
-// Gemini (phase 3) it will be a wrapper around @google/gemini-cli-core's
-// GeminiClient that masquerades as a Query so the rest of sessions.ts
-// (pumpEvents, setMcpServers callers, interrupt, etc.) doesn't have to
-// know which runtime it's talking to.
+// Dispatch the query() call to whatever AgentRuntime the session uses. The
+// runtime registry lives in ./runtimes; every entry returns an AgentQuery,
+// which is structurally compatible with what the rest of sessions.ts
+// expects (pumpEvents, sendInput, interrupt, the SSE route).
 //
-// Centralising the dispatch here means the 4 query() call sites
-// (startSession, startProjectSession, startPlanningSession, resumeSession)
-// only need to add `runtime` to their options blob.
-type QueryOptions = Parameters<typeof query>[0];
-function createAgentQuery(runtime: SessionRuntime, opts: QueryOptions): Query {
-  if (runtime === "claude") return query(opts);
-  // Gemini runtime: phase 3 will implement this against
-  // @google/gemini-cli-core. For phase 1/2 we fail loudly — every public
-  // entry point that could reach here (startSession, startProjectSession)
-  // already gates on runtime and throws a clearer error earlier.
-  throw new Error(`Runtime "${runtime}" not implemented`);
+// Centralising the dispatch here means the 4 query call sites (startSession,
+// startProjectSession, startPlanningSession, resumeSession) only need to add
+// `runtime` to their options blob.
+//
+// The Claude SDK's options shape today doubles as our AgentQueryOptions —
+// they're structurally compatible. The cast on `opts` lets the callers keep
+// passing the SDK-shaped option blobs they already build. When a future
+// runtime needs a different option shape, this is where the translation
+// goes.
+function createAgentQuery(runtime: SessionRuntime, opts: Record<string, unknown>): AgentQuery {
+  return getRuntime(runtime).query(opts as unknown as AgentQueryOptions);
 }
 
 // Debug helper to inspect the session registry
@@ -448,6 +461,7 @@ export function listLiveSessions(): SessionSummary[] {
       isLive: true,
       unread,
       runtime: s.runtime,
+      model: s.model,
     };
   });
 }
@@ -462,7 +476,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; runtime?: SessionRuntime } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; runtime?: SessionRuntime; model?: string | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -498,6 +512,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       isLive: false,
       unread,
       runtime: meta.runtime ?? "claude",
+      model: meta.model ?? null,
     });
   }
   return out;
@@ -666,7 +681,7 @@ export async function restoreSession(
     lastActivity: meta.lastActivity ? new Date(meta.lastActivity) : new Date(),
     seenAt: meta.seenAt ? new Date(meta.seenAt) : null,
     completedAt: meta.completedAt ? new Date(meta.completedAt) : null,
-    q: null as unknown as Query, // Placeholder — replaced on resume
+    q: null as unknown as AgentQuery, // Placeholder — replaced on resume
     input,
     events,
     log: sink,
@@ -702,14 +717,6 @@ export interface StartSessionParams {
 
 export async function startSession(p: StartSessionParams): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
-  if (runtime === "gemini") {
-    // Phase 3 wires this up. For now, fail clearly so the user sees what's
-    // missing instead of a silent default-back to Claude.
-    throw new Error(
-      "Gemini runtime not yet implemented. Use runtime=\"claude\" (the default) for now — the selector is wired through but the GeminiAdapter is the next phase.",
-    );
-  }
-
   const project = await getProject(p.projectSlug);
   const task = await getTask(p.projectSlug, p.taskSlug);
   if (!project || !task) throw new Error("unknown project/task");
@@ -771,7 +778,6 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id, p.projectSlug, p.taskSlug),
       },
-      thinking: { type: "adaptive", display: "summarized" },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -900,8 +906,17 @@ async function updateMeta(
 async function pumpEvents(s: RuntimeSession) {
   try {
     for await (const msg of s.q) {
-      s.log.write(JSON.stringify(msg) + "\n");
-      s.history.push(msg);
+      // stream_event = per-token streaming delta (Claude SDKPartialAssistantMessage
+      // or our Gemini equivalent). Forward to live SSE clients so the UI can
+      // render incremental text, but skip persistence/history — the final
+      // assistant message at end-of-turn carries the full text and is what
+      // gets logged. Otherwise events.jsonl bloats ~30× per turn and the
+      // in-memory replay buffer grows without bound.
+      const isStreamEvent = (msg as { type?: string }).type === "stream_event";
+      if (!isStreamEvent) {
+        s.log.write(JSON.stringify(msg) + "\n");
+        s.history.push(msg);
+      }
       s.lastActivity = new Date();
       s.events.emit("event", msg);
 
@@ -921,6 +936,11 @@ async function pumpEvents(s: RuntimeSession) {
           // no-op; after adoptSessionToProject the slug becomes real and the
           // next init's id is persisted automatically.)
           void persistSdkSessionId(s);
+        }
+        const initModel = (msg as { model?: string }).model;
+        if (initModel && initModel !== s.model) {
+          s.model = initModel;
+          void updateMeta(s, (meta) => { meta.model = initModel; });
         }
       }
 
@@ -1129,11 +1149,6 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
 // sessions but at one level up.
 export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; runtime?: SessionRuntime }): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
-  if (runtime === "gemini") {
-    throw new Error(
-      "Gemini runtime not yet implemented. Use runtime=\"claude\" (the default) for now — the selector is wired through but the GeminiAdapter is the next phase.",
-    );
-  }
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
 
@@ -1186,7 +1201,6 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id, p.projectSlug, ""),
       },
-      thinking: { type: "adaptive", display: "summarized" },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1253,7 +1267,6 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: { "workbench-planning": planningMcp },
-      thinking: { type: "adaptive", display: "summarized" },
       // Don't specify model — use SDK default (latest Claude)
     },
   });
@@ -1471,7 +1484,6 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
           "workbench-comments": commentsMcp,
           "workbench-session": buildSessionMcp(s.id, s.projectSlug, s.taskSlug),
         },
-        thinking: { type: "adaptive", display: "summarized" },
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },

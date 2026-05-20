@@ -39,7 +39,6 @@ type SDKMessageLite =
         content: Array<
           | { type: "text"; text: string }
           | { type: "tool_use"; id: string; name: string; input: unknown }
-          | { type: "thinking"; thinking: string }
         >;
       };
     }
@@ -285,6 +284,14 @@ function ChatPanelHeader({
               {isWorking && <span className="dots ml-0.5" aria-hidden />}
             </span>
             <span className="text-[var(--muted)] shrink-0">· {label}</span>
+            {(session.model || session.runtime) && (
+              <span
+                className="text-[var(--muted)] shrink-0 font-mono"
+                title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+              >
+                · {session.model ?? session.runtime}
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -478,6 +485,8 @@ function LiveChat({
   const [state, setState] = useState<string>(session.state);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  // In-progress streamed text for the current assistant turn (see Chat.tsx).
+  const [streamingText, setStreamingText] = useState<string>("");
   // Track whether we have an active SSE connection (session is truly live)
   const [streamConnected, setStreamConnected] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -579,6 +588,25 @@ function LiveChat({
           setStreamConnected(true);
         }
         const msg = JSON.parse((ev as MessageEvent).data);
+
+        // Streaming delta — accumulate into the in-progress bubble, skip
+        // the persisted message stream (the final assistant message follows).
+        if (msg?.type === "stream_event") {
+          const delta = msg?.event?.delta;
+          if (delta?.type === "text_delta" && typeof delta.text === "string") {
+            setStreamingText((t) => t + delta.text);
+            if (isAtBottomRef.current) {
+              requestAnimationFrame(() => {
+                const el = scrollRef.current;
+                if (el) el.scrollTop = el.scrollHeight;
+              });
+            }
+          }
+          return;
+        }
+        if (msg?.type === "assistant" || msg?.type === "result" || msg?.type === "user") {
+          setStreamingText("");
+        }
 
         if (isInitialLoadRef.current) {
           initialMessages.push(msg);
@@ -767,12 +795,18 @@ function LiveChat({
           </div>
         )}
         <PanelMessageStream messages={messages} />
-        {messages.length === 0 && (
+        {streamingText && (
+          <div className="text-[13px] whitespace-pre-wrap leading-relaxed opacity-90">
+            {streamingText}
+            <span className="dots ml-0.5" aria-hidden />
+          </div>
+        )}
+        {messages.length === 0 && !streamingText && (
           <div className="text-[var(--muted)] text-[12.5px]">
             {isLive ? "Waiting for the agent to start…" : "Loading conversation…"}
           </div>
         )}
-        {isWorking && (
+        {isWorking && !streamingText && (
           <div className="flex items-center gap-2 text-[12.5px] text-[var(--accent)]">
             <span className="inline-block w-2 h-2 rounded-full bg-[var(--accent)] pulse" />
             <span>Working<span className="dots" aria-hidden /></span>
@@ -936,9 +970,7 @@ function NewSessionComposer({
 type PanelPart = { type: string; [k: string]: unknown };
 
 function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
-  type Chip =
-    | { kind: "tool"; part: PanelPart }
-    | { kind: "think"; text: string };
+  type Chip = { kind: "tool"; part: PanelPart };
   type Item =
     | { kind: "user"; key: string; text: string }
     | { kind: "asst-text"; key: string; text: string }
@@ -971,9 +1003,6 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
         if (p.type === "tool_use") {
           if (!batch.length) batchKey = `c-${i}-${j}`;
           batch.push({ kind: "tool", part: p });
-        } else if (p.type === "thinking") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "think", text: (p.thinking as string) ?? "" });
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
@@ -1014,13 +1043,7 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
         if (it.kind === "chip-row") {
           return (
             <div key={it.key} className="flex flex-wrap gap-1">
-              {it.chips.map((c, j) =>
-                c.kind === "tool" ? (
-                  <PanelToolChip key={j} p={c.part} />
-                ) : (
-                  <PanelThinkChip key={j} text={c.text} />
-                )
-              )}
+              {it.chips.map((c, j) => <PanelToolChip key={j} p={c.part} />)}
             </div>
           );
         }
@@ -1044,19 +1067,6 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
   );
 }
 
-function PanelThinkChip({ text }: { text: string }) {
-  return (
-    <details className="group inline-block align-top max-w-full">
-      <summary className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11px] text-[var(--muted)] italic bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded-md px-1.5 py-0.5 border border-[var(--border)]">
-        <span className="text-[9px] opacity-70 not-italic">▸</span>
-        <span>thinking</span>
-      </summary>
-      <pre className="mt-1 overflow-x-auto text-[10.5px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1 max-w-full whitespace-pre-wrap break-words not-italic">
-        {text}
-      </pre>
-    </details>
-  );
-}
 
 function shortenToolName(name: string): string {
   const m = name.match(/^mcp__([^_]+(?:-[^_]+)*)__(.+)$/);

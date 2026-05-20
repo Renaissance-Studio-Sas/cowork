@@ -31,4 +31,5 @@ export interface SessionSummaryDTO {
   isLive: boolean;
   unread: boolean; // true if session completed but hasn't been viewed by user
   runtime: SessionRuntime;
+  model: string | null; // actual model id captured from the SDK init event (e.g. "claude-opus-4-7", "gemini-3.5-flash")
 }

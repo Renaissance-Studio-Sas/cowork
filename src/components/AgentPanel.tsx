@@ -20,7 +20,6 @@ type SDKMessageLite =
         content: Array<
           | { type: "text"; text: string }
           | { type: "tool_use"; id: string; name: string; input: unknown }
-          | { type: "thinking"; thinking: string }
         >;
       };
     }
@@ -146,9 +145,7 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
 type PanelPart = { type: string; [k: string]: unknown };
 
 function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
-  type Chip =
-    | { kind: "tool"; part: PanelPart }
-    | { kind: "think"; text: string };
+  type Chip = { kind: "tool"; part: PanelPart };
   type Item =
     | { kind: "user"; key: string; text: string }
     | { kind: "asst-text"; key: string; text: string }
@@ -182,9 +179,6 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
         if (p.type === "tool_use") {
           if (!batch.length) batchKey = `c-${i}-${j}`;
           batch.push({ kind: "tool", part: p });
-        } else if (p.type === "thinking") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "think", text: (p.thinking as string) ?? "" });
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
@@ -219,9 +213,7 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
         if (it.kind === "chip-row") {
           return (
             <div key={it.key} className="flex flex-wrap gap-1">
-              {it.chips.map((c, j) => c.kind === "tool"
-                ? <PanelToolChip key={j} p={c.part} />
-                : <PanelThinkChip key={j} text={c.text} />)}
+              {it.chips.map((c, j) => <PanelToolChip key={j} p={c.part} />)}
             </div>
           );
         }
@@ -238,22 +230,6 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
         return null;
       })}
     </>
-  );
-}
-
-function PanelThinkChip({ text }: { text: string }) {
-  return (
-    <details className="group inline-block align-top max-w-full">
-      <summary
-        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11px] text-[var(--muted)] italic bg-[var(--panel)] hover:bg-[var(--panel-2)] rounded-md px-1.5 py-0.5 border border-[var(--border)]"
-      >
-        <span className="text-[9px] opacity-70 not-italic">▸</span>
-        <span>thinking</span>
-      </summary>
-      <pre className="mt-1 overflow-x-auto text-[10.5px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1 max-w-full whitespace-pre-wrap break-words not-italic">
-        {text}
-      </pre>
-    </details>
   );
 }
 
