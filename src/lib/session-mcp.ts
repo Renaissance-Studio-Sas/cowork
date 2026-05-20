@@ -303,22 +303,9 @@ Returns profile ID, display name, email, and whether the extension is installed.
         "chrome_connect",
         `Wire the running Claude-in-Chrome bridge into THIS session's MCP map so
 the agent can use the 17 Chrome MCP tools (navigate, tabs_context_mcp,
-read_page, find, form_input, etc.).
-
-⚠ CRITICAL: tool list refresh. After chrome_connect succeeds, the
-mcp__claude-in-chrome__* tools are NOT visible in your current turn — the
-SDK adds them mid-turn but the tool definitions sent to the LLM are locked
-in at turn start. If you call e.g. mcp__claude-in-chrome__navigate in the
-SAME turn as chrome_connect, you will get "No such tool available". You must
-END YOUR TURN after chrome_connect, then the next user message will start a
-new turn with the Chrome tools visible. Strategy:
-
-  Turn N (now)  : chrome_status → chrome_open_profile(id) → chrome_connect.
-                  End with a short message like "Chrome wired to <profile>.
-                  Send a follow-up and I'll proceed." Do NOT try to use any
-                  mcp__claude-in-chrome__* tool yet.
-  Turn N+1      : Chrome tools are now visible. Use tabs_context_mcp,
-                  navigate, read_page, etc.
+read_page, find, form_input, etc.). After this returns success the Chrome
+tools (\`mcp__claude-in-chrome__*\`) are immediately callable in the same
+turn — no need to end the turn first.
 
 PREREQUISITE: a Chrome native-messaging socket must already be live. The
 Claude extension auto-handshakes — no user click is needed — but the socket

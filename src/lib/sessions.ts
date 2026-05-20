@@ -726,6 +726,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id, p.projectSlug, p.taskSlug),
       },
+      thinking: { type: "adaptive", display: "summarized" },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1131,6 +1132,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
         "workbench-comments": commentsMcp,
         "workbench-session": buildSessionMcp(id, p.projectSlug, ""),
       },
+      thinking: { type: "adaptive", display: "summarized" },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1195,6 +1197,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: { "workbench-planning": planningMcp },
+      thinking: { type: "adaptive", display: "summarized" },
       // Don't specify model — use SDK default (latest Claude)
     },
   });
@@ -1409,6 +1412,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
           "workbench-comments": commentsMcp,
           "workbench-session": buildSessionMcp(s.id, s.projectSlug, s.taskSlug),
         },
+        thinking: { type: "adaptive", display: "summarized" },
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },
