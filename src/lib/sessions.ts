@@ -22,6 +22,8 @@ import { getRuntime } from "./runtimes";
 
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
+import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
+import { updateMeta, persistSdkSessionId, persistSessionState } from "./sessions/meta";
 import { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./workbench-tools/planning";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
@@ -53,166 +55,25 @@ import {
   stateAfterResult,
 } from "./session-state-machine";
 
-// Build a system prompt that includes project.md and task.md context so the
-// agent knows what project/task it's working in. Returns undefined if no
-// context files exist (letting the SDK use its default preset).
-async function buildContextSystemPrompt(
-  projectSlug: string,
-  taskSlug: string,
-): Promise<{ type: "preset"; preset: "claude_code"; append: string } | undefined> {
-  const parts: string[] = [];
-
-  // Read project.md
-  try {
-    const projectMdPath = path.join(PROJECTS_DIR, `wip-${projectSlug}`, "files", "project.md");
-    const projectContent = await fs.readFile(projectMdPath, "utf8");
-    if (projectContent.trim()) {
-      parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
-    }
-  } catch {
-    // Try done- prefix
-    try {
-      const projectMdPath = path.join(PROJECTS_DIR, `done-${projectSlug}`, "files", "project.md");
-      const projectContent = await fs.readFile(projectMdPath, "utf8");
-      if (projectContent.trim()) {
-        parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
-      }
-    } catch { /* no project.md */ }
-  }
-
-  // Read task.md
-  if (taskSlug) {
-    try {
-      const project = await getProject(projectSlug);
-      if (project) {
-        const task = project.tasks.find((t) => t.slug === taskSlug);
-        if (task) {
-          const taskMdPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "files", "task.md");
-          const taskContent = await fs.readFile(taskMdPath, "utf8");
-          if (taskContent.trim()) {
-            parts.push(`<task-context>\n# Task: ${taskSlug}\n\n${taskContent.trim()}\n</task-context>`);
-          }
-        }
-      }
-    } catch { /* no task.md */ }
-  }
-
-  if (parts.length === 0) return undefined;
-
-  const contextPrompt = `
-You are working within the Agent Workbench on a specific project and task. Here is the context:
-
-${parts.join("\n\n")}
-
-Use this context to understand the goals, requirements, and current state of work. When relevant, refer back to these documents for guidance.
-
-## Inline Media in Chat
-
-You can display images and videos inline in your chat responses using markdown syntax:
-
-**Basic syntax:**
-- Image: \`![alt text](url)\`
-- Video: \`![alt text](url.mp4)\` (automatically detected by extension: mp4, webm, mov, avi, mkv, m4v)
-
-**With custom dimensions** (append \`|width\` or \`|widthxheight\` to alt text):
-- \`![description|800](url)\` — 800px wide, maintains aspect ratio
-- \`![description|800x600](url)\` — exact 800x600 dimensions
-
-**For files in the task folder**, use the raw file API:
-\`\`\`
-![screenshot|600](/api/files/raw?project=PROJECT&task=TASK&path=uploads/image.png)
-![demo video|800](/api/files/raw?project=PROJECT&task=TASK&path=uploads/demo.mp4)
-\`\`\`
-
-Replace PROJECT and TASK with the current project/task slugs (URL-encoded). Files in the task's \`files/\` directory are served via this API.
-`.trim();
-
-  return { type: "preset", preset: "claude_code", append: contextPrompt };
-}
-
-// Generate a short label from the first message by extracting key words.
-// Produces labels like "Add dark mode", "Fix login bug", "Session names feature"
-function generateSessionLabel(firstMessage: string): string {
-  // Clean up the message
-  let text = firstMessage
-    .trim()
-    .replace(/^(can you|could you|please|hey|hi|hello|I want to|I need to|I'd like to|let's|we should)\s*/gi, "")
-    .replace(/[?!.]+$/, "")
-    .trim();
-
-  // If it starts with a verb, capitalize it; otherwise add context
-  const words = text.split(/\s+/);
-  if (words.length === 0) return "New session";
-
-  // Capitalize first letter
-  words[0] = words[0].charAt(0).toUpperCase() + words[0].slice(1);
-
-  // Take first ~5 words or ~40 chars, whichever is shorter
-  let label = "";
-  for (const word of words) {
-    if (label.length + word.length > 40) break;
-    label += (label ? " " : "") + word;
-  }
-
-  return label || "New session";
-}
-
 // Re-export SessionState for consumers who import from sessions.ts
 export type { SessionState } from "./session-state-machine";
 
-// Which agent runtime drives this session. Claude is the default and is
-// what every session today uses; Gemini is a phase-3 follow-up. Stored in
-// meta.json so resume after a server restart picks the same runtime.
-export type SessionRuntime = "claude" | "gemini";
+// Re-export session-related types so consumers that `import { ... } from
+// "./sessions"` keep working. New code should prefer importing directly
+// from ./sessions/types.
+export type {
+  SessionRuntime,
+  RuntimeSession,
+  PendingPermission,
+  SessionSummary,
+} from "./sessions/types";
 
-interface RuntimeSession {
-  id: string;
-  projectSlug: string;
-  taskSlug: string;
-  cwd: string;
-  title: string;                 // short label derived from first message (e.g. "Add dark mode")
-  startedAt: Date;
-  lastActivity: Date;
-  seenAt: Date | null;           // when user last viewed this session (null = never seen)
-  completedAt: Date | null;      // when session finished (idle/stopped/error) — for unread tracking
-  q: AgentQuery;
-  input: InputChannel;
-  events: EventEmitter;          // emits 'event' (SDKMessage) and 'state' (SessionState)
-  log: WriteStream;              // events.jsonl
-  inputLog: WriteStream;         // input.jsonl
-  history: SDKMessage[];         // in-memory replay buffer for new SSE clients
-  state: SessionState;
-  // Tool calls awaiting user approval via canUseTool. Keyed by toolUseID.
-  // Today this is used for ExitPlanMode (the agent finishes a plan, the SDK
-  // asks for user approval before exiting plan mode). The resolver is called
-  // by the /api/sessions/[id]/permission endpoint with the user's decision.
-  pendingPermissions: Map<string, PendingPermission>;
-  sdkSessionId: string | null;   // the SDK's internal session ID for resumption
-  permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
-  model: string | null;
-  runtime: SessionRuntime;       // claude (default) | gemini
-}
-
-export interface PendingPermission {
-  toolName: string;
-  input: Record<string, unknown>;
-  resolve: (r: PermissionResult) => void;
-  requestedAt: Date;
-}
-
-export interface SessionSummary {
-  id: string;
-  projectSlug: string;
-  taskSlug: string;
-  state: SessionState;
-  title: string;
-  startedAt: string;             // ISO
-  lastActivity: string;          // ISO
-  isLive: boolean;
-  unread: boolean;               // completed session not yet viewed
-  runtime: SessionRuntime;
-  model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")
-}
+import type {
+  SessionRuntime,
+  RuntimeSession,
+  PendingPermission,
+  SessionSummary,
+} from "./sessions/types";
 
 const REGISTRY = new Map<string, RuntimeSession>();
 
@@ -954,71 +815,6 @@ function extractModifiedFilePath(msg: SDKMessage): string | null {
   return null;
 }
 
-// Persist the SDK session ID to meta.json so the session can be resumed after server restart
-async function persistSdkSessionId(s: RuntimeSession): Promise<void> {
-  await updateMeta(s, (meta) => {
-    meta.sdkSessionId = s.sdkSessionId;
-  });
-}
-
-// Per-session mutex queue for meta.json updates. Without this, two
-// setState() calls in quick succession (very common: running → idle → stopped
-// over a few hundred ms) trigger two concurrent persistSessionState calls,
-// each doing read-modify-write on the same file. We've observed the resulting
-// file corruption in the wild: the shorter write's `}\n` ends up overlaid on
-// top of the longer write's content, leaving JSON that won't parse. That
-// blocks restoreSession and the session becomes unrecoverable across server
-// restarts ("session not found or failed to resume").
-const metaWriteQueue = new Map<string, Promise<void>>();
-
-// Read-modify-write meta.json safely:
-// - Serialized per-session: concurrent updateMeta calls for the same session
-//   are queued, so reader/writer cycles never interleave.
-// - Atomic on the file system: write to a sibling .tmp file and rename, so
-//   a crash or process kill mid-write never leaves a half-written meta.json.
-async function updateMeta(
-  s: RuntimeSession,
-  mutate: (meta: Record<string, unknown>) => void,
-): Promise<void> {
-  // Skip for planning sessions (they write to /dev/null)
-  if (s.projectSlug === "__planning__") return;
-
-  const prev = metaWriteQueue.get(s.id) ?? Promise.resolve();
-  const next = prev.then(async () => {
-    try {
-      const project = await getProject(s.projectSlug);
-      if (!project) return;
-
-      let sessionDir: string;
-      if (!s.taskSlug) {
-        sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-      } else {
-        const task = project.tasks.find((t) => t.slug === s.taskSlug);
-        if (!task) return;
-        sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
-      }
-
-      const metaPath = path.join(sessionDir, "meta.json");
-      const tmpPath = metaPath + ".tmp";
-      const raw = await fs.readFile(metaPath, "utf8");
-      const meta = JSON.parse(raw) as Record<string, unknown>;
-      mutate(meta);
-      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
-      await fs.rename(tmpPath, metaPath);
-    } catch {
-      // Best effort — meta drift gets caught by reconcileSessionsOnDisk on boot.
-    }
-  });
-  metaWriteQueue.set(s.id, next);
-  try {
-    await next;
-  } finally {
-    // If this was the last queued write for the session, drop the entry so
-    // the map doesn't accumulate forever.
-    if (metaWriteQueue.get(s.id) === next) metaWriteQueue.delete(s.id);
-  }
-}
-
 async function pumpEvents(s: RuntimeSession) {
   try {
     for await (const msg of s.q) {
@@ -1157,17 +953,6 @@ function setState(s: RuntimeSession, state: SessionState) {
     }
     void persistSessionState(s, state);
   }
-}
-
-// Persist the final state to meta.json for recovery after server restart
-async function persistSessionState(s: RuntimeSession, state: SessionState): Promise<void> {
-  await updateMeta(s, (meta) => {
-    meta.finalState = state;
-    meta.lastActivity = s.lastActivity.toISOString();
-    if (s.completedAt) {
-      meta.completedAt = s.completedAt.toISOString();
-    }
-  });
 }
 
 // Called from fs.ts after a task or project is moved/renamed. Keeps the
