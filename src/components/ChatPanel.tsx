@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useWorkspace } from "@/lib/workspace-context";
 import { handleComposerEnter } from "@/lib/composer";
-import type { SessionSummaryDTO } from "@/lib/types";
+import type { SessionSummaryDTO, SessionRuntime } from "@/lib/types";
 import { TodoList, extractTodosFromMessages } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
 import ReactMarkdown from "react-markdown";
@@ -102,7 +102,7 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
   // For creating new sessions
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
-  const [runtime, setRuntime] = useState<"claude" | "gemini">("claude");
+  const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const startNewSession = async () => {
@@ -920,8 +920,8 @@ function NewSessionComposer({
   starting: boolean;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   placeholder: string;
-  runtime: "claude" | "gemini";
-  onRuntime: (r: "claude" | "gemini") => void;
+  runtime: SessionRuntime;
+  onRuntime: (r: SessionRuntime) => void;
 }) {
   return (
     <div className="border-t border-[var(--border)] p-2.5 bg-[var(--bg-2)]">
@@ -954,7 +954,7 @@ function NewSessionComposer({
         <div className="text-[10.5px] text-[var(--muted)]">New session</div>
         <select
           value={runtime}
-          onChange={(e) => onRuntime(e.target.value as "claude" | "gemini")}
+          onChange={(e) => onRuntime(e.target.value as SessionRuntime)}
           className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
           title="Agent runtime"
         >

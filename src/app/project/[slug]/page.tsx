@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
+import type { ProjectDTO, SessionSummaryDTO, TaskDTO, SessionRuntime } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { StatusChip } from "@/components/StatusChip";
@@ -64,7 +64,7 @@ export default function ProjectPage() {
 
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
-  const [runtime, setRuntime] = useState<"claude" | "gemini">("claude");
+  const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const [files, setFiles] = useState<string[]>([]);
   const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);

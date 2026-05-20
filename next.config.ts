@@ -1,8 +1,16 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Agent SDK + better-sqlite3 are Node-only; keep them out of the client bundle
-  serverExternalPackages: ["@anthropic-ai/claude-agent-sdk", "better-sqlite3", "chokidar"],
+  // Node-only packages — don't bundle for the client; require at runtime.
+  // gemini-cli-core transitively pulls in @lydell/node-pty (native pty for
+  // its interactive shell tool) which Turbopack chokes on. Listing the
+  // package as external short-circuits the bundler.
+  serverExternalPackages: [
+    "@anthropic-ai/claude-agent-sdk",
+    "@google/gemini-cli-core",
+    "better-sqlite3",
+    "chokidar",
+  ],
 };
 
 export default nextConfig;
