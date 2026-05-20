@@ -1,16 +1,13 @@
-// GeminiRuntime — implements AgentRuntime on top of @google/gemini-cli-core's
-// Config + GeminiChat. Replaces the earlier raw @google/genai adapter so
-// Gemini sessions can grow into tool calling, MCP, and the agent loop
-// without rewriting the runtime layer. See docs/gemini-runtime-parity.md
-// for the staged plan.
+// GeminiRuntime — implements AgentRuntime on top of @google/gemini-cli-core.
 //
-// Step 1 (this file as it stands): plain text chat + streaming.
-// Subsequent steps add:
-//   - tool calling + MCP (via Config's ToolRegistry + McpClient)
-//   - canUseTool / ExitPlanMode plumbing
-//   - resume (persist + reload GeminiChat history)
+// We use the high-level GeminiClient.sendMessageStream rather than the
+// lower-level GeminiChat. The client drives the full agent loop
+// (model call → tool execution → continue) and emits a typed event
+// stream we translate into our AgentEvent shape. Without this, a tool
+// call requested by the model wouldn't actually execute — sendMessage
+// at the chat level is one round-trip with the LLM, not a loop.
 //
-// Auth: env vars read by @google/gemini-cli-core's getAuthTypeFromEnv():
+// Auth: env vars read by gemini-cli-core's getAuthTypeFromEnv():
 //   GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION
 // resolves to AuthType.USE_VERTEX_AI with ADC. gemini-3.5-flash requires
 // GOOGLE_CLOUD_LOCATION=global (see .env.local) — regional endpoints 404
@@ -19,11 +16,16 @@
 import { randomUUID } from "node:crypto";
 import {
   Config,
-  GeminiChat,
   AuthType,
-  LlmRole,
-  StreamEventType,
-  type StreamEvent as CliStreamEvent,
+  ApprovalMode,
+  GeminiEventType,
+  Scheduler,
+  type GeminiClient,
+  type GeminiChat,
+  type ServerGeminiStreamEvent,
+  type Turn,
+  type CompletedToolCall,
+  type ToolCallRequestInfo,
 } from "@google/gemini-cli-core";
 import type {
   AgentRuntime,
@@ -49,19 +51,27 @@ class GeminiAgentQuery implements AgentQuery {
   private readonly abort = new AbortController();
   private readonly workbenchToolGroups: Array<{ name: string; tools: WorkbenchTool[] }>;
 
-  // Lazy: Config + GeminiChat bootstrap is async (refreshAuth → initialize)
-  // so we set up on first iteration rather than in the constructor (which
-  // is sync per AgentRuntime contract).
+  // Lazy: bootstrap is async (refreshAuth → initialize → startChat) so we
+  // set up on first iteration rather than in the sync AgentRuntime
+  // constructor.
   private config: Config | null = null;
+  private client: GeminiClient | null = null;
+  // `chat` is started for its side-effect of populating the client's
+  // active chat session; sendMessageStream uses it implicitly via the
+  // client. Kept on the instance for future inspection / resume work.
   private chat: GeminiChat | null = null;
+  // Drives tool execution between model turns. cli-core's
+  // sendMessageStream sets turn.pendingToolCalls but doesn't execute
+  // them — we feed them to the scheduler, then send the responses
+  // back as the next request.
+  private scheduler: Scheduler | null = null;
 
   constructor(opts: AgentQueryOptions) {
     this.input = opts.prompt;
     // sessions.ts builds Claude-SDK-shaped options: { prompt, options: { cwd,
     // model, workbenchToolGroups, systemPrompt, … } }. Read from the nested
     // `options` first, fall back to top-level for direct AgentQueryOptions
-    // callers. Without this read, the Gemini adapter was silently
-    // ignoring tool registration AND the model override.
+    // callers.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const nested = (opts as any).options as Record<string, unknown> | undefined;
     const get = <T>(key: string): T | undefined =>
@@ -81,9 +91,7 @@ class GeminiAgentQuery implements AgentQuery {
   }
 
   private async bootstrap(): Promise<void> {
-    if (this.chat) return;
-    // Config is gemini-cli-core's central AgentLoopContext — it owns the
-    // tool registry, MCP client manager, content generator, etc.
+    if (this.client) return;
     this.config = new Config({
       sessionId: this.sessionId,
       clientName: "cowork",
@@ -91,35 +99,49 @@ class GeminiAgentQuery implements AgentQuery {
       cwd: this.cwd,
       targetDir: this.cwd,
       debugMode: false,
-      // Disable telemetry collection for cowork sessions — gemini-cli-core
-      // has clearcut/usage stats hooks intended for the CLI; cowork isn't
-      // the CLI and shouldn't ship anonymous usage to Google's pipelines.
+      // Disable telemetry — gemini-cli-core has clearcut/usage hooks
+      // intended for the CLI; cowork isn't the CLI.
       usageStatisticsEnabled: false,
+      // YOLO mode = auto-approve every tool call. cowork's permission
+      // model is "bypassPermissions" by default (matches the Claude
+      // runtime), and we don't have an interactive confirm UI to call
+      // back into. Without this, the scheduler refuses tool execution
+      // with "requires user confirmation, which is not supported in
+      // non-interactive mode." Plan-mode-style approvals can be plumbed
+      // later via canUseTool when we add that wiring.
+      approvalMode: ApprovalMode.YOLO,
     });
-    // refreshAuth reads GOOGLE_GENAI_USE_VERTEXAI / GOOGLE_CLOUD_PROJECT
-    // from env and wires the content generator for Vertex.
     await this.config.refreshAuth(AuthType.USE_VERTEX_AI);
-    // initialize() builds the tool registry (empty by default), MCP client
-    // manager, etc.
     await this.config.initialize();
 
-    // Register cowork's workbench tools into gemini-cli-core's ToolRegistry
-    // so the agent can call them (comments, planning, email, session). The
-    // Claude-specific chrome_connect/disconnect tools are not in this set —
-    // gemini-cli-core needs its own Chrome integration (out of scope).
+    // Register cowork's workbench tools into the Config's ToolRegistry so
+    // they're visible to the agent. Done before startChat() so the chat's
+    // initial tools snapshot includes them.
     for (const group of this.workbenchToolGroups) {
       registerWorkbenchToolsInGemini(this.config, group.tools);
     }
 
-    // GeminiChat takes its tool list at construction time — registering in
-    // ToolRegistry alone doesn't propagate. The chat expects the Vertex
-    // tools shape: `[{ functionDeclarations: [...] }]`, not raw Tool[].
-    // Pull FunctionDeclarations from the registry, wrap, feed in.
-    // (Matches what gemini-cli-core's own Client.startChat does.)
-    const toolDeclarations = this.config.getToolRegistry().getFunctionDeclarations();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const tools = [{ functionDeclarations: toolDeclarations }] as any[];
-    this.chat = new GeminiChat(this.config, this.systemInstruction, tools, []);
+    this.client = this.config.getGeminiClient();
+    await this.client.initialize();
+    // startChat builds the GeminiChat with tools pulled from the registry
+    // (in the Vertex-API wire shape, which we'd otherwise have to assemble
+    // ourselves). It also wires the onModelChanged callback for tool
+    // re-resolution if the model is swapped mid-session.
+    this.chat = await this.client.startChat();
+    if (this.systemInstruction) {
+      this.chat.setSystemInstruction(this.systemInstruction);
+    }
+
+    // Scheduler executes pending tool calls between model turns. cowork
+    // doesn't ship an editor UI, so getPreferredEditor returns undefined
+    // (the scheduler falls back to its no-confirm path for tools that
+    // would otherwise require an editor pick).
+    this.scheduler = new Scheduler({
+      context: this.config,
+      messageBus: this.config.getMessageBus(),
+      getPreferredEditor: () => undefined,
+      schedulerId: `cowork-${this.sessionId}`,
+    });
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<AgentEvent> {
@@ -128,127 +150,116 @@ class GeminiAgentQuery implements AgentQuery {
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error(`[gemini-runtime] bootstrap failed:`, errorMsg);
-      yield {
-        type: "system",
-        subtype: "init",
-        session_id: this.sessionId,
-        cwd: this.cwd,
-        model: this.model,
-        tools: [],
-        mcp_servers: [],
-        slash_commands: [],
-        permissionMode: "bypassPermissions",
-        apiKeySource: "env",
-      } as unknown as AgentEvent;
-      yield {
-        type: "result",
-        subtype: "error",
-        session_id: this.sessionId,
-        is_error: true,
-        error: `gemini-cli-core bootstrap failed: ${errorMsg}`,
-        result: errorMsg,
-      } as unknown as AgentEvent;
+      yield initEvent(this.sessionId, this.cwd, this.model);
+      yield resultErrorEvent(this.sessionId, `gemini-cli-core bootstrap failed: ${errorMsg}`);
       return;
     }
 
-    yield {
-      type: "system",
-      subtype: "init",
-      session_id: this.sessionId,
-      cwd: this.cwd,
-      model: this.model,
-      tools: [],
-      mcp_servers: [],
-      slash_commands: [],
-      permissionMode: "bypassPermissions",
-      apiKeySource: "env",
-    } as unknown as AgentEvent;
+    yield initEvent(this.sessionId, this.cwd, this.model);
 
     for await (const userMsg of this.input) {
       if (this.abort.signal.aborted) break;
       const text = extractUserText(userMsg);
       if (!text) continue;
 
-      let accumulated = "";
       const turnUuid = randomUUID();
       const promptId = `prompt_${Date.now()}`;
-      try {
-        const stream = await this.chat!.sendMessageStream(
-          { model: this.model, isChatModel: true },
-          [{ text }],
-          promptId,
-          this.abort.signal,
-          LlmRole.MAIN,
-        );
+      let accumulated = "";
+      // Tracks tool_use IDs we've emitted, so subsequent tool_result
+      // messages reference the matching id. cli-core uses its own callId;
+      // we generate a stable mapping per turn.
+      const callIdToToolUseId = new Map<string, string>();
+      // Cap how many model↔tool round-trips we'll do per user message.
+      // cli-core has its own MAX_TURNS (in the hundreds) but we want a
+      // tighter belt-and-braces here too so a runaway agent can't loop
+      // forever on the user's nickel.
+      const MAX_TOOL_ROUNDS = 25;
 
-        for await (const ev of stream as AsyncGenerator<CliStreamEvent>) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let request: any = [{ text }];
+        let rounds = 0;
+
+        while (true) {
           if (this.abort.signal.aborted) break;
-          if (ev.type !== StreamEventType.CHUNK) continue;
-          // ev.value is a @google/genai GenerateContentResponse — same
-          // shape we already handle in the text-only adapter. Extract
-          // text from the first candidate's parts.
-          const resp = ev.value as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-          const parts = resp.candidates?.[0]?.content?.parts ?? [];
-          for (const p of parts) {
-            const t = p?.text;
-            if (typeof t !== "string" || !t) continue;
-            accumulated += t;
+          if (++rounds > MAX_TOOL_ROUNDS) {
             yield {
-              type: "stream_event",
-              uuid: turnUuid,
-              session_id: this.sessionId,
-              parent_tool_use_id: null,
-              event: {
-                type: "content_block_delta",
-                index: 0,
-                delta: { type: "text_delta", text: t },
-              },
-            } as unknown as AgentEvent;
+              type: "system",
+              subtype: "error",
+              message: `Exceeded ${MAX_TOOL_ROUNDS} tool-execution rounds in one turn — aborting`,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            } as any;
+            break;
           }
+
+          const stream = this.client!.sendMessageStream(
+            request,
+            this.abort.signal,
+            promptId,
+          );
+
+          // Manual iteration so we can capture the AsyncGenerator's return
+          // value (the Turn instance). `for await … of stream` discards it.
+          const iter = stream[Symbol.asyncIterator]();
+          let turn: Turn | undefined;
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            const r = await iter.next();
+            if (r.done) {
+              turn = r.value;
+              break;
+            }
+            for (const out of translateEvent(r.value, this.sessionId, this.model, turnUuid, callIdToToolUseId)) {
+              if (out.type === "assistant") {
+                const content = (out as { message?: { content?: Array<{ type?: string; text?: string }> } }).message?.content;
+                for (const part of content ?? []) {
+                  if (part.type === "text" && typeof part.text === "string") {
+                    accumulated += part.text;
+                  }
+                }
+              }
+              yield out;
+            }
+          }
+
+          // No pending tool calls → the agent finished this turn.
+          const pending = turn?.pendingToolCalls ?? [];
+          if (pending.length === 0) break;
+
+          // Execute the pending tool calls via the scheduler. It walks
+          // through validation → confirmation → execution → result. For
+          // cowork's permission model (bypassPermissions), the
+          // confirmation step auto-allows.
+          const completed = await this.scheduler!.schedule(
+            pending as ToolCallRequestInfo[],
+            this.abort.signal,
+          );
+
+          // Surface tool_result events to the UI as Claude-shaped user
+          // messages, mirroring what the Claude SDK does. Each call's
+          // toolUseId was registered when we translated the ToolCallRequest.
+          for (const c of completed) {
+            yield toolResultEventFromCompleted(c, callIdToToolUseId, this.sessionId);
+          }
+
+          // Build the next request from each completed call's responseParts.
+          // cli-core expects the conversation to alternate functionCall
+          // (already in chat history from the prior Turn) ↔ functionResponse.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const nextRequest: any[] = [];
+          for (const c of completed) {
+            const parts = (c as { response?: { responseParts?: unknown[] } }).response?.responseParts ?? [];
+            for (const p of parts) nextRequest.push(p);
+          }
+          if (nextRequest.length === 0) break;
+          request = nextRequest;
         }
 
-        // Final assistant message with the full accumulated text.
-        yield {
-          type: "assistant",
-          session_id: this.sessionId,
-          parent_tool_use_id: null,
-          message: {
-            id: `msg_${Date.now()}`,
-            role: "assistant",
-            type: "message",
-            model: this.model,
-            content: [{ type: "text", text: accumulated }],
-            stop_reason: "end_turn",
-            stop_sequence: null,
-            usage: {},
-          },
-        } as unknown as AgentEvent;
-
-        yield {
-          type: "result",
-          subtype: "success",
-          session_id: this.sessionId,
-          is_error: false,
-          duration_ms: 0,
-          duration_api_ms: 0,
-          num_turns: 1,
-          result: accumulated,
-          total_cost_usd: 0,
-          usage: {},
-          modelUsage: {},
-          permission_denials: [],
-        } as unknown as AgentEvent;
+        yield resultSuccessEvent(this.sessionId, accumulated);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`[gemini-runtime] sendMessageStream failed:`, errorMsg);
-        yield {
-          type: "result",
-          subtype: "error",
-          session_id: this.sessionId,
-          is_error: true,
-          error: errorMsg,
-          result: errorMsg,
-        } as unknown as AgentEvent;
+        yield resultErrorEvent(this.sessionId, errorMsg);
       }
     }
   }
@@ -257,9 +268,9 @@ class GeminiAgentQuery implements AgentQuery {
     this.abort.abort();
   }
 
-  // Step 4 will hook MCP wiring up through Config's mcpClientManager.
-  // Step 1 ships as no-op so chrome_connect in a gemini-cli session
-  // doesn't crash.
+  // Step: gemini-cli MCP integration wiring is its own piece of work; today
+  // setMcpServers is a no-op so chrome_connect from a Gemini session doesn't
+  // crash. Chrome support in gemini-cli-core is its own follow-up.
   async setMcpServers(_servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult> {
     return { added: [], removed: [], errors: {} };
   }
@@ -276,6 +287,199 @@ export const geminiRuntime: AgentRuntime = {
     return new GeminiAgentQuery(opts);
   },
 };
+
+// Translate one ServerGeminiStreamEvent (cli-core's typed event union)
+// into zero or more AgentEvents (Claude SDK-shaped, which the UI and
+// pumpEvents already speak). cli-core's loop emits Content for text
+// deltas, ToolCallRequest when the model asks to invoke a tool, and
+// ToolCallResponse when execution completes — we map each to the
+// corresponding Claude-shaped message.
+function translateEvent(
+  ev: ServerGeminiStreamEvent,
+  sessionId: string,
+  model: string,
+  turnUuid: string,
+  callIdToToolUseId: Map<string, string>,
+): AgentEvent[] {
+  switch (ev.type) {
+    case GeminiEventType.Content: {
+      // Text delta — emit as stream_event for incremental UI rendering.
+      const text = (ev as { value?: string }).value;
+      if (!text) return [];
+      return [{
+        type: "stream_event",
+        uuid: turnUuid,
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any];
+    }
+    case GeminiEventType.ToolCallRequest: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const req = (ev as any).value as { callId: string; name: string; args: Record<string, unknown> };
+      const toolUseId = `toolu_${randomUUID().slice(0, 12)}`;
+      callIdToToolUseId.set(req.callId, toolUseId);
+      return [{
+        type: "assistant",
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: {
+          id: `msg_${Date.now()}`,
+          role: "assistant",
+          type: "message",
+          model,
+          content: [{ type: "tool_use", id: toolUseId, name: req.name, input: req.args }],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: {},
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any];
+    }
+    case GeminiEventType.ToolCallResponse: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const resp = (ev as any).value as {
+        callId: string;
+        responseParts?: Array<{ text?: string; functionResponse?: { response?: unknown } }>;
+        error?: Error;
+      };
+      const toolUseId = callIdToToolUseId.get(resp.callId) ?? `toolu_${randomUUID().slice(0, 12)}`;
+      const text = resp.responseParts
+        ?.map((p) => {
+          if (typeof p.text === "string") return p.text;
+          if (p.functionResponse?.response) return JSON.stringify(p.functionResponse.response);
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n") ?? (resp.error ? String(resp.error.message ?? resp.error) : "");
+      return [{
+        type: "user",
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: text,
+            is_error: !!resp.error,
+          }],
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any];
+    }
+    case GeminiEventType.Thought:
+    case GeminiEventType.Citation:
+    case GeminiEventType.Retry:
+    case GeminiEventType.Finished:
+    case GeminiEventType.ChatCompressed:
+    case GeminiEventType.ModelInfo:
+      // Silent — these are flow control / metadata cli-core uses
+      // internally. Could be surfaced as system events in the future.
+      return [];
+    case GeminiEventType.Error: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const v = (ev as any).value as { error?: unknown };
+      const message = v?.error ? String(v.error) : "Unknown error";
+      return [{
+        type: "system",
+        subtype: "error",
+        message,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any];
+    }
+    default:
+      return [];
+  }
+}
+
+// Translate a scheduler-completed tool call into a Claude-shaped user/
+// tool_result message. The toolUseId comes from the map populated when we
+// translated the ToolCallRequest earlier in the stream.
+function toolResultEventFromCompleted(
+  c: CompletedToolCall,
+  callIdToToolUseId: Map<string, string>,
+  sessionId: string,
+): AgentEvent {
+  const callId = c.request?.callId;
+  const toolUseId = (callId && callIdToToolUseId.get(callId)) ?? `toolu_${randomUUID().slice(0, 12)}`;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const resp = (c as any).response as { responseParts?: Array<{ text?: string; functionResponse?: { response?: unknown } }>; error?: Error } | undefined;
+  const text = resp?.responseParts
+    ?.map((p) => {
+      if (typeof p.text === "string") return p.text;
+      if (p.functionResponse?.response) return JSON.stringify(p.functionResponse.response);
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n") ?? (resp?.error ? String(resp.error.message ?? resp.error) : "");
+  return {
+    type: "user",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: toolUseId,
+        content: text,
+        is_error: !!resp?.error,
+      }],
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
+
+function initEvent(sessionId: string, cwd: string, model: string): AgentEvent {
+  return {
+    type: "system",
+    subtype: "init",
+    session_id: sessionId,
+    cwd,
+    model,
+    tools: [],
+    mcp_servers: [],
+    slash_commands: [],
+    permissionMode: "bypassPermissions",
+    apiKeySource: "env",
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
+
+function resultSuccessEvent(sessionId: string, text: string): AgentEvent {
+  return {
+    type: "result",
+    subtype: "success",
+    session_id: sessionId,
+    is_error: false,
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 1,
+    result: text,
+    total_cost_usd: 0,
+    usage: {},
+    modelUsage: {},
+    permission_denials: [],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
+
+function resultErrorEvent(sessionId: string, errorMsg: string): AgentEvent {
+  return {
+    type: "result",
+    subtype: "error",
+    session_id: sessionId,
+    is_error: true,
+    error: errorMsg,
+    result: errorMsg,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+}
 
 function extractUserText(msg: AgentUserMessage): string {
   const c = (msg as { message?: { content?: unknown } }).message?.content;
