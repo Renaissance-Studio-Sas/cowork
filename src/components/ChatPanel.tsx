@@ -796,9 +796,9 @@ function LiveChat({
         )}
         <PanelMessageStream messages={messages} />
         {streamingText && (
-          <div className="text-[13px] whitespace-pre-wrap leading-relaxed opacity-90">
-            {streamingText}
-            <span className="dots ml-0.5" aria-hidden />
+          <div className="opacity-90 relative">
+            <PanelMarkdown text={streamingText} />
+            <span className="dots inline-block ml-0.5" aria-hidden />
           </div>
         )}
         {messages.length === 0 && !streamingText && (

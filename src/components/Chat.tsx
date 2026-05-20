@@ -580,11 +580,13 @@ export function Chat({ session, onChange, onBack }: Props) {
           <MessageStream messages={messages} sessionId={session.id} />
           {/* In-progress streamed text from the current assistant turn. Lives
               outside the persisted message stream — gets cleared and replaced
-              by the final assistant message when the turn completes. */}
+              by the final assistant message when the turn completes. Rendered
+              through the same Markdown component as final messages so headings,
+              code fences, lists, etc. format live as the agent types. */}
           {streamingText && (
-            <div className="text-[13.5px] whitespace-pre-wrap leading-relaxed opacity-90">
-              {streamingText}
-              <span className="dots ml-0.5" aria-hidden />
+            <div className="opacity-90 relative">
+              <Markdown text={streamingText} />
+              <span className="dots inline-block ml-0.5" aria-hidden />
             </div>
           )}
           {messages.length === 0 && !streamingText && (
