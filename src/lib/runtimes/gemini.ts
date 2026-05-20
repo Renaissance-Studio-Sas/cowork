@@ -57,15 +57,26 @@ class GeminiAgentQuery implements AgentQuery {
 
   constructor(opts: AgentQueryOptions) {
     this.input = opts.prompt;
-    this.cwd = opts.cwd || process.cwd();
-    this.model = opts.model || DEFAULT_MODEL;
-    this.sessionId = `gemini-${randomUUID().slice(0, 8)}`;
-    this.workbenchToolGroups = opts.workbenchToolGroups ?? [];
+    // sessions.ts builds Claude-SDK-shaped options: { prompt, options: { cwd,
+    // model, workbenchToolGroups, systemPrompt, … } }. Read from the nested
+    // `options` first, fall back to top-level for direct AgentQueryOptions
+    // callers. Without this read, the Gemini adapter was silently
+    // ignoring tool registration AND the model override.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const nested = (opts as any).options as Record<string, unknown> | undefined;
+    const get = <T>(key: string): T | undefined =>
+      (nested?.[key] as T | undefined) ?? (opts as unknown as Record<string, T>)[key];
 
-    if (typeof opts.systemPrompt === "object" && opts.systemPrompt) {
-      this.systemInstruction = opts.systemPrompt.append;
-    } else if (typeof opts.systemPrompt === "string") {
-      this.systemInstruction = opts.systemPrompt;
+    this.cwd = get<string>("cwd") || process.cwd();
+    this.model = get<string>("model") || DEFAULT_MODEL;
+    this.sessionId = `gemini-${randomUUID().slice(0, 8)}`;
+    this.workbenchToolGroups = get<typeof this.workbenchToolGroups>("workbenchToolGroups") ?? [];
+
+    const sysPrompt = get<AgentQueryOptions["systemPrompt"]>("systemPrompt");
+    if (typeof sysPrompt === "object" && sysPrompt) {
+      this.systemInstruction = sysPrompt.append;
+    } else if (typeof sysPrompt === "string") {
+      this.systemInstruction = sysPrompt;
     }
   }
 
@@ -100,7 +111,15 @@ class GeminiAgentQuery implements AgentQuery {
       registerWorkbenchToolsInGemini(this.config, group.tools);
     }
 
-    this.chat = new GeminiChat(this.config, this.systemInstruction, [], []);
+    // GeminiChat takes its tool list at construction time — registering in
+    // ToolRegistry alone doesn't propagate. The chat expects the Vertex
+    // tools shape: `[{ functionDeclarations: [...] }]`, not raw Tool[].
+    // Pull FunctionDeclarations from the registry, wrap, feed in.
+    // (Matches what gemini-cli-core's own Client.startChat does.)
+    const toolDeclarations = this.config.getToolRegistry().getFunctionDeclarations();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tools = [{ functionDeclarations: toolDeclarations }] as any[];
+    this.chat = new GeminiChat(this.config, this.systemInstruction, tools, []);
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<AgentEvent> {

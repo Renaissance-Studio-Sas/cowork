@@ -10,8 +10,7 @@
 // our workbench tools are pure in-process functions. Plugging in at the
 // ToolRegistry layer is the cleanest match.
 
-import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
+import { z, toJSONSchema } from "zod";
 import {
   type Config,
   BaseDeclarativeTool,
@@ -71,16 +70,17 @@ class WorkbenchToolClass extends BaseDeclarativeTool<AnyParams, ToolResult> {
       // add a per-tool override later.
       Kind.Other,
       // gemini-cli-core wants a clean JSON Schema for parameterSchema:
-      // { type: 'object', properties: {...}, required: [...] }. Bare —
-      // no $schema, no top-level $ref, no definitions wrapper. zod-to-
-      // json-schema's default output adds those, which makes Gemini's
-      // function-call parser reject the tool with "Model stream ended
-      // with malformed function call." So we strip the schema wrapper.
-      // The type mismatch (zod v4 here vs zod v3 in zod-to-json-schema)
-      // is bridged with `any` casts — runtime output is JSON Schema
-      // regardless of which zod the input came from.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      stripJsonSchemaWrapper(zodToJsonSchema(z.object(workbenchTool.schema as z.ZodRawShape) as any) as any),
+      // { type: 'object', properties: {...}, required: [...] }. zod v4's
+      // built-in toJSONSchema produces exactly this — we just strip the
+      // `$schema` URL and `additionalProperties` (gemini-cli-core's
+      // function-call parser is happy without either).
+      //
+      // NOTE: the older zod-to-json-schema package silently returned `{}`
+      // for zod v4 inputs (was authored against zod v3 internals). That
+      // caused tools to be registered with no usable schema, and Gemini
+      // rejected calls with "Model stream ended with malformed function
+      // call." Using z's own toJSONSchema fixes it.
+      stripJsonSchemaWrapper(toJSONSchema(z.object(workbenchTool.schema as z.ZodRawShape))),
       messageBus,
     );
   }
@@ -101,15 +101,17 @@ export function registerWorkbenchToolsInGemini(config: Config, tools: WorkbenchT
   }
 }
 
-// zod-to-json-schema emits a wrapped schema with `$schema`,
-// optional `definitions`, and sometimes a top-level `$ref`. gemini-cli-core
-// (and the underlying Gemini function-call parser) expects a flat
-// `{ type: 'object', properties, required }`. Strip the wrapper here.
+// Sanitize a JSON Schema for Gemini's function-call parser. Strips fields
+// that aren't part of OpenAPI 3.0 (which is the subset Gemini accepts in
+// FunctionDeclaration.parameters per the Vertex API docs). The Gemini API
+// returns finishReason="MALFORMED_FUNCTION_CALL" when given unsupported
+// constructs like $schema, additionalProperties, oneOf/anyOf/allOf at root,
+// or schemas wrapped in $ref/definitions. We recurse so nested properties
+// (e.g. array items) are also sanitized.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function stripJsonSchemaWrapper(schema: any): any {
   if (!schema || typeof schema !== "object") return schema;
-  // Inline the top-level $ref if present (zod-to-json-schema sometimes
-  // emits `{ $ref: "#/definitions/X", definitions: { X: {...} } }`).
+  // Resolve top-level $ref into definitions if present.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let resolved: any = schema;
   if (schema.$ref && schema.definitions) {
@@ -118,8 +120,20 @@ function stripJsonSchemaWrapper(schema: any): any {
       resolved = schema.definitions[refPath];
     }
   }
-  // Strip JSON-Schema metadata that Gemini's parser doesn't want.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { $schema: _$schema, definitions: _definitions, ...rest } = resolved;
-  return rest;
+  return sanitizeForGemini(resolved);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function sanitizeForGemini(schema: any): any {
+  if (Array.isArray(schema)) return schema.map(sanitizeForGemini);
+  if (!schema || typeof schema !== "object") return schema;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    // Drop fields Gemini's function-call parser doesn't accept.
+    if (k === "$schema" || k === "$id" || k === "$ref" || k === "definitions") continue;
+    if (k === "additionalProperties") continue;
+    out[k] = sanitizeForGemini(v);
+  }
+  return out;
 }

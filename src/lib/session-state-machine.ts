@@ -79,10 +79,14 @@ export function isCompletedState(state: SessionState): boolean {
 
 /**
  * States that should be persisted to meta.json for recovery.
- * This includes all terminal states so the UI shows the correct state after refresh.
+ *
+ * Terminal states (idle/error/stopped) are persisted so the UI shows the
+ * correct state after refresh. "running" is also persisted so the boot-time
+ * auto-resume pass can detect sessions that were mid-process when the server
+ * died (no terminal state ever got written).
  */
 export function shouldPersistState(state: SessionState): boolean {
-  return state === "idle" || state === "error" || state === "stopped";
+  return state === "idle" || state === "error" || state === "stopped" || state === "running";
 }
 
 /**

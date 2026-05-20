@@ -342,7 +342,14 @@ if (!globalThis.__wb_watchdog_interval) {
 // PROJECTS_DIR depending on which module the loader entered first.
 if (!globalThis.__wb_reconciled) {
   globalThis.__wb_reconciled = true;
-  setImmediate(() => { void reconcileSessionsOnDisk(); });
+  setImmediate(async () => {
+    await reconcileSessionsOnDisk();
+    // Resume sessions that were mid-process when the server died. Awaited
+    // after reconcile so we read freshly-corrected (projectSlug, taskSlug,
+    // cwd) values — otherwise auto-resume could try to restore against a
+    // stale path and silently fail.
+    await autoResumeRunningSessions();
+  });
 }
 
 // Build the canUseTool callback the SDK invokes before each tool execution.
@@ -727,6 +734,91 @@ export async function restoreSession(
   return session;
 }
 
+// Boot-time pass: find sessions that were processing when the server died
+// (meta.finalState === "running" with an sdkSessionId on disk) and resume
+// each via the SDK so it picks up where it left off. Restores each into the
+// registry first, then pushes a synthetic continuation prompt so the SDK has
+// a new turn to act on — without one it won't emit any events. Sequential by
+// design: parallel resumes would burst API calls and racing pumpEvents loops
+// on shared cwd transcripts is asking for trouble.
+const RESUME_PROMPT = "[Server restarted — please continue where you left off.]";
+
+async function findRunningSessionsInDir(
+  sessDir: string,
+  projectSlug: string,
+  taskSlug: string,
+): Promise<Array<{ projectSlug: string; taskSlug: string; id: string }>> {
+  const out: Array<{ projectSlug: string; taskSlug: string; id: string }> = [];
+  let dirents: import("node:fs").Dirent[];
+  try {
+    dirents = await fs.readdir(sessDir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const d of dirents) {
+    if (!d.isDirectory()) continue;
+    const metaPath = path.join(sessDir, d.name, "meta.json");
+    try {
+      const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
+      // sdkSessionId is required: resume() needs it to find the SDK's
+      // transcript. A session that crashed before the first `init` event has
+      // no transcript to resume against — skip it.
+      if (meta.finalState === "running" && meta.sdkSessionId) {
+        out.push({ projectSlug, taskSlug, id: d.name });
+      }
+    } catch { /* skip unreadable meta */ }
+  }
+  return out;
+}
+
+export async function autoResumeRunningSessions(): Promise<{ resumed: number; failed: number }> {
+  let projects;
+  try {
+    projects = await listProjects();
+  } catch (err) {
+    console.warn(`[auto-resume] could not list projects:`, (err as Error).message);
+    return { resumed: 0, failed: 0 };
+  }
+
+  const candidates: Array<{ projectSlug: string; taskSlug: string; id: string }> = [];
+  for (const p of projects) {
+    candidates.push(...await findRunningSessionsInDir(
+      path.join(PROJECTS_DIR, p.folderName, "sessions"),
+      p.slug, "",
+    ));
+    for (const t of p.tasks) {
+      candidates.push(...await findRunningSessionsInDir(
+        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
+        p.slug, t.slug,
+      ));
+    }
+  }
+
+  if (candidates.length === 0) return { resumed: 0, failed: 0 };
+  console.log(`[auto-resume] Found ${candidates.length} session(s) to resume`);
+
+  let resumed = 0;
+  let failed = 0;
+  for (const c of candidates) {
+    try {
+      const s = await restoreSession(c.projectSlug, c.taskSlug, c.id);
+      if (!s) { failed++; continue; }
+      const ok = await resumeSession(s, RESUME_PROMPT);
+      if (ok) {
+        resumed++;
+        console.log(`[auto-resume] Resumed session ${c.id} (${c.projectSlug}/${c.taskSlug})`);
+      } else {
+        failed++;
+      }
+    } catch (err) {
+      failed++;
+      console.error(`[auto-resume] Failed to resume ${c.id}:`, (err as Error).message);
+    }
+  }
+  console.log(`[auto-resume] Done: ${resumed} resumed, ${failed} failed`);
+  return { resumed, failed };
+}
+
 export interface StartSessionParams {
   projectSlug: string;
   taskSlug: string;
@@ -761,6 +853,10 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         permissionMode: p.permissionMode ?? "bypassPermissions",
         model: p.model ?? null,
         runtime,
+        // Marks the session as in-flight so the boot-time auto-resume pass
+        // can detect a server crash mid-process. Overwritten by setState
+        // when the session reaches a terminal state.
+        finalState: "running",
       },
       null,
       2,
@@ -1192,6 +1288,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       permissionMode: p.permissionMode ?? "bypassPermissions",
       model: p.model ?? null,
       runtime,
+      finalState: "running",
     }, null, 2),
   );
 
