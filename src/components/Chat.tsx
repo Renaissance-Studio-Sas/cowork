@@ -1115,20 +1115,70 @@ function shortenToolName(name: string): string {
 
 function ToolChip({ p }: { p: Part }) {
   const name = shortenToolName(p.name as string);
+  // Surface a short label for the call when the tool provides one. Gemini's
+  // built-in tools (run_shell_command, edit, write_file, …) pass a
+  // `description` field; for shell calls without a description we fall
+  // back to the command itself; the Claude SDK's Bash tool likewise has a
+  // `description` field. Keeps the chip informative without forcing the
+  // user to expand for context.
+  const input = p.input as Record<string, unknown> | undefined;
+  const summary = chipSummary(p.name as string, input);
   return (
     <details className="group inline-block align-top max-w-full">
       <summary
-        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11.5px] text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[rgba(37,99,235,0.18)] rounded-md px-2 py-0.5 border border-[var(--border)]"
+        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11.5px] text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[rgba(37,99,235,0.18)] rounded-md px-2 py-0.5 border border-[var(--border)] max-w-full"
         title={p.name as string}
       >
         <span className="text-[9px] opacity-70">▸</span>
-        <span className="font-mono">{name}</span>
+        <span className="font-mono shrink-0">{name}</span>
+        {summary && (
+          <span className="text-[var(--text-soft)] truncate max-w-[480px]" title={summary}>
+            · {summary}
+          </span>
+        )}
       </summary>
       <pre className="mt-1 overflow-x-auto text-[11px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 max-w-full whitespace-pre-wrap break-words">
         {JSON.stringify(p.input, null, 2)}
       </pre>
     </details>
   );
+}
+
+// Pick the most informative short label for a tool-use chip. Looks for
+// well-known input fields in priority order. Truncates at 120 chars so
+// long shell commands or file paths don't overflow the chip; the full
+// content is still in the expanded view + the title tooltip.
+function chipSummary(toolName: string, input: Record<string, unknown> | undefined): string {
+  if (!input) return "";
+  const pick = (key: string): string => {
+    const v = input[key];
+    return typeof v === "string" ? v : "";
+  };
+  // Prefer an explicit description if present (Gemini's shell/edit tools,
+  // Claude's Bash tool).
+  const desc = pick("description");
+  if (desc) return shorten(desc);
+  // Shell — show the command verbatim.
+  if (toolName.endsWith("run_shell_command") || toolName === "Bash") {
+    const cmd = pick("command");
+    if (cmd) return shorten(cmd.replace(/\s+/g, " "));
+  }
+  // File ops — show the path.
+  for (const k of ["file_path", "filePath", "path", "dir_path"]) {
+    const v = pick(k);
+    if (v) return shorten(v);
+  }
+  // Globs / queries.
+  for (const k of ["pattern", "query"]) {
+    const v = pick(k);
+    if (v) return shorten(v);
+  }
+  return "";
+}
+
+function shorten(s: string): string {
+  const trimmed = s.trim();
+  return trimmed.length > 120 ? trimmed.slice(0, 117) + "…" : trimmed;
 }
 
 function extractText(content: unknown): string {

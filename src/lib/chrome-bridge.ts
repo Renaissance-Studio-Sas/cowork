@@ -110,15 +110,25 @@ export function findNativeHostPids(): number[] {
 // See docs/chrome-mcp-per-session.md for the broader limitation.
 export const expectedProfileBySession = new Map<string, { id: string; email: string }>();
 
+export interface BoundProfile {
+  id: string;
+  name: string;
+  email: string;
+  boundAt: Date;
+}
+
+// Maps sessionId -> BoundProfile
+export const boundProfileBySession = new Map<string, BoundProfile>();
+
 // The Chrome native-messaging socket is per-user (not per-profile) so only
 // ONE profile can own it at a time across all sessions. We can't read the
 // profile from the socket or native-host process itself, so we track the
 // last profile that launched a successful handshake via chrome_open_profile.
 // chrome_force_reset clears this. chrome_status surfaces it as
 // "Connected profile (last bound)".
-export let lastBoundProfile: { id: string; name: string; email: string; boundAt: Date } | null = null;
+export let lastBoundProfile: BoundProfile | null = null;
 
-export function setLastBoundProfile(p: typeof lastBoundProfile): void {
+export function setLastBoundProfile(p: BoundProfile | null): void {
   lastBoundProfile = p;
 }
 

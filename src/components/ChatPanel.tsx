@@ -1076,20 +1076,53 @@ function shortenToolName(name: string): string {
 
 function PanelToolChip({ p }: { p: PanelPart }) {
   const name = shortenToolName(p.name as string);
+  // See Chat.tsx ToolChip for the rationale. Truncates harder here since
+  // the side panel is narrower.
+  const input = p.input as Record<string, unknown> | undefined;
+  const summary = panelChipSummary(p.name as string, input);
   return (
     <details className="group inline-block align-top max-w-full">
       <summary
-        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[rgba(37,99,235,0.18)] rounded-md px-1.5 py-0.5 border border-[var(--border)]"
+        className="cursor-pointer select-none list-none inline-flex items-center gap-1 text-[11px] text-[var(--accent)] bg-[var(--accent-soft)] hover:bg-[rgba(37,99,235,0.18)] rounded-md px-1.5 py-0.5 border border-[var(--border)] max-w-full"
         title={p.name as string}
       >
         <span className="text-[9px] opacity-70">▸</span>
-        <span className="font-mono">{name}</span>
+        <span className="font-mono shrink-0">{name}</span>
+        {summary && (
+          <span className="text-[var(--text-soft)] truncate max-w-[220px]" title={summary}>
+            · {summary}
+          </span>
+        )}
       </summary>
       <pre className="mt-1 overflow-x-auto text-[10.5px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1 max-w-full whitespace-pre-wrap break-words">
         {JSON.stringify(p.input, null, 2)}
       </pre>
     </details>
   );
+}
+
+function panelChipSummary(toolName: string, input: Record<string, unknown> | undefined): string {
+  if (!input) return "";
+  const pick = (key: string): string => {
+    const v = input[key];
+    return typeof v === "string" ? v : "";
+  };
+  const desc = pick("description");
+  if (desc) return shortenPanel(desc);
+  if (toolName.endsWith("run_shell_command") || toolName === "Bash") {
+    const cmd = pick("command");
+    if (cmd) return shortenPanel(cmd.replace(/\s+/g, " "));
+  }
+  for (const k of ["file_path", "filePath", "path", "dir_path", "pattern", "query"]) {
+    const v = pick(k);
+    if (v) return shortenPanel(v);
+  }
+  return "";
+}
+
+function shortenPanel(s: string): string {
+  const trimmed = s.trim();
+  return trimmed.length > 80 ? trimmed.slice(0, 77) + "…" : trimmed;
 }
 
 function extractText(content: unknown): string {
