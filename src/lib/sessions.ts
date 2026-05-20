@@ -279,14 +279,6 @@ export function getSessionQuery(id: string): AgentQuery | null {
   return s.q;
 }
 
-// Get the session directory for a live session.
-// Returns null if the session is not found.
-export function getSessionDir(id: string): string | null {
-  const s = registry.get(id);
-  if (!s) return null;
-  return path.join(s.cwd, "sessions", s.id);
-}
-
 // Dispatch the query() call to whatever AgentRuntime the session uses. The
 // runtime registry lives in ./runtimes; every entry returns an AgentQuery,
 // which is structurally compatible with what the rest of sessions.ts
@@ -757,6 +749,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // into gemini-cli-core's ToolRegistry.
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
+      runtimeStateDir: sessionDir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1103,6 +1096,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
+      runtimeStateDir: sessionDir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1385,6 +1379,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
+        runtimeStateDir: sessionDir,
         systemPrompt,
         ...(s.model ? { model: s.model } : {}),
       },

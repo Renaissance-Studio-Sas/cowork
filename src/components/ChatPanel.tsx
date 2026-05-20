@@ -993,7 +993,11 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
     const mm = m as { type?: string; message?: { content?: unknown } };
     if (mm.type === "user") {
       const text = extractText(mm.message?.content).trim();
-      if (text) {
+      // Hide system-injected resume prompts (see Chat.tsx for context).
+      // In the side panel we just drop them silently — no room for a
+      // "session resumed" note.
+      const isResumePrompt = text === "[Server restarted — please continue where you left off.]";
+      if (text && !isResumePrompt) {
         flush();
         items.push({ kind: "user", key: `u-${i}`, text });
       }
@@ -1048,11 +1052,7 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
           );
         }
         if (it.kind === "result") {
-          return (
-            <div key={it.key} className="text-[10.5px] text-[var(--muted)] text-center pt-1">
-              — turn complete —
-            </div>
-          );
+          return null;
         }
         if (it.kind === "error") {
           return (

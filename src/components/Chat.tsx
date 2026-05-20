@@ -891,7 +891,15 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       // User messages can also be tool-result echoes (no visible text). Those
       // mustn't break the chip row — only flush when there's actual text.
       const text = extractText(mm.message?.content).trim();
-      if (text) {
+      // Hide system-injected resume prompts (sessions.ts pushes this as a
+      // user message so the model has something to continue from after a
+      // server restart — but it's not actually FROM the user). Surfaced as
+      // a small "session resumed" note via system-info instead.
+      const isResumePrompt = text === "[Server restarted — please continue where you left off.]";
+      if (isResumePrompt) {
+        flush();
+        items.push({ kind: "system-info", key: `sr-${i}`, text: "Session resumed after server restart." });
+      } else if (text) {
         flush();
         items.push({ kind: "user", key: `u-${i}`, text });
       }
@@ -947,11 +955,7 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
           );
         }
         if (it.kind === "result") {
-          return (
-            <div key={it.key} className="text-[11px] text-[var(--muted)] text-center py-1">
-              — turn complete —
-            </div>
-          );
+          return null;
         }
         if (it.kind === "system-info") {
           return (
@@ -1012,11 +1016,7 @@ function Bubble({ msg }: { msg: SDKMessageLite }) {
   }
 
   if (m.type === "result") {
-    return (
-      <div className="text-[11px] text-[var(--muted)] text-center py-1">
-        — turn complete —
-      </div>
-    );
+    return null;
   }
 
   return null;

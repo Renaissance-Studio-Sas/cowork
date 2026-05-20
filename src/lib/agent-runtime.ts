@@ -76,6 +76,12 @@ export interface AgentQueryOptions {
   // mcpServers; Gemini registers them as native Tools in gemini-cli-core's
   // ToolRegistry. See src/lib/workbench-tools/ for definitions.
   workbenchToolGroups?: Array<{ name: string; tools: import("./workbench-tools/types").WorkbenchTool[] }>;
+  // Optional per-session directory where the runtime can persist arbitrary
+  // state (history snapshots, etc.) it needs to survive server restarts.
+  // Claude doesn't need this — the SDK manages its own transcript files
+  // keyed by sdkSessionId. Gemini uses it for `gemini-history.json` so the
+  // conversation context comes back after restart.
+  runtimeStateDir?: string;
   // Runtime-specific knobs we don't want to enumerate here pass through
   // verbatim. The runtime implementation is responsible for what it accepts.
   [key: string]: unknown;

@@ -14,6 +14,8 @@
 // for the 3.x family.
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   Config,
   AuthType,
@@ -55,6 +57,9 @@ class GeminiAgentQuery implements AgentQuery {
   private readonly systemInstruction: string | undefined;
   private readonly abort = new AbortController();
   private readonly workbenchToolGroups: Array<{ name: string; tools: WorkbenchTool[] }>;
+  // Where to read/write `gemini-history.json` for restart-survival. Optional —
+  // when absent, the session is effectively single-process-lifetime.
+  private readonly runtimeStateDir: string | undefined;
 
   // Lazy: bootstrap is async (refreshAuth → initialize → startChat) so we
   // set up on first iteration rather than in the sync AgentRuntime
@@ -86,6 +91,7 @@ class GeminiAgentQuery implements AgentQuery {
     this.model = get<string>("model") || DEFAULT_MODEL;
     this.sessionId = `gemini-${randomUUID().slice(0, 8)}`;
     this.workbenchToolGroups = get<typeof this.workbenchToolGroups>("workbenchToolGroups") ?? [];
+    this.runtimeStateDir = get<string>("runtimeStateDir");
 
     const sysPrompt = get<AgentQueryOptions["systemPrompt"]>("systemPrompt");
     if (typeof sysPrompt === "object" && sysPrompt) {
@@ -127,14 +133,26 @@ class GeminiAgentQuery implements AgentQuery {
     }
 
     this.client = this.config.getGeminiClient();
+    // client.initialize() calls startChat() internally and stores the
+    // resulting GeminiChat on client.chat — that's the chat instance
+    // sendMessageStream will use. We must NOT call startChat() externally
+    // (it returns a fresh chat but doesn't replace client.chat, so we'd
+    // end up reading/writing history on a chat that the model never sees).
     await this.client.initialize();
-    // startChat builds the GeminiChat with tools pulled from the registry
-    // (in the Vertex-API wire shape, which we'd otherwise have to assemble
-    // ourselves). It also wires the onModelChanged callback for tool
-    // re-resolution if the model is swapped mid-session.
-    this.chat = await this.client.startChat();
+    this.chat = this.client.getChat();
     if (this.systemInstruction) {
       this.chat.setSystemInstruction(this.systemInstruction);
+    }
+
+    // Reload prior conversation history from disk if this session has
+    // run before (server restart, or user re-opened a stopped session).
+    // Without this, the model starts fresh each turn — we observed it
+    // returning empty responses to "hello?" because the implicit
+    // "[Server restarted — please continue]" prompt has no context.
+    const priorHistory = await this.loadHistory();
+    if (priorHistory && priorHistory.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.chat.setHistory(priorHistory as any, { silent: true });
     }
 
     // Scheduler executes pending tool calls between model turns. cowork
@@ -325,6 +343,12 @@ class GeminiAgentQuery implements AgentQuery {
           request = nextRequest;
         }
 
+        // Persist conversation history after the user's turn fully resolves
+        // (all model rounds + tool executions for THIS user message). Saving
+        // mid-loop would leave the file in an inconsistent state if the
+        // server died between a tool call and its response.
+        await this.saveHistory();
+
         yield resultSuccessEvent(this.sessionId, accumulated);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -336,6 +360,38 @@ class GeminiAgentQuery implements AgentQuery {
 
   async interrupt(): Promise<void> {
     this.abort.abort();
+  }
+
+  // Load Gemini chat history from disk. Returns undefined when there's no
+  // runtimeStateDir, no history file (fresh session), or the file is
+  // unparseable. Errors are intentionally swallowed: an unrecoverable
+  // history file shouldn't block the session from starting — the agent
+  // just begins fresh.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async loadHistory(): Promise<any[] | undefined> {
+    if (!this.runtimeStateDir) return undefined;
+    try {
+      const raw = await fs.readFile(path.join(this.runtimeStateDir, "gemini-history.json"), "utf8");
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Persist current Gemini chat history atomically (write to tmp + rename)
+  // so a crash mid-write never leaves a half-written JSON.
+  private async saveHistory(): Promise<void> {
+    if (!this.runtimeStateDir || !this.chat) return;
+    try {
+      const history = this.chat.getHistory();
+      const filePath = path.join(this.runtimeStateDir, "gemini-history.json");
+      const tmpPath = filePath + ".tmp";
+      await fs.writeFile(tmpPath, JSON.stringify(history, null, 2));
+      await fs.rename(tmpPath, filePath);
+    } catch (err) {
+      console.warn("[gemini-runtime] failed to persist history:", err);
+    }
   }
 
   // Step: gemini-cli MCP integration wiring is its own piece of work; today

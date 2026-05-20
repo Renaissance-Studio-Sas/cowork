@@ -218,7 +218,7 @@ function PanelMessageStream({ messages }: { messages: SDKMessageLite[] }) {
           );
         }
         if (it.kind === "result") {
-          return <div key={it.key} className="text-[10.5px] text-[var(--muted)] text-center pt-1">— turn complete —</div>;
+          return null;
         }
         if (it.kind === "error") {
           return (
