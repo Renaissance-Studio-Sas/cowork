@@ -506,16 +506,16 @@ export async function restoreSession(
   if (!project) return null;
 
   let sessionDir: string;
-  let cwd: string;
   if (!taskSlug) {
     sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-    cwd = path.join(PROJECTS_DIR, project.folderName);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return null;
     sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
-    cwd = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   }
+  // The agent's runtime cwd is always the workspace root (see startSession
+  // comment). Stored on the RuntimeSession so resume keeps it consistent.
+  const cwd = WORKSPACE_ROOT;
 
   // Read meta.json
   const metaPath = path.join(sessionDir, "meta.json");
@@ -695,8 +695,14 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
 
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}--${randomUUID().slice(0, 6)}`;
   const name = generateSessionLabel(p.firstMessage);
-  const cwd = taskDir(project, task);
-  const sessionDir = path.join(cwd, "sessions", id);
+  // The agent runs with cwd = workspace root so CLAUDE.md / GEMINI.md at
+  // the root are picked up by the runtime, and the agent has full access
+  // to the projects/ tree without needing additionalDirectories. The
+  // task identity + path is supplied via the system prompt (see
+  // sessions/prompts.ts). Session persistence (events.jsonl, meta.json)
+  // still lives under the task folder.
+  const cwd = WORKSPACE_ROOT;
+  const sessionDir = path.join(taskDir(project, task), "sessions", id);
   await fs.mkdir(sessionDir, { recursive: true });
 
   await fs.writeFile(
@@ -740,22 +746,18 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     prompt: input,
     options: {
       cwd,
-      // Grant access to the whole workspace root so agents can read shared
-      // resources (CLAUDE.md, skills/, scripts/, etc.) while keeping their
-      // cwd at the task folder where outputs naturally land.
-      additionalDirectories: [WORKSPACE_ROOT],
       // Localhost personal use — full trust by default. We still listen for
       // end_turn to flip awaiting_input.
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
-      // Static workbench MCPs (comments, session-management, email, chrome
-      // connect/disconnect) are wrapped for Claude here. Gemini's adapter
-      // ignores this field today and registers workbench tools through its
-      // own ToolRegistry path (TODO step 4 of gemini-runtime-parity).
+      // Static workbench MCPs (comments, session-management, chrome
+      // connect/disconnect) wrapped for Claude here. Gemini's runtime
+      // adapter consumes workbenchToolGroups instead, registering them
+      // into gemini-cli-core's ToolRegistry.
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
-      ...(systemPrompt ? { systemPrompt } : {}),
+      systemPrompt,
       ...(p.model ? { model: p.model } : {}),
     },
   });
@@ -1055,8 +1057,10 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
 
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}--${randomUUID().slice(0, 6)}`;
   const name = generateSessionLabel(p.firstMessage);
-  const cwd = path.join(PROJECTS_DIR, project.folderName);
-  const sessionDir = path.join(cwd, "sessions", id);
+  // Agent runs at workspace root; project identity + path comes via the
+  // system prompt. See startSession comment.
+  const cwd = WORKSPACE_ROOT;
+  const sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
   await fs.mkdir(sessionDir, { recursive: true });
 
   await fs.writeFile(
@@ -1094,13 +1098,12 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     prompt: input,
     options: {
       cwd,
-      additionalDirectories: [WORKSPACE_ROOT],
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
-      ...(systemPrompt ? { systemPrompt } : {}),
+      systemPrompt,
       ...(p.model ? { model: p.model } : {}),
     },
   });
@@ -1372,15 +1375,17 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     s.q = createAgentQuery(s.runtime, {
       prompt: s.input,
       options: {
-        cwd: s.cwd,
-        additionalDirectories: [WORKSPACE_ROOT],
+        // s.cwd is set to WORKSPACE_ROOT for new sessions; for old
+        // sessions resumed from disk, force-override since their stored
+        // cwd may be the task folder (pre-refactor).
+        cwd: WORKSPACE_ROOT,
         resume: s.sdkSessionId,
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
-        ...(systemPrompt ? { systemPrompt } : {}),
+        systemPrompt,
         ...(s.model ? { model: s.model } : {}),
       },
     });

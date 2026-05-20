@@ -4,61 +4,86 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, PROJECTS_DIR } from "../fs";
+import { getProject, PROJECTS_DIR, WORKSPACE_ROOT } from "../fs";
 
-// Build a system prompt that includes project.md and task.md context so the
-// agent knows what project/task it's working in. Returns undefined if no
-// context files exist (letting the SDK use its default preset).
+// Build the per-session system prompt. Always returns a prompt (never
+// undefined) so the agent always knows what project/task it's working on
+// and where files live. Includes project.md and task.md verbatim when
+// they exist; otherwise notes the file is empty and points the agent at
+// the location to write to.
+//
+// The agent's working directory is the cowork workspace root (set by the
+// caller — see sessions.ts). That's where CLAUDE.md / GEMINI.md live, and
+// where `projects/<wip-project>/<wip-task>/` is reachable. We tell the
+// agent the EXPLICIT relative path to the task folder so file operations
+// go to the right place.
 export async function buildContextSystemPrompt(
   projectSlug: string,
   taskSlug: string,
-): Promise<{ type: "preset"; preset: "claude_code"; append: string } | undefined> {
-  const parts: string[] = [];
-
-  // Read project.md
-  try {
-    const projectMdPath = path.join(PROJECTS_DIR, `wip-${projectSlug}`, "files", "project.md");
-    const projectContent = await fs.readFile(projectMdPath, "utf8");
-    if (projectContent.trim()) {
-      parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
+): Promise<{ type: "preset"; preset: "claude_code"; append: string }> {
+  // Resolve the task folder relative to the workspace root. We need the
+  // actual folder name (`wip-…` or `done-…`), not just the slug, because
+  // the agent will reference it in file ops.
+  const project = await getProject(projectSlug).catch(() => null);
+  let taskFolderRel: string | null = null;
+  let projectFolderRel: string | null = null;
+  if (project) {
+    projectFolderRel = path.join("projects", project.folderName);
+    if (taskSlug) {
+      const task = project.tasks.find((t) => t.slug === taskSlug);
+      if (task) taskFolderRel = path.join(projectFolderRel, task.folderName);
     }
-  } catch {
-    // Try done- prefix
-    try {
-      const projectMdPath = path.join(PROJECTS_DIR, `done-${projectSlug}`, "files", "project.md");
-      const projectContent = await fs.readFile(projectMdPath, "utf8");
-      if (projectContent.trim()) {
-        parts.push(`<project-context>\n# Project: ${projectSlug}\n\n${projectContent.trim()}\n</project-context>`);
-      }
-    } catch { /* no project.md */ }
   }
 
-  // Read task.md
-  if (taskSlug) {
-    try {
-      const project = await getProject(projectSlug);
-      if (project) {
-        const task = project.tasks.find((t) => t.slug === taskSlug);
-        if (task) {
-          const taskMdPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "files", "task.md");
-          const taskContent = await fs.readFile(taskMdPath, "utf8");
-          if (taskContent.trim()) {
-            parts.push(`<task-context>\n# Task: ${taskSlug}\n\n${taskContent.trim()}\n</task-context>`);
-          }
-        }
-      }
-    } catch { /* no task.md */ }
-  }
+  // Read project.md and task.md if they exist. Missing files are not an
+  // error — the agent gets a "not yet written" placeholder so it knows
+  // the file is supposed to be there and that writing to it is a normal
+  // first step on a new project/task.
+  const projectMd = projectFolderRel
+    ? await readIfExists(path.join(WORKSPACE_ROOT, projectFolderRel, "files", "project.md"))
+    : null;
+  const taskMd = taskFolderRel
+    ? await readIfExists(path.join(WORKSPACE_ROOT, taskFolderRel, "files", "task.md"))
+    : null;
 
-  if (parts.length === 0) return undefined;
+  const where = taskFolderRel
+    ? `task **${taskSlug}** in project **${projectSlug}**`
+    : `project **${projectSlug}** (project-level — no specific task)`;
 
-  const contextPrompt = `
-You are working within the Agent Workbench on a specific project and task. Here is the context:
+  const pathLine = taskFolderRel
+    ? `Task folder (relative to workspace root): \`${taskFolderRel}/\`\nProject folder: \`${projectFolderRel}/\``
+    : `Project folder: \`${projectFolderRel ?? "(unknown)"}/\``;
 
-${parts.join("\n\n")}
+  const projectMdBlock = projectFolderRel
+    ? formatMdSection(
+        "Project context",
+        path.join(projectFolderRel, "files", "project.md"),
+        projectMd,
+      )
+    : "";
 
-Use this context to understand the goals, requirements, and current state of work. When relevant, refer back to these documents for guidance.
+  const taskMdBlock = taskFolderRel
+    ? formatMdSection(
+        "Task context",
+        path.join(taskFolderRel, "files", "task.md"),
+        taskMd,
+      )
+    : "";
 
+  const append = `
+You are working in the **cowork agent workbench** on ${where}.
+
+Your working directory is the workspace root. Repo-level conventions are
+in **CLAUDE.md** / **GEMINI.md** at the workspace root — read those if you
+haven't already.
+
+${pathLine}
+
+When you write output files for this task, put them under the task's
+\`files/\` directory using the path above. When you read or modify
+project.md / task.md, use the paths shown in the sections below.
+
+${projectMdBlock}${taskMdBlock}
 ## Inline Media in Chat
 
 You can display images and videos inline in your chat responses using markdown syntax:
@@ -80,7 +105,26 @@ You can display images and videos inline in your chat responses using markdown s
 Replace PROJECT and TASK with the current project/task slugs (URL-encoded). Files in the task's \`files/\` directory are served via this API.
 `.trim();
 
-  return { type: "preset", preset: "claude_code", append: contextPrompt };
+  return { type: "preset", preset: "claude_code", append };
+}
+
+async function readIfExists(p: string): Promise<string | null> {
+  try {
+    const content = await fs.readFile(p, "utf8");
+    return content.trim() ? content.trim() : "";
+  } catch {
+    return null;
+  }
+}
+
+function formatMdSection(label: string, relPath: string, content: string | null): string {
+  if (content === null) {
+    return `## ${label} (\`${relPath}\`)\n\n_File not yet written. Create it if you have something to record there._\n\n`;
+  }
+  if (content === "") {
+    return `## ${label} (\`${relPath}\`)\n\n_File exists but is empty._\n\n`;
+  }
+  return `## ${label} (\`${relPath}\`)\n\n${content}\n\n`;
 }
 
 // Generate a short label from the first message by extracting key words.
