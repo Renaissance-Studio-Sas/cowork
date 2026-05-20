@@ -22,9 +22,9 @@ import { getRuntime } from "./runtimes";
 
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
-import { buildCommentsMcp } from "./comments-mcp";
-import { buildSessionMcp } from "./session-mcp";
-import { buildPlanningMcp, PLANNING_SYSTEM_PROMPT } from "./planning-mcp";
+import { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./workbench-tools/planning";
+import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
+import { buildStaticWorkbenchMcps } from "./claude-chrome-tools";
 import {
   type SessionState,
   isValidTransition,
@@ -759,7 +759,6 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(firstMsg);
 
-  const commentsMcp = buildCommentsMcp(p.projectSlug, p.taskSlug);
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug);
   const q = createAgentQuery(runtime, {
     prompt: input,
@@ -774,10 +773,11 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
-      mcpServers: {
-        "workbench-comments": commentsMcp,
-        "workbench-session": buildSessionMcp(id, p.projectSlug, p.taskSlug),
-      },
+      // Static workbench MCPs (comments, session-management, email, chrome
+      // connect/disconnect) are wrapped for Claude here. Gemini's adapter
+      // ignores this field today and registers workbench tools through its
+      // own ToolRegistry path (TODO step 4 of gemini-runtime-parity).
+      mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1184,10 +1184,9 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(makeUserMessage(p.firstMessage, id));
 
-  // Comments MCP scoped to the project — tools operate on project-level
-  // .comments.json (taskSlug is empty).
-  const commentsMcp = buildCommentsMcp(p.projectSlug, "");
-  // Project-level sessions only get project.md context (no task)
+  // Project-level sessions only get project.md context (no task). Comments
+  // and other workbench tools scope to project-level (empty taskSlug); the
+  // comments tool operates on project-level .comments.json in that case.
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, "");
   const q = createAgentQuery(runtime, {
     prompt: input,
@@ -1197,10 +1196,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
-      mcpServers: {
-        "workbench-comments": commentsMcp,
-        "workbench-session": buildSessionMcp(id, p.projectSlug, ""),
-      },
+      mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1254,7 +1250,6 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
 
   input.push(makeUserMessage(firstMessage, id));
 
-  const planningMcp = buildPlanningMcp();
   // Planning sessions are always Claude — see RuntimeSession construction below.
   const q = createAgentQuery("claude", {
     prompt: input,
@@ -1266,7 +1261,9 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       systemPrompt: { type: "preset", preset: "claude_code", append: PLANNING_SYSTEM_PROMPT },
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
-      mcpServers: { "workbench-planning": planningMcp },
+      mcpServers: {
+        "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildPlanningTools()),
+      },
       // Don't specify model — use SDK default (latest Claude)
     },
   });
@@ -1464,8 +1461,6 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     // Create a new input channel
     s.input = new InputChannel();
 
-    // Build MCP servers for the resumed session
-    const commentsMcp = buildCommentsMcp(s.projectSlug, s.taskSlug);
     const systemPrompt = await buildContextSystemPrompt(s.projectSlug, s.taskSlug);
 
     // Create new query with resume option. Re-use the session's existing
@@ -1480,10 +1475,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
-        mcpServers: {
-          "workbench-comments": commentsMcp,
-          "workbench-session": buildSessionMcp(s.id, s.projectSlug, s.taskSlug),
-        },
+        mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },

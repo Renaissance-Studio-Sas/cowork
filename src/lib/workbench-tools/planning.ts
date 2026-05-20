@@ -1,38 +1,34 @@
-// MCP tool the planning agent calls when it's ready to propose a project plan.
-// The tool itself just acknowledges the call back to the agent — the
-// browser-side UI watches the SDK stream for a tool_use with this name and
-// renders the input as an editable "Plan" card.
+// Workbench tool the planning agent calls when it's ready to propose a
+// project plan. The tool itself just acknowledges the call back to the
+// agent — the browser-side UI watches the SDK stream for a tool_use with
+// this name and renders the input as an editable "Plan" card.
 
-import { tool, createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { defineTool, type WorkbenchTool } from "./types";
 
-export function buildPlanningMcp(): McpSdkServerConfigWithInstance {
-  return createSdkMcpServer({
-    name: "workbench-planning",
-    version: "0.1.0",
-    tools: [
-      tool(
-        "propose_plan",
-        "Propose a project plan to the user. Call this once you have enough information about the project. The user will see your proposal as an editable card and can accept or revise it.",
-        {
-          project_slug: z.string().describe("Human-readable project name with proper case and spaces, e.g. 'House Sale', 'Buy in Paris', 'Tax 2025'. NOT kebab-case. The folder name is the display name."),
-          project_description: z.string().describe("1-2 sentences describing the project"),
-          tasks: z.array(z.object({
-            slug: z.string().describe("Human-readable task name with proper case and spaces, e.g. 'Collect Receipts', 'Draft Email to School'. NOT kebab-case."),
-            description: z.string().describe("one-line description of what this task is about"),
-          })).min(1).max(8).describe("2-5 initial tasks to populate the project"),
-        },
-        async ({ project_slug, project_description, tasks }) => {
-          return {
-            content: [{
-              type: "text",
-              text: `Proposed plan: project "${project_slug}" with ${tasks.length} task(s). Waiting for the user to accept or revise.`,
-            }],
-          };
-        },
-      ),
-    ],
-  });
+export function buildPlanningTools(): WorkbenchTool[] {
+  return [
+    defineTool(
+      "propose_plan",
+      "Propose a project plan to the user. Call this once you have enough information about the project. The user will see your proposal as an editable card and can accept or revise it.",
+      {
+        project_slug: z.string().describe("Human-readable project name with proper case and spaces, e.g. 'House Sale', 'Buy in Paris', 'Tax 2025'. NOT kebab-case. The folder name is the display name."),
+        project_description: z.string().describe("1-2 sentences describing the project"),
+        tasks: z.array(z.object({
+          slug: z.string().describe("Human-readable task name with proper case and spaces, e.g. 'Collect Receipts', 'Draft Email to School'. NOT kebab-case."),
+          description: z.string().describe("one-line description of what this task is about"),
+        })).min(1).max(8).describe("2-5 initial tasks to populate the project"),
+      },
+      async ({ project_slug, tasks }) => {
+        return {
+          content: [{
+            type: "text",
+            text: `Proposed plan: project "${project_slug}" with ${tasks.length} task(s). Waiting for the user to accept or revise.`,
+          }],
+        };
+      },
+    ),
+  ];
 }
 
 export const PLANNING_SYSTEM_PROMPT = `You are helping the user set up a new project in their personal task management system called "Coworking Space".
