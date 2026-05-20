@@ -202,6 +202,17 @@ class GeminiAgentQuery implements AgentQuery {
           // value (the Turn instance). `for await … of stream` discards it.
           const iter = stream[Symbol.asyncIterator]();
           let turn: Turn | undefined;
+          // Buffer per-round text + tool_uses so the final assistant
+          // message for the round is ONE Claude-shaped message with all
+          // content parts. Emitting tool_use as its own assistant message
+          // would clear the UI's streaming text bubble (which has been
+          // showing the model's text via stream_event deltas) with no
+          // replacement text content — the user sees the agent's text
+          // appear briefly then vanish.
+          let turnText = "";
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const turnToolUses: Array<{ type: "tool_use"; id: string; name: string; input: any }> = [];
+
           // eslint-disable-next-line no-constant-condition
           while (true) {
             const r = await iter.next();
@@ -209,17 +220,71 @@ class GeminiAgentQuery implements AgentQuery {
               turn = r.value;
               break;
             }
-            for (const out of translateEvent(r.value, this.sessionId, this.model, turnUuid, callIdToToolUseId)) {
-              if (out.type === "assistant") {
-                const content = (out as { message?: { content?: Array<{ type?: string; text?: string }> } }).message?.content;
-                for (const part of content ?? []) {
-                  if (part.type === "text" && typeof part.text === "string") {
-                    accumulated += part.text;
-                  }
-                }
+            const ev = r.value;
+            // Content events: stream the delta to the UI for live-rendering,
+            // and accumulate into the round's text buffer.
+            if (ev.type === GeminiEventType.Content) {
+              const text = (ev as { value?: string }).value;
+              if (text) {
+                turnText += text;
+                accumulated += text;
+                yield {
+                  type: "stream_event",
+                  uuid: turnUuid,
+                  session_id: this.sessionId,
+                  parent_tool_use_id: null,
+                  event: {
+                    type: "content_block_delta",
+                    index: 0,
+                    delta: { type: "text_delta", text },
+                  },
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                } as any;
               }
+              continue;
+            }
+            // Tool-call requests: buffer; we'll emit one consolidated
+            // assistant message with [text, tool_uses...] when the stream
+            // ends.
+            if (ev.type === GeminiEventType.ToolCallRequest) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const req = (ev as any).value as { callId: string; name: string; args: Record<string, unknown> };
+              const toolUseId = `toolu_${randomUUID().slice(0, 12)}`;
+              callIdToToolUseId.set(req.callId, toolUseId);
+              turnToolUses.push({ type: "tool_use", id: toolUseId, name: req.name, input: req.args });
+              continue;
+            }
+            // Other event types (Error, etc.) → translate normally.
+            for (const out of translateEvent(ev, this.sessionId, this.model, turnUuid, callIdToToolUseId)) {
               yield out;
             }
+          }
+
+          // End-of-round consolidation: emit ONE assistant message with the
+          // text + tool_use content parts. The persisted text replaces the
+          // UI's streaming bubble cleanly. Skip if no text and no tools
+          // (rare — the model emitted nothing this round).
+          if (turnText || turnToolUses.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const content: any[] = [];
+            if (turnText) content.push({ type: "text", text: turnText });
+            for (const tu of turnToolUses) content.push(tu);
+            yield {
+              type: "assistant",
+              session_id: this.sessionId,
+              parent_tool_use_id: null,
+              message: {
+                id: `msg_${Date.now()}`,
+                role: "assistant",
+                type: "message",
+                model: this.model,
+                content,
+                stop_reason: turnToolUses.length > 0 ? "tool_use" : "end_turn",
+                stop_sequence: null,
+                usage: {},
+              },
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            } as any;
           }
 
           // No pending tool calls → the agent finished this turn.
@@ -237,7 +302,7 @@ class GeminiAgentQuery implements AgentQuery {
 
           // Surface tool_result events to the UI as Claude-shaped user
           // messages, mirroring what the Claude SDK does. Each call's
-          // toolUseId was registered when we translated the ToolCallRequest.
+          // toolUseId was registered when we buffered the ToolCallRequest.
           for (const c of completed) {
             yield toolResultEventFromCompleted(c, callIdToToolUseId, this.sessionId);
           }
