@@ -103,6 +103,7 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
   // For creating new sessions
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
+  const [runtime, setRuntime] = useState<"claude" | "gemini">("claude");
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const startNewSession = async () => {
@@ -113,7 +114,7 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
       const r = await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: contextPrefix + draft.trim() }),
+        body: JSON.stringify({ message: contextPrefix + draft.trim(), runtime }),
       });
       const j = await r.json();
       if (j.id) {
@@ -156,6 +157,8 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
           starting={starting}
           composerRef={composerRef}
           placeholder={filePath ? `Ask about ${filePath}…` : "Start a conversation…"}
+          runtime={runtime}
+          onRuntime={setRuntime}
         />
       </aside>
     );
@@ -212,6 +215,8 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
           starting={starting}
           composerRef={composerRef}
           placeholder={filePath ? `Ask about ${filePath}…` : "Start a new conversation…"}
+          runtime={runtime}
+          onRuntime={setRuntime}
         />
       )}
     </aside>
@@ -872,6 +877,8 @@ function NewSessionComposer({
   starting,
   composerRef,
   placeholder,
+  runtime,
+  onRuntime,
 }: {
   draft: string;
   onDraft: (v: string) => void;
@@ -879,6 +886,8 @@ function NewSessionComposer({
   starting: boolean;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   placeholder: string;
+  runtime: "claude" | "gemini";
+  onRuntime: (r: "claude" | "gemini") => void;
 }) {
   return (
     <div className="border-t border-[var(--border)] p-2.5 bg-[var(--bg-2)]">
@@ -907,8 +916,17 @@ function NewSessionComposer({
           ↑
         </button>
       </div>
-      <div className="text-[10.5px] text-[var(--muted)] px-1 pt-1">
-        New session
+      <div className="flex items-center justify-between px-1 pt-1">
+        <div className="text-[10.5px] text-[var(--muted)]">New session</div>
+        <select
+          value={runtime}
+          onChange={(e) => onRuntime(e.target.value as "claude" | "gemini")}
+          className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
+          title="Agent runtime"
+        >
+          <option value="claude">Claude</option>
+          <option value="gemini">Gemini</option>
+        </select>
       </div>
     </div>
   );

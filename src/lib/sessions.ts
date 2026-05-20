@@ -126,6 +126,11 @@ function generateSessionLabel(firstMessage: string): string {
 // Re-export SessionState for consumers who import from sessions.ts
 export type { SessionState } from "./session-state-machine";
 
+// Which agent runtime drives this session. Claude is the default and is
+// what every session today uses; Gemini is a phase-3 follow-up. Stored in
+// meta.json so resume after a server restart picks the same runtime.
+export type SessionRuntime = "claude" | "gemini";
+
 interface RuntimeSession {
   id: string;
   projectSlug: string;
@@ -151,6 +156,7 @@ interface RuntimeSession {
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
+  runtime: SessionRuntime;       // claude (default) | gemini
 }
 
 export interface PendingPermission {
@@ -170,6 +176,7 @@ export interface SessionSummary {
   lastActivity: string;          // ISO
   isLive: boolean;
   unread: boolean;               // completed session not yet viewed
+  runtime: SessionRuntime;
 }
 
 const REGISTRY = new Map<string, RuntimeSession>();
@@ -377,6 +384,27 @@ export function getSessionDir(id: string): string | null {
   return path.join(s.cwd, "sessions", s.id);
 }
 
+// Dispatch the query() call by runtime. Today every runtime returns a
+// SDK-shaped Query (AsyncIterable<SDKMessage> + setMcpServers / interrupt /
+// mcpServerStatus). For Claude it's the SDK's own Query verbatim. For
+// Gemini (phase 3) it will be a wrapper around @google/gemini-cli-core's
+// GeminiClient that masquerades as a Query so the rest of sessions.ts
+// (pumpEvents, setMcpServers callers, interrupt, etc.) doesn't have to
+// know which runtime it's talking to.
+//
+// Centralising the dispatch here means the 4 query() call sites
+// (startSession, startProjectSession, startPlanningSession, resumeSession)
+// only need to add `runtime` to their options blob.
+type QueryOptions = Parameters<typeof query>[0];
+function createAgentQuery(runtime: SessionRuntime, opts: QueryOptions): Query {
+  if (runtime === "claude") return query(opts);
+  // Gemini runtime: phase 3 will implement this against
+  // @google/gemini-cli-core. For phase 1/2 we fail loudly — every public
+  // entry point that could reach here (startSession, startProjectSession)
+  // already gates on runtime and throws a clearer error earlier.
+  throw new Error(`Runtime "${runtime}" not implemented`);
+}
+
 // Debug helper to inspect the session registry
 export function debugSessionRegistry(targetId: string): { found: boolean; hasQuery: boolean; allIds: string[] } {
   const s = registry.get(targetId);
@@ -419,6 +447,7 @@ export function listLiveSessions(): SessionSummary[] {
       lastActivity: s.lastActivity.toISOString(),
       isLive: true,
       unread,
+      runtime: s.runtime,
     };
   });
 }
@@ -433,7 +462,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; runtime?: SessionRuntime } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -468,6 +497,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       lastActivity,
       isLive: false,
       unread,
+      runtime: meta.runtime ?? "claude",
     });
   }
   return out;
@@ -597,6 +627,7 @@ export async function restoreSession(
     seenAt?: string;
     lastActivity?: string;
     completedAt?: string;
+    runtime?: SessionRuntime;
   } = {};
   try {
     const raw = await fs.readFile(metaPath, "utf8");
@@ -651,6 +682,9 @@ export async function restoreSession(
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
+    // Older meta.json files predate the runtime field — default to "claude"
+    // so they keep working unchanged.
+    runtime: (meta.runtime as SessionRuntime) ?? "claude",
   };
 
   registerSession(session);
@@ -663,9 +697,19 @@ export interface StartSessionParams {
   firstMessage: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model?: string;
+  runtime?: SessionRuntime;       // defaults to "claude"
 }
 
 export async function startSession(p: StartSessionParams): Promise<RuntimeSession> {
+  const runtime: SessionRuntime = p.runtime ?? "claude";
+  if (runtime === "gemini") {
+    // Phase 3 wires this up. For now, fail clearly so the user sees what's
+    // missing instead of a silent default-back to Claude.
+    throw new Error(
+      "Gemini runtime not yet implemented. Use runtime=\"claude\" (the default) for now — the selector is wired through but the GeminiAdapter is the next phase.",
+    );
+  }
+
   const project = await getProject(p.projectSlug);
   const task = await getTask(p.projectSlug, p.taskSlug);
   if (!project || !task) throw new Error("unknown project/task");
@@ -688,6 +732,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         startedAt: new Date().toISOString(),
         permissionMode: p.permissionMode ?? "bypassPermissions",
         model: p.model ?? null,
+        runtime,
       },
       null,
       2,
@@ -709,7 +754,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
 
   const commentsMcp = buildCommentsMcp(p.projectSlug, p.taskSlug);
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug);
-  const q = query({
+  const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
       cwd,
@@ -754,6 +799,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
+    runtime,
   };
   registerSession(session);
 
@@ -1029,6 +1075,7 @@ export async function adoptSessionToProject(id: string, projectSlug: string): Pr
     cwd: newCwd,
     startedAt: s.startedAt.toISOString(),
     originatedFrom: "planning",
+    runtime: s.runtime,
   }, null, 2));
 
   // events.jsonl — dump whatever's already streamed
@@ -1080,7 +1127,13 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
 // Project-level session — cwd is the project folder, sessions persist to
 // `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
 // sessions but at one level up.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string }): Promise<RuntimeSession> {
+export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; runtime?: SessionRuntime }): Promise<RuntimeSession> {
+  const runtime: SessionRuntime = p.runtime ?? "claude";
+  if (runtime === "gemini") {
+    throw new Error(
+      "Gemini runtime not yet implemented. Use runtime=\"claude\" (the default) for now — the selector is wired through but the GeminiAdapter is the next phase.",
+    );
+  }
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
 
@@ -1101,6 +1154,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       startedAt: new Date().toISOString(),
       permissionMode: p.permissionMode ?? "bypassPermissions",
       model: p.model ?? null,
+      runtime,
     }, null, 2),
   );
 
@@ -1120,7 +1174,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   const commentsMcp = buildCommentsMcp(p.projectSlug, "");
   // Project-level sessions only get project.md context (no task)
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, "");
-  const q = query({
+  const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
       cwd,
@@ -1161,6 +1215,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
+    runtime,
   };
   registerSession(session);
   session.log.write(JSON.stringify(firstUserEcho) + "\n");
@@ -1186,7 +1241,8 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
   input.push(makeUserMessage(firstMessage, id));
 
   const planningMcp = buildPlanningMcp();
-  const q = query({
+  // Planning sessions are always Claude — see RuntimeSession construction below.
+  const q = createAgentQuery("claude", {
     prompt: input,
     options: {
       cwd,
@@ -1227,6 +1283,9 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
+    // Planning sessions are always Claude — they predate the runtime selector
+    // and run before any project has a configured runtime preference.
+    runtime: "claude",
   };
   registerSession(session);
   session.events.emit("event", firstUserEcho);
@@ -1399,7 +1458,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     // Create new query with resume option. Re-use the session's existing
     // pendingPermissions map + events emitter so a permission request emitted
     // mid-resume reaches the same SSE subscribers.
-    s.q = query({
+    s.q = createAgentQuery(s.runtime, {
       prompt: s.input,
       options: {
         cwd: s.cwd,

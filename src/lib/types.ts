@@ -18,6 +18,8 @@ export interface TaskDTO {
   labels: string[];
 }
 
+export type SessionRuntime = "claude" | "gemini";
+
 export interface SessionSummaryDTO {
   id: string;
   projectSlug: string;
@@ -28,4 +30,5 @@ export interface SessionSummaryDTO {
   lastActivity: string;
   isLive: boolean;
   unread: boolean; // true if session completed but hasn't been viewed by user
+  runtime: SessionRuntime;
 }
