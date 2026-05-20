@@ -38,6 +38,8 @@ import type {
   AgentMcpServer,
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
+  AgentCanUseTool,
+  AgentPermissionResult,
 } from "../agent-runtime";
 import type { WorkbenchTool } from "../workbench-tools/types";
 import { registerWorkbenchToolsInGemini } from "./gemini-tool-adapter";
@@ -60,6 +62,13 @@ class GeminiAgentQuery implements AgentQuery {
   // Where to read/write `gemini-history.json` for restart-survival. Optional —
   // when absent, the session is effectively single-process-lifetime.
   private readonly runtimeStateDir: string | undefined;
+  // Optional pre-tool-execution hook. cowork passes its `canUseTool`
+  // callback here. It's called BEFORE each pending tool call is handed
+  // to the Scheduler. Allows cowork to deny tools (synthesizes a
+  // "denied" tool_result) or async-park a call awaiting user approval
+  // (e.g. plan-mode flows). When unset, every call auto-allows — same
+  // shape as the Claude runtime's default.
+  private readonly canUseTool: AgentCanUseTool | undefined;
 
   // Lazy: bootstrap is async (refreshAuth → initialize → startChat) so we
   // set up on first iteration rather than in the sync AgentRuntime
@@ -92,6 +101,7 @@ class GeminiAgentQuery implements AgentQuery {
     this.sessionId = `gemini-${randomUUID().slice(0, 8)}`;
     this.workbenchToolGroups = get<typeof this.workbenchToolGroups>("workbenchToolGroups") ?? [];
     this.runtimeStateDir = get<string>("runtimeStateDir");
+    this.canUseTool = get<AgentCanUseTool>("canUseTool");
 
     const sysPrompt = get<AgentQueryOptions["systemPrompt"]>("systemPrompt");
     if (typeof sysPrompt === "object" && sysPrompt) {
@@ -113,13 +123,13 @@ class GeminiAgentQuery implements AgentQuery {
       // Disable telemetry — gemini-cli-core has clearcut/usage hooks
       // intended for the CLI; cowork isn't the CLI.
       usageStatisticsEnabled: false,
-      // YOLO mode = auto-approve every tool call. cowork's permission
-      // model is "bypassPermissions" by default (matches the Claude
-      // runtime), and we don't have an interactive confirm UI to call
-      // back into. Without this, the scheduler refuses tool execution
-      // with "requires user confirmation, which is not supported in
-      // non-interactive mode." Plan-mode-style approvals can be plumbed
-      // later via canUseTool when we add that wiring.
+      // YOLO mode at the scheduler level (cli-core auto-approves every
+      // tool call rather than refusing with "requires user confirmation").
+      // The actual cowork-side approval gate is our checkPermission() above
+      // the scheduler — it runs BEFORE we hand tools to the scheduler,
+      // calls into AgentQueryOptions.canUseTool, and either allows,
+      // denies, or async-parks (plan-mode-style approvals). YOLO here
+      // means "if it reached the scheduler, cowork already approved."
       approvalMode: ApprovalMode.YOLO,
     });
     await this.config.refreshAuth(AuthType.USE_VERTEX_AI);
@@ -314,14 +324,56 @@ class GeminiAgentQuery implements AgentQuery {
           const pending = turn?.pendingToolCalls ?? [];
           if (pending.length === 0) break;
 
-          // Execute the pending tool calls via the scheduler. It walks
-          // through validation → confirmation → execution → result. For
-          // cowork's permission model (bypassPermissions), the
-          // confirmation step auto-allows.
-          const completed = await this.scheduler!.schedule(
-            pending as ToolCallRequestInfo[],
-            this.abort.signal,
-          );
+          // Pre-execution canUseTool gate: ask cowork (deny/allow/park).
+          // Calls that get denied are synthesized into denial tool_results
+          // and never reach the scheduler. Calls that get allowed (with
+          // possibly updated input) get passed through.
+          const toSchedule: ToolCallRequestInfo[] = [];
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const synthesizedResults: any[] = [];
+          for (const call of pending) {
+            const c = call as ToolCallRequestInfo;
+            const toolUseId = callIdToToolUseId.get(c.callId) ?? c.callId;
+            const decision = await this.checkPermission(c.name, c.args, toolUseId);
+            if (decision.behavior === "deny") {
+              // The scheduler will never run this — synthesize a
+              // tool_result for the model + the UI so the conversation
+              // can continue. Keep the conversation valid: feed a
+              // functionResponse back to the model on the next round so
+              // its function_call has a matching response.
+              const denyMsg = decision.message ?? "Tool call denied by user";
+              synthesizedResults.push({
+                callId: c.callId,
+                responseText: denyMsg,
+                isError: true,
+              });
+              yield {
+                type: "user",
+                session_id: this.sessionId,
+                parent_tool_use_id: null,
+                message: {
+                  role: "user",
+                  content: [{
+                    type: "tool_result",
+                    tool_use_id: toolUseId,
+                    content: denyMsg,
+                    is_error: true,
+                  }],
+                },
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              } as any;
+              continue;
+            }
+            // allow — possibly with modified input
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const args = (decision as any).updatedInput ?? c.args;
+            toSchedule.push({ ...c, args });
+          }
+
+          // Execute the (possibly filtered) tool calls via the scheduler.
+          const completed = toSchedule.length > 0
+            ? await this.scheduler!.schedule(toSchedule, this.abort.signal)
+            : [];
 
           // Surface tool_result events to the UI as Claude-shaped user
           // messages, mirroring what the Claude SDK does. Each call's
@@ -338,6 +390,24 @@ class GeminiAgentQuery implements AgentQuery {
           for (const c of completed) {
             const parts = (c as { response?: { responseParts?: unknown[] } }).response?.responseParts ?? [];
             for (const p of parts) nextRequest.push(p);
+          }
+          // Append synthesized functionResponse Parts for denied calls so
+          // the model's functionCall → functionResponse pairing stays valid.
+          // Without these, Vertex rejects the next request with a
+          // "function_call without matching function_response" error.
+          for (const denied of synthesizedResults) {
+            // Look up the original call's name from pending — we need it
+            // for the functionResponse part. (Vertex's schema requires
+            // name to match the originating functionCall.)
+            const orig = pending.find(
+              (p) => (p as ToolCallRequestInfo).callId === denied.callId,
+            ) as ToolCallRequestInfo | undefined;
+            nextRequest.push({
+              functionResponse: {
+                name: orig?.name ?? "unknown",
+                response: { error: denied.responseText },
+              },
+            });
           }
           if (nextRequest.length === 0) break;
           request = nextRequest;
@@ -360,6 +430,31 @@ class GeminiAgentQuery implements AgentQuery {
 
   async interrupt(): Promise<void> {
     this.abort.abort();
+  }
+
+  // Run the optional canUseTool hook with a synthesized options object
+  // shaped like what the Claude SDK passes. Returns the cowork-supplied
+  // PermissionResult, or auto-allow when no hook is set. The promise
+  // returned by canUseTool may resolve synchronously (auto-allow/deny)
+  // or asynchronously (parked awaiting user UI approval, e.g. plan-mode);
+  // either way we just await it.
+  private async checkPermission(
+    toolName: string,
+    args: Record<string, unknown>,
+    toolUseId: string,
+  ): Promise<AgentPermissionResult> {
+    if (!this.canUseTool) {
+      return { behavior: "allow", updatedInput: args };
+    }
+    try {
+      // Claude SDK's options has more fields (sessionId, etc.); cowork's
+      // buildCanUseTool only reads toolUseID, so a minimal object suffices.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return await this.canUseTool(toolName, args, { toolUseID: toolUseId } as any);
+    } catch (err) {
+      console.warn("[gemini-runtime] canUseTool threw:", err);
+      return { behavior: "allow", updatedInput: args };
+    }
   }
 
   // Load Gemini chat history from disk. Returns undefined when there's no
