@@ -3,16 +3,17 @@ import fs from "node:fs/promises";
 import { createWriteStream, type WriteStream } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { query, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKMessage, type CanUseTool, type PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
-import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir } from "./fs";
+import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildCommentsMcp } from "./comments-mcp";
 import { buildSessionMcp } from "./session-mcp";
 import { buildPlanningMcp, PLANNING_SYSTEM_PROMPT } from "./planning-mcp";
 import {
   type SessionState,
   isValidTransition,
+  isTerminalState,
   shouldPersistState,
   canOverwriteWithStopped,
   stateAfterResult,
@@ -70,6 +71,26 @@ You are working within the Agent Workbench on a specific project and task. Here 
 ${parts.join("\n\n")}
 
 Use this context to understand the goals, requirements, and current state of work. When relevant, refer back to these documents for guidance.
+
+## Inline Media in Chat
+
+You can display images and videos inline in your chat responses using markdown syntax:
+
+**Basic syntax:**
+- Image: \`![alt text](url)\`
+- Video: \`![alt text](url.mp4)\` (automatically detected by extension: mp4, webm, mov, avi, mkv, m4v)
+
+**With custom dimensions** (append \`|width\` or \`|widthxheight\` to alt text):
+- \`![description|800](url)\` — 800px wide, maintains aspect ratio
+- \`![description|800x600](url)\` — exact 800x600 dimensions
+
+**For files in the task folder**, use the raw file API:
+\`\`\`
+![screenshot|600](/api/files/raw?project=PROJECT&task=TASK&path=uploads/image.png)
+![demo video|800](/api/files/raw?project=PROJECT&task=TASK&path=uploads/demo.mp4)
+\`\`\`
+
+Replace PROJECT and TASK with the current project/task slugs (URL-encoded). Files in the task's \`files/\` directory are served via this API.
 `.trim();
 
   return { type: "preset", preset: "claude_code", append: contextPrompt };
@@ -114,6 +135,7 @@ interface RuntimeSession {
   startedAt: Date;
   lastActivity: Date;
   seenAt: Date | null;           // when user last viewed this session (null = never seen)
+  completedAt: Date | null;      // when session finished (idle/stopped/error) — for unread tracking
   q: Query;
   input: InputChannel;
   events: EventEmitter;          // emits 'event' (SDKMessage) and 'state' (SessionState)
@@ -121,10 +143,21 @@ interface RuntimeSession {
   inputLog: WriteStream;         // input.jsonl
   history: SDKMessage[];         // in-memory replay buffer for new SSE clients
   state: SessionState;
-  pendingPermission: null;       // reserved for canUseTool integration
+  // Tool calls awaiting user approval via canUseTool. Keyed by toolUseID.
+  // Today this is used for ExitPlanMode (the agent finishes a plan, the SDK
+  // asks for user approval before exiting plan mode). The resolver is called
+  // by the /api/sessions/[id]/permission endpoint with the user's decision.
+  pendingPermissions: Map<string, PendingPermission>;
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
+}
+
+export interface PendingPermission {
+  toolName: string;
+  input: Record<string, unknown>;
+  resolve: (r: PermissionResult) => void;
+  requestedAt: Date;
 }
 
 export interface SessionSummary {
@@ -149,6 +182,8 @@ declare global {
   var __wb_watchdog_interval: ReturnType<typeof setInterval> | undefined;
   // eslint-disable-next-line no-var
   var __wb_session_registry_events: EventEmitter | undefined;
+  // eslint-disable-next-line no-var
+  var __wb_reconciled: boolean | undefined;
 }
 const registry: Map<string, RuntimeSession> =
   globalThis.__wb_session_registry ?? (globalThis.__wb_session_registry = REGISTRY);
@@ -250,8 +285,106 @@ if (!globalThis.__wb_watchdog_interval) {
   }
 }
 
+// On first boot, walk every session on disk and fix any meta.json whose
+// project/task/cwd drifted from the actual folder it lives in (e.g. a user
+// renamed a project folder outside the rename API). Fire-and-forget — the
+// registry is empty at boot, so this can race with the first incoming
+// request harmlessly: either the request reads pre-fix meta or post-fix
+// meta, both are valid JSON. The next restoreSession after reconciliation
+// sees the corrected values.
+//
+// Defer to the next tick because sessions.ts ↔ fs.ts is a circular import;
+// calling the reconciler synchronously here would hit a TDZ error on
+// PROJECTS_DIR depending on which module the loader entered first.
+if (!globalThis.__wb_reconciled) {
+  globalThis.__wb_reconciled = true;
+  setImmediate(() => { void reconcileSessionsOnDisk(); });
+}
+
+// Build the canUseTool callback the SDK invokes before each tool execution.
+// We use it as the user-approval gate for ExitPlanMode: when the agent
+// finishes a plan and tries to exit plan mode, we park the call in
+// `pendingPermissions` and emit a `permission_request` event so the UI can
+// surface an Approve/Deny card. Everything else auto-allows — sessions run
+// in `bypassPermissions` so the SDK normally wouldn't even call this.
+function buildCanUseTool(
+  pendingPermissions: Map<string, PendingPermission>,
+  events: EventEmitter,
+): CanUseTool {
+  return async (toolName, input, options) => {
+    if (toolName === "ExitPlanMode") {
+      return new Promise<PermissionResult>((resolve) => {
+        const toolUseId = options.toolUseID;
+        pendingPermissions.set(toolUseId, {
+          toolName,
+          input,
+          resolve,
+          requestedAt: new Date(),
+        });
+        events.emit("permission_request", {
+          toolUseId,
+          toolName,
+          input,
+        });
+      });
+    }
+    return { behavior: "allow", updatedInput: input };
+  };
+}
+
+// Resolve a pending tool-use approval. Called by the permission API endpoint
+// once the user clicks Approve or Deny in the UI.
+export function resolvePermission(
+  id: string,
+  toolUseId: string,
+  result: PermissionResult,
+): boolean {
+  const s = registry.get(id);
+  if (!s) return false;
+  const pending = s.pendingPermissions.get(toolUseId);
+  if (!pending) return false;
+  pending.resolve(result);
+  s.pendingPermissions.delete(toolUseId);
+  // Echo the decision so the UI can clear its approval card without waiting
+  // for the SDK's tool_result to come back.
+  s.events.emit("permission_resolved", {
+    toolUseId,
+    behavior: result.behavior,
+  });
+  return true;
+}
+
 export function getSession(id: string): RuntimeSession | undefined {
   return registry.get(id);
+}
+
+// Expose the live SDK Query for a session so MCP tools (chrome_connect /
+// chrome_disconnect / chrome_reconnect in session-mcp.ts) can call its
+// setMcpServers() to add or remove dynamic MCP servers mid-conversation.
+// Returns null when the session is unknown or has no live query (e.g. a
+// session restored from disk before resume).
+export function getSessionQuery(id: string): Query | null {
+  const s = registry.get(id);
+  if (!s || !s.q) return null;
+  return s.q;
+}
+
+// Get the session directory for a live session.
+// Returns null if the session is not found.
+export function getSessionDir(id: string): string | null {
+  const s = registry.get(id);
+  if (!s) return null;
+  return path.join(s.cwd, "sessions", s.id);
+}
+
+// Debug helper to inspect the session registry
+export function debugSessionRegistry(targetId: string): { found: boolean; hasQuery: boolean; allIds: string[] } {
+  const s = registry.get(targetId);
+  return {
+    found: !!s,
+    hasQuery: !!(s?.q),
+    allIds: Array.from(registry.keys()),
+  };
 }
 
 // Rename a live session's in-memory title directly by ID.
@@ -264,37 +397,18 @@ export async function renameLiveSession(id: string, newName: string): Promise<bo
   const trimmedName = newName.trim();
   s.title = trimmedName;
 
-  // Also persist to meta.json
-  try {
-    const project = await getProject(s.projectSlug);
-    if (project) {
-      let sessionDir: string;
-      if (!s.taskSlug) {
-        sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-      } else {
-        const task = project.tasks.find((t) => t.slug === s.taskSlug);
-        if (task) {
-          sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
-        } else {
-          return true; // In-memory update succeeded, disk update not possible
-        }
-      }
-      const metaPath = path.join(sessionDir, "meta.json");
-      const raw = await fs.readFile(metaPath, "utf8");
-      const meta = JSON.parse(raw);
-      meta.name = trimmedName;
-      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-    }
-  } catch {
-    // Disk update failed, but in-memory succeeded
-  }
+  await updateMeta(s, (meta) => {
+    meta.name = trimmedName;
+  });
 
   return true;
 }
 
 export function listLiveSessions(): SessionSummary[] {
   return [...registry.values()].map((s) => {
-    const unread = !s.seenAt || s.lastActivity > s.seenAt;
+    // Session is unread only if it completed in the background (after user last viewed it)
+    // Running sessions are never marked unread — user sees them update in real-time
+    const unread = s.completedAt !== null && (!s.seenAt || s.completedAt > s.seenAt);
     return {
       id: s.id,
       projectSlug: s.projectSlug,
@@ -319,7 +433,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -337,8 +451,10 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
         lastActivity = st.mtime.toISOString();
       } catch { /* missing */ }
     }
-    // Session is unread if it hasn't been seen, or if there's activity after seenAt
-    const unread = !meta.seenAt || (meta.seenAt < lastActivity);
+    // Session is unread only if it completed after user last viewed it
+    // For legacy sessions without completedAt, use lastActivity as proxy (they're already done)
+    const completedAt = meta.completedAt ?? lastActivity;
+    const unread = !meta.seenAt || (meta.seenAt < completedAt);
     // Use persisted finalState if available (idle = done, error = error),
     // otherwise fall back to "idle" (assume completed) for historical sessions
     const state: SessionState = meta.finalState ?? "idle";
@@ -480,6 +596,7 @@ export async function restoreSession(
     finalState?: SessionState;
     seenAt?: string;
     lastActivity?: string;
+    completedAt?: string;
   } = {};
   try {
     const raw = await fs.readFile(metaPath, "utf8");
@@ -503,6 +620,7 @@ export async function restoreSession(
   input.close(); // Closed — not active
   const events = new EventEmitter();
   events.setMaxListeners(0);
+  const pendingPermissions = new Map<string, PendingPermission>();
 
   // Don't create file streams yet — they'll be created on resume
   const sink = createWriteStream("/dev/null");
@@ -516,15 +634,20 @@ export async function restoreSession(
     startedAt: meta.startedAt ? new Date(meta.startedAt) : new Date(),
     lastActivity: meta.lastActivity ? new Date(meta.lastActivity) : new Date(),
     seenAt: meta.seenAt ? new Date(meta.seenAt) : null,
+    completedAt: meta.completedAt ? new Date(meta.completedAt) : null,
     q: null as unknown as Query, // Placeholder — replaced on resume
     input,
     events,
     log: sink,
     inputLog: sink,
     history,
-    // Use persisted finalState if available, default to "idle" (done) for restored sessions
-    state: meta.finalState ?? "idle",
-    pendingPermission: null,
+    // A restored session has closed streams and a placeholder query, so the
+    // runtime state must be "stopped" regardless of what meta.json says —
+    // sendInput dispatches by state, and only "stopped"/"error" routes through
+    // resumeSession (which re-opens streams). If we left state as "idle" here,
+    // the next user message would silently write to closed streams.
+    state: "stopped",
+    pendingPermissions,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
@@ -577,6 +700,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   const input = new InputChannel();
   const events = new EventEmitter();
   events.setMaxListeners(0);
+  const pendingPermissions = new Map<string, PendingPermission>();
 
   // First message
   const firstMsg = makeUserMessage(p.firstMessage, id);
@@ -597,12 +721,11 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // end_turn to flip awaiting_input.
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
+      canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: {
         "workbench-comments": commentsMcp,
-        "workbench-session": buildSessionMcp(id),
+        "workbench-session": buildSessionMcp(id, p.projectSlug, p.taskSlug),
       },
-      // Enable Claude in Chrome integration for browser automation
-      extraArgs: { chrome: null },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -618,6 +741,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     startedAt: now,
     lastActivity: now,
     seenAt: null, // New session — never seen
+    completedAt: null, // Not completed yet
     q,
     input,
     events,
@@ -625,7 +749,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     inputLog,
     history: [],
     state: "running",
-    pendingPermission: null,
+    pendingPermissions,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -663,29 +787,66 @@ function extractModifiedFilePath(msg: SDKMessage): string | null {
 
 // Persist the SDK session ID to meta.json so the session can be resumed after server restart
 async function persistSdkSessionId(s: RuntimeSession): Promise<void> {
+  await updateMeta(s, (meta) => {
+    meta.sdkSessionId = s.sdkSessionId;
+  });
+}
+
+// Per-session mutex queue for meta.json updates. Without this, two
+// setState() calls in quick succession (very common: running → idle → stopped
+// over a few hundred ms) trigger two concurrent persistSessionState calls,
+// each doing read-modify-write on the same file. We've observed the resulting
+// file corruption in the wild: the shorter write's `}\n` ends up overlaid on
+// top of the longer write's content, leaving JSON that won't parse. That
+// blocks restoreSession and the session becomes unrecoverable across server
+// restarts ("session not found or failed to resume").
+const metaWriteQueue = new Map<string, Promise<void>>();
+
+// Read-modify-write meta.json safely:
+// - Serialized per-session: concurrent updateMeta calls for the same session
+//   are queued, so reader/writer cycles never interleave.
+// - Atomic on the file system: write to a sibling .tmp file and rename, so
+//   a crash or process kill mid-write never leaves a half-written meta.json.
+async function updateMeta(
+  s: RuntimeSession,
+  mutate: (meta: Record<string, unknown>) => void,
+): Promise<void> {
   // Skip for planning sessions (they write to /dev/null)
   if (s.projectSlug === "__planning__") return;
 
-  try {
-    const project = await getProject(s.projectSlug);
-    if (!project) return;
+  const prev = metaWriteQueue.get(s.id) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    try {
+      const project = await getProject(s.projectSlug);
+      if (!project) return;
 
-    let sessionDir: string;
-    if (!s.taskSlug) {
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-    } else {
-      const task = project.tasks.find((t) => t.slug === s.taskSlug);
-      if (!task) return;
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
+      let sessionDir: string;
+      if (!s.taskSlug) {
+        sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
+      } else {
+        const task = project.tasks.find((t) => t.slug === s.taskSlug);
+        if (!task) return;
+        sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
+      }
+
+      const metaPath = path.join(sessionDir, "meta.json");
+      const tmpPath = metaPath + ".tmp";
+      const raw = await fs.readFile(metaPath, "utf8");
+      const meta = JSON.parse(raw) as Record<string, unknown>;
+      mutate(meta);
+      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
+      await fs.rename(tmpPath, metaPath);
+    } catch {
+      // Best effort — meta drift gets caught by reconcileSessionsOnDisk on boot.
     }
-
-    const metaPath = path.join(sessionDir, "meta.json");
-    const raw = await fs.readFile(metaPath, "utf8");
-    const meta = JSON.parse(raw);
-    meta.sdkSessionId = s.sdkSessionId;
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-  } catch {
-    // Ignore errors — best effort
+  });
+  metaWriteQueue.set(s.id, next);
+  try {
+    await next;
+  } finally {
+    // If this was the last queued write for the session, drop the entry so
+    // the map doesn't accumulate forever.
+    if (metaWriteQueue.get(s.id) === next) metaWriteQueue.delete(s.id);
   }
 }
 
@@ -756,6 +917,10 @@ async function pumpEvents(s: RuntimeSession) {
     if (s.state !== "running" && s.state !== "stopped") {
       s.log.end();
       s.inputLog.end();
+      // Mark the InputChannel closed too. sendInput uses this as its signal
+      // that the SDK has gone away — without it, an input arriving here
+      // (state=idle, streams closed, dead SDK) would silently disappear.
+      s.input.close();
     }
   }
 }
@@ -785,43 +950,30 @@ function setState(s: RuntimeSession, state: SessionState) {
     return;
   }
 
+  const wasTerminal = isTerminalState(s.state);
   s.state = state;
   s.events.emit("state", state);
 
-  // Persist certain states to meta.json so they survive restarts
+  // Track when session completes (for "New" badge logic)
+  // Only set completedAt when transitioning FROM a non-terminal state TO a terminal state.
+  // Transitions between terminal states (e.g., stopped → idle) shouldn't create a new "New" badge.
   if (shouldPersistState(state)) {
+    if (!wasTerminal) {
+      s.completedAt = new Date();
+    }
     void persistSessionState(s, state);
   }
 }
 
 // Persist the final state to meta.json for recovery after server restart
 async function persistSessionState(s: RuntimeSession, state: SessionState): Promise<void> {
-  // Skip for planning sessions (they write to /dev/null)
-  if (s.projectSlug === "__planning__") return;
-
-  try {
-    const project = await getProject(s.projectSlug);
-    if (!project) return;
-
-    let sessionDir: string;
-    if (!s.taskSlug) {
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-    } else {
-      const task = project.tasks.find((t) => t.slug === s.taskSlug);
-      if (!task) return;
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
-    }
-
-    const metaPath = path.join(sessionDir, "meta.json");
-    const raw = await fs.readFile(metaPath, "utf8");
-    const meta = JSON.parse(raw);
+  await updateMeta(s, (meta) => {
     meta.finalState = state;
-    // Persist lastActivity so unread detection doesn't rely on file mtime
     meta.lastActivity = s.lastActivity.toISOString();
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-  } catch {
-    // Ignore errors — best effort
-  }
+    if (s.completedAt) {
+      meta.completedAt = s.completedAt.toISOString();
+    }
+  });
 }
 
 // Called from fs.ts after a task or project is moved/renamed. Keeps the
@@ -946,6 +1098,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   const input = new InputChannel();
   const events = new EventEmitter();
   events.setMaxListeners(0);
+  const pendingPermissions = new Map<string, PendingPermission>();
 
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(makeUserMessage(p.firstMessage, id));
@@ -962,12 +1115,11 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       additionalDirectories: [WORKSPACE_ROOT],
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
+      canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: {
         "workbench-comments": commentsMcp,
-        "workbench-session": buildSessionMcp(id),
+        "workbench-session": buildSessionMcp(id, p.projectSlug, ""),
       },
-      // Enable Claude in Chrome integration for browser automation
-      extraArgs: { chrome: null },
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -984,6 +1136,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     startedAt: now,
     lastActivity: now,
     seenAt: null, // New session — never seen
+    completedAt: null, // Not completed yet
     q,
     input,
     events,
@@ -991,7 +1144,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     inputLog,
     history: [firstUserEcho],
     state: "running",
-    pendingPermission: null,
+    pendingPermissions,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1015,6 +1168,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
   const input = new InputChannel();
   const events = new EventEmitter();
   events.setMaxListeners(0);
+  const pendingPermissions = new Map<string, PendingPermission>();
 
   input.push(makeUserMessage(firstMessage, id));
 
@@ -1028,9 +1182,8 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       // discovering existing projects, with our planning prompt appended.
       systemPrompt: { type: "preset", preset: "claude_code", append: PLANNING_SYSTEM_PROMPT },
       settingSources: ["project", "user"],
+      canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: { "workbench-planning": planningMcp },
-      // Enable Claude in Chrome integration for browser automation
-      extraArgs: { chrome: null },
     },
   });
 
@@ -1047,6 +1200,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     startedAt: now,
     lastActivity: now,
     seenAt: null, // Planning sessions don't track seen state
+    completedAt: null, // Planning sessions don't track completion
     q,
     input,
     events,
@@ -1054,7 +1208,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     inputLog: createWriteStream("/dev/null"),
     history: [firstUserEcho],
     state: "running",
-    pendingPermission: null,
+    pendingPermissions,
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
@@ -1069,10 +1223,16 @@ export async function sendInput(id: string, text: string): Promise<boolean> {
   const s = registry.get(id);
   if (!s) return false;
 
-  // If session is stopped/error, resume it first
-  if (s.state === "stopped" || s.state === "error") {
-    const resumed = await resumeSession(s, text);
-    return resumed;
+  // Route to resumeSession when the SDK is no longer consuming input. The
+  // nominal state isn't sufficient: the SDK process can die unexpectedly
+  // (e.g. `Claude Code process exited with code 1`) and leave the session in
+  // state="idle" or "awaiting_input" while the input channel is closed.
+  // Without this guard, sendInput would write to a closed inputLog, push into
+  // a dead InputChannel, flip state to "running" — and the session would
+  // appear alive but never produce events.
+  const sdkDead = s.input.isClosed() || s.state === "stopped" || s.state === "error";
+  if (sdkDead) {
+    return resumeSession(s, text);
   }
 
   // The SDK doesn't echo typed user messages in streaming-input mode, so we
@@ -1122,12 +1282,13 @@ export async function sendInputWithFiles(
     messageText = `${fileRefs}\n\n${text}`;
   }
 
-  // If session is stopped/error, resume it with the message
-  if (s.state === "stopped" || s.state === "error") {
-    // For resumed sessions, we can't easily add images to the resume flow
-    // Just include the text with file references
-    const resumed = await resumeSession(s, messageText);
-    return resumed;
+  // Route to resumeSession when the SDK is no longer consuming input — same
+  // dead-SDK guard as sendInput. See its comment for rationale.
+  const sdkDead = s.input.isClosed() || s.state === "stopped" || s.state === "error";
+  if (sdkDead) {
+    // For resumed sessions, we can't easily add images to the resume flow.
+    // Just include the text with file references.
+    return resumeSession(s, messageText);
   }
 
   // Read images and convert to base64
@@ -1220,7 +1381,9 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     const commentsMcp = buildCommentsMcp(s.projectSlug, s.taskSlug);
     const systemPrompt = await buildContextSystemPrompt(s.projectSlug, s.taskSlug);
 
-    // Create new query with resume option
+    // Create new query with resume option. Re-use the session's existing
+    // pendingPermissions map + events emitter so a permission request emitted
+    // mid-resume reaches the same SSE subscribers.
     s.q = query({
       prompt: s.input,
       options: {
@@ -1229,12 +1392,11 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         resume: s.sdkSessionId,
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
+        canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         mcpServers: {
           "workbench-comments": commentsMcp,
-          "workbench-session": buildSessionMcp(s.id),
+          "workbench-session": buildSessionMcp(s.id, s.projectSlug, s.taskSlug),
         },
-        // Enable Claude in Chrome integration for browser automation
-        extraArgs: { chrome: null },
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },
@@ -1250,6 +1412,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     // Push the message to the input channel
     s.input.push(msg);
     s.lastActivity = new Date();
+    s.completedAt = null; // Clear completion — session is running again
     setState(s, "running");
 
     // Start pumping events from the new query
@@ -1309,22 +1472,28 @@ export async function markSessionSeen(
 ): Promise<boolean> {
   const now = new Date();
 
-  // Update in-memory seenAt for live sessions
+  // Live session: route through updateMeta so this serializes with the
+  // setState / persistSdkSessionId writers (otherwise concurrent writes can
+  // corrupt meta.json).
   const liveSession = registry.get(sessionId);
   if (liveSession) {
     liveSession.seenAt = now;
+    await updateMeta(liveSession, (meta) => {
+      meta.seenAt = now.toISOString();
+    });
+    return true;
   }
 
+  // Dead session (not in registry): no other writer can race, direct write is fine.
   const project = await getProject(projectSlug);
-  if (!project) return !!liveSession; // Return true if we at least updated in-memory
+  if (!project) return false;
 
   let sessionDir: string;
   if (!taskSlug) {
-    // Project-level session
     sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return !!liveSession;
+    if (!task) return false;
     sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
   }
 
@@ -1333,10 +1502,12 @@ export async function markSessionSeen(
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
     meta.seenAt = now.toISOString();
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    const tmpPath = metaPath + ".tmp";
+    await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
+    await fs.rename(tmpPath, metaPath);
     return true;
   } catch {
-    return !!liveSession; // Return true if we at least updated in-memory
+    return false;
   }
 }
 
@@ -1381,14 +1552,29 @@ export async function renameSession(
 }
 
 // Delete a session by removing its entire directory.
-// Returns true if successful, false if session not found or is live.
+// Returns true if successful, false if session not found or still running.
 export async function deleteSession(
   projectSlug: string,
   taskSlug: string,
   sessionId: string,
 ): Promise<boolean> {
-  // Don't allow deleting live sessions
-  if (registry.has(sessionId)) return false;
+  // Check if session is in registry
+  const liveSession = registry.get(sessionId);
+  if (liveSession) {
+    // Only block deletion if session is actively running
+    if (liveSession.state === "running") {
+      return false;
+    }
+    // Session is stopped/idle/error — clean up streams and remove from registry
+    try {
+      liveSession.input.close();
+      liveSession.log.end();
+      liveSession.inputLog.end();
+    } catch {
+      // Ignore stream cleanup errors
+    }
+    registry.delete(sessionId);
+  }
 
   const project = await getProject(projectSlug);
   if (!project) return false;

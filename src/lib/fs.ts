@@ -12,7 +12,11 @@ import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions"
 // fails: only an `init` event is emitted and the agent never replies. Rename
 // the SDK transcript directories alongside the project/task folders so resume
 // keeps working.
-async function relocateSdkTranscripts(oldAbsPath: string, newAbsPath: string): Promise<void> {
+//
+// Exported so the startup reconciliation pass (reconcileSessionsOnDisk) can
+// also call it when it detects that a session's meta.json cwd drifted from
+// the folder it actually lives in.
+export async function relocateSdkTranscripts(oldAbsPath: string, newAbsPath: string): Promise<void> {
   const encode = (p: string) => p.replaceAll("/", "-");
   const base = path.join(os.homedir(), ".claude", "projects");
   const oldPrefix = encode(oldAbsPath);
@@ -466,4 +470,81 @@ export async function deleteFile(projectSlug: string, taskSlug: string, rel: str
   const base = path.join(taskDir(project, task), "files");
   const full = ensureSafePath(base, rel);
   await fs.rm(full, { recursive: true, force: true });
+}
+
+// Walk every session folder on disk and fix any meta.json whose
+// `project`/`task`/`cwd` drifted from the actual location it lives in.
+// This happens when a user renames/moves a project or task folder outside the
+// rename API (e.g. directly in Finder). Without this, sendInput → resumeSession
+// → getProject(staleSlug) returns null and the session is silently broken.
+//
+// Also relocates the SDK transcript directory if the cwd changed, so
+// resume(sdkSessionId) keeps working.
+//
+// Called once on module load with a globalThis guard for HMR. Best effort —
+// failures are logged but never throw.
+export async function reconcileSessionsOnDisk(): Promise<void> {
+  try {
+    const projects = await listProjects();
+    for (const p of projects) {
+      const projectCwd = path.join(PROJECTS_DIR, p.folderName);
+      await reconcileSessionDir(
+        path.join(projectCwd, "sessions"),
+        p.slug, "", projectCwd,
+      );
+      for (const t of p.tasks) {
+        const taskCwd = path.join(projectCwd, t.folderName);
+        await reconcileSessionDir(
+          path.join(taskCwd, "sessions"),
+          p.slug, t.slug, taskCwd,
+        );
+      }
+    }
+  } catch (err) {
+    const e = err as Error;
+    console.warn(`[reconcile] sessions reconciliation failed:`, e.message);
+  }
+}
+
+async function reconcileSessionDir(
+  sessDir: string,
+  expectedProject: string,
+  expectedTask: string,
+  expectedCwd: string,
+): Promise<void> {
+  let entries: Awaited<ReturnType<typeof fs.readdir>>;
+  try {
+    entries = await fs.readdir(sessDir, { withFileTypes: true });
+  } catch { return; }
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    const metaPath = path.join(sessDir, d.name, "meta.json");
+    let meta: { project?: string; task?: string; cwd?: string; [k: string]: unknown };
+    try {
+      meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
+    } catch { continue; }
+    const projectDrift = meta.project !== expectedProject;
+    const taskDrift = (meta.task ?? "") !== expectedTask;
+    const cwdDrift = meta.cwd !== expectedCwd;
+    if (!projectDrift && !taskDrift && !cwdDrift) continue;
+
+    const oldCwd = typeof meta.cwd === "string" ? meta.cwd : null;
+    console.log(
+      `[reconcile] session ${d.name}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
+    );
+    meta.project = expectedProject;
+    meta.task = expectedTask;
+    meta.cwd = expectedCwd;
+    try {
+      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    } catch (err) {
+      const e = err as Error;
+      console.warn(`[reconcile] could not rewrite ${metaPath}:`, e.message);
+      continue;
+    }
+
+    if (oldCwd && oldCwd !== expectedCwd) {
+      await relocateSdkTranscripts(oldCwd, expectedCwd);
+    }
+  }
 }

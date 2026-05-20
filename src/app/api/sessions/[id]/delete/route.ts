@@ -23,7 +23,7 @@ export async function DELETE(req: Request, { params }: Params) {
   const ok = await deleteSession(projectSlug, taskSlug ?? "", id);
   if (!ok) {
     return NextResponse.json(
-      { error: "session not found or is still running" },
+      { error: "Session not found or is actively running" },
       { status: 404 },
     );
   }

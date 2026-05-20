@@ -12,6 +12,7 @@ import type { SessionSummaryDTO } from "@/lib/types";
 import { taskSessionRoute, projectSessionRoute } from "@/lib/routes";
 import { TodoList, extractTodosFromMessages } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
+import { EmailPreviewCard } from "./EmailPreviewCard";
 
 interface UploadedFile {
   name: string;
@@ -66,6 +67,13 @@ export function Chat({ session, onChange, onBack }: Props) {
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
 
+  // Tool calls awaiting user approval (today: only ExitPlanMode). Keyed by
+  // toolUseId. Populated from SSE `permission_request` events, cleared on
+  // `permission_resolved` (echoed when the user clicks Approve/Deny).
+  const [pendingPermissions, setPendingPermissions] = useState<
+    Map<string, { toolName: string; input: Record<string, unknown> }>
+  >(new Map());
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -113,6 +121,7 @@ export function Chat({ session, onChange, onBack }: Props) {
     setState(session.state);
     setStreamConnected(false);
     setHistoryMeta(null);
+    setPendingPermissions(new Map());
     isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
@@ -184,6 +193,27 @@ export function Chat({ session, onChange, onBack }: Props) {
         const { state: st } = JSON.parse((ev as MessageEvent).data);
         setState(st);
         onChangeRef.current();
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("permission_request", (ev) => {
+      try {
+        const { toolUseId, toolName, input } = JSON.parse((ev as MessageEvent).data);
+        setPendingPermissions((prev) => {
+          const next = new Map(prev);
+          next.set(toolUseId, { toolName, input });
+          return next;
+        });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("permission_resolved", (ev) => {
+      try {
+        const { toolUseId } = JSON.parse((ev as MessageEvent).data);
+        setPendingPermissions((prev) => {
+          if (!prev.has(toolUseId)) return prev;
+          const next = new Map(prev);
+          next.delete(toolUseId);
+          return next;
+        });
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -372,6 +402,28 @@ export function Chat({ session, onChange, onBack }: Props) {
 
   const canManageSession = !isLive || state === "stopped" || state === "error";
 
+  // Are we in plan mode? Two signals:
+  //   1. ExitPlanMode is pending approval → definitely in plan mode, awaiting user
+  //   2. The most recent plan-control tool_use is EnterPlanMode (no following
+  //      ExitPlanMode yet) → agent is researching/planning
+  const inPlanMode = useMemo(() => {
+    for (const p of pendingPermissions.values()) {
+      if (p.toolName === "ExitPlanMode") return true;
+    }
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.type !== "assistant") continue;
+      const content = (m as { message?: { content?: unknown } }).message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content as Array<{ type?: string; name?: string }>) {
+        if (c.type !== "tool_use") continue;
+        if (c.name === "ExitPlanMode") return false;
+        if (c.name === "EnterPlanMode") return true;
+      }
+    }
+    return false;
+  }, [messages, pendingPermissions]);
+
   const isWorking = state === "running";
   const isAwaiting = state === "awaiting_input";
   const isDone = state === "idle" || state === "stopped"; // stopped sessions seamlessly resume, treat as done
@@ -428,6 +480,14 @@ export function Chat({ session, onChange, onBack }: Props) {
               {stateLabel}
               {isWorking && <span className="dots" aria-hidden />}
             </span>
+            {inPlanMode && (
+              <>
+                <span>·</span>
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10.5px] font-medium uppercase tracking-wide border border-[var(--accent)] text-[var(--accent)]">
+                  Plan mode
+                </span>
+              </>
+            )}
           </div>
         </div>
         {/* Session menu for stopped sessions */}
@@ -478,7 +538,7 @@ export function Chat({ session, onChange, onBack }: Props) {
               </button>
             </div>
           )}
-          <MessageStream messages={messages} />
+          <MessageStream messages={messages} sessionId={session.id} />
           {messages.length === 0 && (
             <div className="text-[var(--muted)] text-[13px]">Waiting for the agent to start…</div>
           )}
@@ -527,6 +587,22 @@ export function Chat({ session, onChange, onBack }: Props) {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {pendingPermissions.size > 0 && (
+        <div className="border-t border-[var(--border)] px-6 py-3 bg-[var(--bg-2)]">
+          <div className="max-w-[760px] mx-auto space-y-2">
+            {Array.from(pendingPermissions.entries()).map(([toolUseId, p]) => (
+              <PlanApprovalCard
+                key={toolUseId}
+                sessionId={session.id}
+                toolUseId={toolUseId}
+                toolName={p.toolName}
+                input={p.input}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -584,6 +660,82 @@ export function Chat({ session, onChange, onBack }: Props) {
         </div>
       </div>
     </>
+  );
+}
+
+// Surface a tool-use approval request from the agent's canUseTool callback.
+// Today the only tool that gets here is ExitPlanMode — the agent has finished
+// a plan and the SDK is asking the user to approve before exiting plan mode
+// and letting the agent execute changes.
+function PlanApprovalCard({
+  sessionId,
+  toolUseId,
+  toolName,
+  input,
+}: {
+  sessionId: string;
+  toolUseId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const planText = typeof input.plan === "string" ? input.plan : JSON.stringify(input, null, 2);
+
+  const decide = async (behavior: "allow" | "deny") => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/permission`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toolUseId,
+          behavior,
+          updatedInput: behavior === "allow" ? input : undefined,
+          message: behavior === "deny" ? "User rejected the plan." : undefined,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) setError(j.error ?? "failed");
+      // SSE permission_resolved event will clear this card from parent state
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const isPlan = toolName === "ExitPlanMode";
+  return (
+    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[12px] font-semibold text-[var(--accent)]">
+          {isPlan ? "Plan ready for review" : `Approve ${toolName}?`}
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => decide("deny")}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[#dc2626] hover:border-[#dc2626] disabled:opacity-40 transition"
+          >
+            Deny
+          </button>
+          <button
+            onClick={() => decide("allow")}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] disabled:opacity-40 hover:brightness-110 transition"
+          >
+            {busy ? "…" : "Approve & continue"}
+          </button>
+        </div>
+      </div>
+      <div className="max-h-[240px] overflow-y-auto rounded-md bg-[var(--bg)] px-3 py-2 text-[13px] prose prose-sm max-w-none [&_*]:!my-1">
+        <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{planText}</ReactMarkdown>
+      </div>
+      {error && <div className="text-[12px] text-[#dc2626] mt-2">{error}</div>}
+    </div>
   );
 }
 
@@ -652,7 +804,7 @@ function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: S
 // Flatten the message stream into render items, batching consecutive tool
 // calls and thinking blocks (across messages) into a single inline-flex
 // row of compact chips. Visible text and user messages break the row.
-function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
+function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; sessionId: string }) {
   type Chip =
     | { kind: "tool"; part: Part }
     | { kind: "think"; text: string };
@@ -660,6 +812,7 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
     | { kind: "user"; key: string; text: string }
     | { kind: "asst-text"; key: string; text: string }
     | { kind: "chip-row"; key: string; chips: Chip[] }
+    | { kind: "email-preview"; key: string; part: Part }
     | { kind: "result"; key: string };
 
   const items: Item[] = [];
@@ -687,8 +840,15 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       const parts = (mm.message?.content as Part[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
-          if (!batch.length) batchKey = `c-${i}-${j}`;
-          batch.push({ kind: "tool", part: p });
+          // Special handling for email preview tools
+          if (p.name === "mcp__workbench-email__compose_email_preview" ||
+              p.name === "mcp__workbench-session__request_send_email") {
+            flush();
+            items.push({ kind: "email-preview", key: `ep-${i}-${j}`, part: p });
+          } else {
+            if (!batch.length) batchKey = `c-${i}-${j}`;
+            batch.push({ kind: "tool", part: p });
+          }
         } else if (p.type === "thinking") {
           if (!batch.length) batchKey = `c-${i}-${j}`;
           batch.push({ kind: "think", text: (p.thinking as string) ?? "" });
@@ -730,6 +890,34 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
               {it.chips.map((c, j) => c.kind === "tool"
                 ? <ToolChip key={j} p={c.part} />
                 : <ThinkChip key={j} text={c.text} />)}
+            </div>
+          );
+        }
+        if (it.kind === "email-preview") {
+          // Extract previewId from the tool input
+          const input = it.part.input as Record<string, unknown>;
+          // The previewId comes from the tool result, but we have the input here.
+          // We'll use a hash of the input to identify it, or extract from a subsequent result.
+          // For now, render with initialData from the tool input
+          const previewId = `preview-${it.key}`;
+          return (
+            <div key={it.key} className="my-3">
+              <EmailPreviewCard
+                sessionId={sessionId}
+                previewId={previewId}
+                initialData={{
+                  to: input.to as string,
+                  cc: input.cc as string | undefined,
+                  subject: input.subject as string,
+                  body: input.body as string,
+                  attachments: input.attachments as string[] | undefined,
+                  threadId: input.threadId as string | undefined,
+                  replyToMessageId: input.replyToMessageId as string | undefined,
+                  isForward: input.isForward as boolean | undefined,
+                  isReply: input.isReply as boolean | undefined,
+                  originalThread: input.originalThread as import("./EmailPreviewCard").EmailMessage[] | undefined,
+                }}
+              />
             </div>
           );
         }
@@ -947,10 +1135,84 @@ function extractText(content: unknown): string {
   return "";
 }
 
+const VIDEO_EXT = new Set(["mp4", "webm", "mov", "avi", "mkv", "m4v"]);
+
+function extFromUrl(url: string): string {
+  try {
+    // Handle data URLs - they're not videos
+    if (url.startsWith("data:")) return "";
+    const parsed = new URL(url, "http://x");
+    // Check if there's a 'path' query param (used by /api/files/raw)
+    const pathParam = parsed.searchParams.get("path");
+    const pathToCheck = pathParam || parsed.pathname;
+    const idx = pathToCheck.lastIndexOf(".");
+    return idx < 0 ? "" : pathToCheck.slice(idx + 1).toLowerCase();
+  } catch {
+    // Fallback for relative paths
+    const idx = url.lastIndexOf(".");
+    return idx < 0 ? "" : url.slice(idx + 1).split(/[?#]/)[0].toLowerCase();
+  }
+}
+
+// Parse alt text for dimensions: "alt text|600" or "alt text|600x400"
+function parseAltWithSize(alt?: string): { alt: string; width?: number; height?: number } {
+  if (!alt) return { alt: "" };
+  const match = alt.match(/^(.+?)\|(\d+)(?:x(\d+))?$/);
+  if (match) {
+    return {
+      alt: match[1].trim(),
+      width: parseInt(match[2], 10),
+      height: match[3] ? parseInt(match[3], 10) : undefined,
+    };
+  }
+  return { alt };
+}
+
+function MarkdownMedia({ src, alt }: { src?: string; alt?: string }) {
+  if (!src) return null;
+  const ext = extFromUrl(src);
+  const { alt: cleanAlt, width, height } = parseAltWithSize(alt);
+  const style: React.CSSProperties = {};
+  if (width) style.width = width;
+  if (height) style.height = height;
+  if (!width && !height) style.maxHeight = "400px";
+
+  if (VIDEO_EXT.has(ext)) {
+    return (
+      <video
+        src={src}
+        controls
+        className="max-w-full rounded-lg my-2"
+        style={style}
+      >
+        {cleanAlt && <track kind="captions" label={cleanAlt} />}
+      </video>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt={cleanAlt}
+      className="max-w-full rounded-lg my-2"
+      style={style}
+    />
+  );
+}
+
+const markdownComponents = {
+  img: ({ src, alt }: { src?: string | Blob; alt?: string }) => (
+    <MarkdownMedia src={typeof src === "string" ? src : undefined} alt={alt} />
+  ),
+};
+
 function Markdown({ text }: { text: string }) {
   return (
     <div className="prose max-w-none text-[14px] leading-relaxed prose-p:my-2 prose-pre:bg-[var(--panel-2)] prose-pre:border prose-pre:border-[var(--border)] prose-code:text-[var(--accent)] prose-code:before:content-none prose-code:after:content-none">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{text}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        components={markdownComponents}
+      >{text}</ReactMarkdown>
     </div>
   );
 }

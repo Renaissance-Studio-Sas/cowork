@@ -20,6 +20,10 @@ export class InputChannel implements AsyncIterable<SDKUserMessage> {
     for (const w of this.waiters.splice(0)) w({ value: undefined as never, done: true });
   }
 
+  isClosed(): boolean {
+    return this.closed;
+  }
+
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return {
       next: (): Promise<IteratorResult<SDKUserMessage>> => {

@@ -32,14 +32,14 @@ const STATE_LABEL: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "needs your reply",
   running: "working",
   idle: "done",
-  stopped: "stopped",
+  stopped: "done",
   error: "error",
 };
 const STATE_COLOR: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
   idle: "var(--ok)",
-  stopped: "var(--muted)",
+  stopped: "var(--ok)", // same as idle/done
   error: "#dc2626",
 };
 

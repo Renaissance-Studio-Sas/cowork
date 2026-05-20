@@ -40,9 +40,15 @@ export type SessionState = "running" | "idle" | "awaiting_input" | "stopped" | "
  * - "error" can go to: running (resume only)
  */
 
+// "error" is reachable from EVERY non-terminal state — the SDK process can
+// crash at any moment (`Claude Code process exited with code 1` etc.), and
+// blocking the transition to "error" leaves the session stuck in idle/
+// awaiting_input with a dead pumpEvents loop, no events, no recovery. The
+// next sendInput then takes the live-write path into a dead InputChannel
+// and the session is silently un-resumable.
 const VALID_TRANSITIONS: Record<SessionState, Set<SessionState>> = {
   running: new Set(["idle", "awaiting_input", "stopped", "error"]),
-  idle: new Set(["running", "stopped"]),
+  idle: new Set(["running", "stopped", "error"]),
   awaiting_input: new Set(["running", "stopped", "error"]),
   stopped: new Set(["running"]),
   error: new Set(["running"]),

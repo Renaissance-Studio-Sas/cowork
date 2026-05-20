@@ -53,12 +53,27 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: total - initialHistory.length });
       for (const msg of initialHistory) sendEvent("message", msg);
 
+      // Replay any in-flight permission requests so a late-joining client
+      // sees the pending approval card immediately (e.g. user navigates to
+      // the session URL after the agent has already asked).
+      for (const [toolUseId, pending] of s.pendingPermissions) {
+        sendEvent("permission_request", {
+          toolUseId,
+          toolName: pending.toolName,
+          input: pending.input,
+        });
+      }
+
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onState = (state: string) => sendEvent("state", { state });
       const onFileChanged = (data: { path: string }) => sendEvent("file_changed", data);
+      const onPermissionRequest = (data: unknown) => sendEvent("permission_request", data);
+      const onPermissionResolved = (data: unknown) => sendEvent("permission_resolved", data);
       s.events.on("event", onEvent);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
+      s.events.on("permission_request", onPermissionRequest);
+      s.events.on("permission_resolved", onPermissionResolved);
 
       const heartbeat = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
@@ -69,6 +84,8 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         s.events.off("event", onEvent);
         s.events.off("state", onState);
         s.events.off("file_changed", onFileChanged);
+        s.events.off("permission_request", onPermissionRequest);
+        s.events.off("permission_resolved", onPermissionResolved);
         try { controller.close(); } catch { /* already closed */ }
       };
 

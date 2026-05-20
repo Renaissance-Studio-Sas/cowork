@@ -10,6 +10,7 @@ import { StatusChip } from "./StatusChip";
 import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
+const RECENT_COLLAPSED_KEY = "wb-recent-sessions-collapsed";
 
 function loadCollapsed(): Record<string, boolean> {
   try {
@@ -30,6 +31,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const { projects, sessions, awaitingCount, refresh } = useWorkspace();
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [recentCollapsed, setRecentCollapsed] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   type Rename = { kind: "task"; project: string; task: string } | { kind: "project"; project: string };
   const [renaming, setRenaming] = useState<Rename | null>(null);
@@ -39,7 +41,12 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   // Parse current selection from pathname
   const selected = parsePathname(pathname);
 
-  useEffect(() => { setCollapsed(loadCollapsed()); }, []);
+  useEffect(() => {
+    setCollapsed(loadCollapsed());
+    try {
+      setRecentCollapsed(localStorage.getItem(RECENT_COLLAPSED_KEY) === "true");
+    } catch { /* ignore */ }
+  }, []);
 
   const updateCollapsed = (project: string, value: boolean) => {
     setCollapsed((prev) => {
@@ -47,6 +54,11 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
       try { localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
+  };
+
+  const updateRecentCollapsed = (value: boolean) => {
+    setRecentCollapsed(value);
+    try { localStorage.setItem(RECENT_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
   };
 
   const visibleProjects = [...projects].sort((a, b) => {
@@ -124,6 +136,23 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
     refresh();
   };
 
+  const markAllTaskSessionsAsRead = async (projectSlug: string, taskSlug: string) => {
+    const unreadSessions = sessions.filter(
+      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && s.unread
+    );
+    if (unreadSessions.length === 0) return;
+    await Promise.all(
+      unreadSessions.map((s) =>
+        fetch(`/api/sessions/${s.id}/seen`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectSlug, taskSlug }),
+        })
+      )
+    );
+    refresh();
+  };
+
   const moveTaskTo = async (fromProject: string, taskSlug: string, toProject: string) => {
     const r = await fetch(`/api/projects/${fromProject}/tasks/${taskSlug}`, {
       method: "PATCH",
@@ -137,17 +166,18 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
 
   const openTaskMenu = (e: React.MouseEvent, projectSlug: string, taskSlug: string) => {
     e.preventDefault();
+    const unreadCount = sessions.filter(
+      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && s.unread
+    ).length;
     const items: MenuItem[] = [
       { label: "Rename  ↵", onClick: () => startRenameTask(projectSlug, taskSlug) },
+      {
+        label: unreadCount > 0 ? `Mark all as read (${unreadCount})` : "Mark all as read",
+        onClick: () => markAllTaskSessionsAsRead(projectSlug, taskSlug),
+        disabled: unreadCount === 0,
+      },
+      { label: "Delete", danger: true, onClick: () => deleteTask(projectSlug, taskSlug) },
     ];
-    for (const p of wipProjects) {
-      if (p.slug === projectSlug) continue;
-      items.push({
-        label: `Move to ${p.slug}`,
-        onClick: () => moveTaskTo(projectSlug, taskSlug, p.slug),
-      });
-    }
-    items.push({ label: "Delete", danger: true, onClick: () => deleteTask(projectSlug, taskSlug) });
     setMenu({ x: e.clientX, y: e.clientY, items });
   };
 
@@ -213,14 +243,30 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
         {/* Recent Sessions */}
         {recentSessions.length > 0 && (
           <div className="mb-3">
-            <div className="px-2 py-1.5 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
-              Recent Sessions
+            <div className="flex items-center gap-1 px-1 py-1.5">
+              <button
+                onClick={() => updateRecentCollapsed(!recentCollapsed)}
+                className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
+                title={recentCollapsed ? "Expand" : "Collapse"}
+              >
+                <svg
+                  width="18" height="18" viewBox="0 0 24 24"
+                  className={`text-[var(--muted)] transition-transform ${recentCollapsed ? "" : "rotate-90"}`}
+                  fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                  aria-hidden
+                ><path d="M9 6l6 6-6 6" /></svg>
+              </button>
+              <span className="text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
+                Recent Sessions
+              </span>
             </div>
-            <div className="space-y-0.5">
-              {recentSessions.map((s) => (
-                <RecentSessionRow key={s.id} session={s} selected={pathname.includes(`/session/${s.id}`)} />
-              ))}
-            </div>
+            {!recentCollapsed && (
+              <div className="space-y-0.5">
+                {recentSessions.map((s) => (
+                  <RecentSessionRow key={s.id} session={s} selected={pathname.includes(`/session/${s.id}`)} />
+                ))}
+              </div>
+            )}
           </div>
         )}
 

@@ -33,14 +33,14 @@ const STATE_LABEL: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "needs your reply",
   running: "working",
   idle: "done",
-  stopped: "stopped",
+  stopped: "done",
   error: "error",
 };
 const STATE_COLOR: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
   idle: "var(--ok)",
-  stopped: "var(--muted)",
+  stopped: "var(--ok)", // same as idle/done
   error: "#dc2626",
 };
 
@@ -308,6 +308,34 @@ export default function TaskPage() {
     setMenu({ x: e.clientX, y: e.clientY, items });
   };
 
+  const markAllSessionsAsRead = async () => {
+    const unreadSessions = taskSessions.filter((s) => s.unread);
+    if (unreadSessions.length === 0) return;
+    await Promise.all(
+      unreadSessions.map((s) =>
+        fetch(`/api/sessions/${s.id}/seen`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectSlug, taskSlug }),
+        })
+      )
+    );
+    refresh();
+  };
+
+  const openSessionsHeaderContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const unreadCount = taskSessions.filter((s) => s.unread).length;
+    const items: MenuItem[] = [
+      {
+        label: unreadCount > 0 ? `Mark all as read (${unreadCount})` : "Mark all as read",
+        onClick: markAllSessionsAsRead,
+        disabled: unreadCount === 0,
+      },
+    ];
+    setMenu({ x: e.clientX, y: e.clientY, items });
+  };
+
   if (!task) {
     return (
       <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
@@ -424,7 +452,10 @@ export default function TaskPage() {
 
           {!dirPath && (
             <div>
-              <div className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-medium mb-2 px-1">
+              <div
+                className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-medium mb-2 px-1 cursor-default"
+                onContextMenu={openSessionsHeaderContextMenu}
+              >
                 Sessions
               </div>
               {taskSessions.length === 0 ? (
