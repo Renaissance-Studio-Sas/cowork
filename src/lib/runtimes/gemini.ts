@@ -203,10 +203,13 @@ class GeminiAgentQuery implements AgentQuery {
       // we generate a stable mapping per turn.
       const callIdToToolUseId = new Map<string, string>();
       // Cap how many model↔tool round-trips we'll do per user message.
-      // cli-core has its own MAX_TURNS (in the hundreds) but we want a
-      // tighter belt-and-braces here too so a runaway agent can't loop
-      // forever on the user's nickel.
-      const MAX_TOOL_ROUNDS = 25;
+      // Matches cli-core's own MAX_TURNS=100. Real codebase exploration
+      // can easily run 30-50 rounds (read file → grep → list dir → read
+      // another → …); the previous 25-round cap aborted legitimate work
+      // mid-flight. 100 still catches runaway loops (model stuck
+      // re-grepping the same thing) without strangling normal multi-step
+      // tool sequences.
+      const MAX_TOOL_ROUNDS = 100;
 
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
