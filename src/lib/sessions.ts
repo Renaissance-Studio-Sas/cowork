@@ -858,12 +858,23 @@ async function pumpEvents(s: RuntimeSession) {
       s.lastActivity = new Date();
       s.events.emit("event", msg);
 
-      // Capture SDK session ID from messages for resumption
-      const msgAny = msg as { session_id?: string };
-      if (msgAny.session_id && !s.sdkSessionId) {
-        s.sdkSessionId = msgAny.session_id;
-        // Persist SDK session ID to meta.json for recovery after server restart
-        void persistSdkSessionId(s);
+      // Track the SDK session ID for resumption. Only `system: init` events
+      // mark the start of a new SDK session — every other event inherits the
+      // current session's id (including subagent messages, which we must NOT
+      // mistake for the parent). Each resume / cwd-change spawns a new init
+      // with a new session_id, so we keep the LATEST one rather than the
+      // first (the prior `!s.sdkSessionId` capture would otherwise stick on
+      // a stale planning-era id and break resume after an adopt).
+      if (msg.type === "system" && (msg as { subtype?: string }).subtype === "init") {
+        const sid = (msg as { session_id?: string }).session_id;
+        if (sid && sid !== s.sdkSessionId) {
+          s.sdkSessionId = sid;
+          // Persist to meta.json so the new id survives restarts. (For
+          // session.projectSlug = "__planning__" persistSdkSessionId is a
+          // no-op; after adoptSessionToProject the slug becomes real and the
+          // next init's id is persisted automatically.)
+          void persistSdkSessionId(s);
+        }
       }
 
       // Emit file_changed when the agent modifies a file so the UI can refresh
@@ -1184,6 +1195,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: { "workbench-planning": planningMcp },
+      // Don't specify model — use SDK default (latest Claude)
     },
   });
 
@@ -1596,4 +1608,25 @@ export async function deleteSession(
   } catch {
     return false;
   }
+}
+
+// Inject a system message into a live session. Used to add confirmation
+// messages (e.g., when a plan is approved) that appear in the chat stream.
+// Returns true if the session was found and message was injected.
+export function injectSystemMessage(id: string, message: string): boolean {
+  const s = registry.get(id);
+  if (!s) return false;
+
+  const msg = {
+    type: "system" as const,
+    subtype: "info" as const,
+    message,
+  } as unknown as SDKMessage;
+
+  s.history.push(msg);
+  s.log.write(JSON.stringify(msg) + "\n");
+  s.events.emit("event", msg);
+  s.lastActivity = new Date();
+
+  return true;
 }

@@ -681,6 +681,7 @@ function PlanApprovalCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const planText = typeof input.plan === "string" ? input.plan : JSON.stringify(input, null, 2);
+  const isPlan = toolName === "ExitPlanMode";
 
   const decide = async (behavior: "allow" | "deny") => {
     if (busy) return;
@@ -698,7 +699,19 @@ function PlanApprovalCard({
         }),
       });
       const j = await r.json();
-      if (!j.ok) setError(j.error ?? "failed");
+      if (!j.ok) {
+        setError(j.error ?? "failed");
+        return;
+      }
+      // Inject a confirmation message into the chat
+      if (behavior === "allow" && isPlan) {
+        const confirmationMessage = "✓ Plan approved. Proceeding with implementation.";
+        await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/inject-message`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: confirmationMessage, role: "system" }),
+        });
+      }
       // SSE permission_resolved event will clear this card from parent state
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -707,7 +720,6 @@ function PlanApprovalCard({
     }
   };
 
-  const isPlan = toolName === "ExitPlanMode";
   return (
     <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-3">
       <div className="flex items-center justify-between mb-2">
@@ -813,7 +825,8 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
     | { kind: "asst-text"; key: string; text: string }
     | { kind: "chip-row"; key: string; chips: Chip[] }
     | { kind: "email-preview"; key: string; part: Part }
-    | { kind: "result"; key: string };
+    | { kind: "result"; key: string }
+    | { kind: "system-info"; key: string; text: string };
 
   const items: Item[] = [];
   let batch: Chip[] = [];
@@ -860,6 +873,12 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
     } else if (mm.type === "result") {
       flush();
       items.push({ kind: "result", key: `r-${i}` });
+    } else if (mm.type === "system") {
+      const sysMsg = m as { subtype?: string; message?: string };
+      if (sysMsg.subtype === "info" && sysMsg.message) {
+        flush();
+        items.push({ kind: "system-info", key: `si-${i}`, text: sysMsg.message });
+      }
     }
   });
   flush();
@@ -925,6 +944,15 @@ function MessageStream({ messages, sessionId }: { messages: SDKMessageLite[]; se
           return (
             <div key={it.key} className="text-[11px] text-[var(--muted)] text-center py-1">
               — turn complete —
+            </div>
+          );
+        }
+        if (it.kind === "system-info") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-[var(--ok-soft)] border border-[var(--ok)] text-[var(--ok)] px-3 py-1.5 text-[12.5px] font-medium">
+                {it.text}
+              </div>
             </div>
           );
         }

@@ -332,7 +332,7 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
         }
       }
 
-      // Step 2: Approve the email
+      // Step 2: Approve the email and get the signature
       const approveR = await fetch(
         `/api/sessions/${encodeURIComponent(sessionId)}/email/${encodeURIComponent(previewIdToUse)}/approve`,
         { method: "POST" }
@@ -344,35 +344,27 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
         return;
       }
 
-      setPreview((p) => p ? { ...p, status: "approved", approvalHash: approveJ.approvalToken } : p);
-      onStatusChange?.("approved", approveJ.approvalToken);
-
-      // Step 3: Actually send the email
+      // Update local state to show sending status
+      setPreview((p) => p ? { ...p, status: "approved", approvalHash: approveJ.approvalToken, ...emailData } : p);
+      setEditMode(false);
       setSending(true);
+
+      // Step 3: Send the email via the server-side endpoint
       const sendR = await fetch(
         `/api/sessions/${encodeURIComponent(sessionId)}/email/${encodeURIComponent(previewIdToUse)}/send`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            approvalToken: approveJ.approvalToken,
-            ...emailData,
-          }),
-        }
+        { method: "POST" }
       );
       const sendJ = await sendR.json();
-
       if (!sendR.ok) {
         setError(sendJ.error ?? "Failed to send email");
-        setPreview((p) => p ? { ...p, status: "approved" } : p);
-        setBusy(false);
         setSending(false);
+        setBusy(false);
         return;
       }
 
-      setPreview((p) => p ? { ...p, status: "sent", ...emailData } : p);
-      onStatusChange?.("sent");
-      setEditMode(false);
+      // Update local state to show sent status
+      setPreview((p) => p ? { ...p, status: "sent" } : p);
+      onStatusChange?.("sent", approveJ.approvalToken);
 
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -432,7 +424,7 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
 
   const statusLabels = {
     pending: "Pending approval",
-    approved: "Sending...",
+    approved: sending ? "Sending..." : "Approved",
     rejected: "Rejected",
     sent: "Sent",
   };
@@ -480,10 +472,9 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
               background: `${statusColors[preview.status]}20`,
             }}
           >
-            {sending && (
-              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+            {preview.status === "approved" && (
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <polyline points="20,6 9,17 4,12" />
               </svg>
             )}
             {statusLabels[preview.status]}
@@ -592,7 +583,7 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
       {isPending && (
         <div className="px-4 py-3 border-t border-[var(--border)] bg-[var(--panel-2)] flex items-center justify-between">
           <div className="text-[11px] text-[var(--muted)]">
-            {editMode ? "Edit the email, then approve to send" : "Review the email above before sending"}
+            {editMode ? "Edit the email, then approve" : "Review the email above"}
           </div>
           <div className="flex gap-2">
             <button
@@ -613,7 +604,7 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                   </svg>
-                  Sending...
+                  {sending ? "Sending..." : "Approving..."}
                 </>
               ) : (
                 "Approve & Send"
@@ -626,11 +617,22 @@ export function EmailPreviewCard({ sessionId, previewId: _previewIdHint, initial
       {preview.status === "approved" && (
         <div className="px-4 py-3 border-t border-[var(--border)] bg-[rgba(234,179,8,0.1)]">
           <div className="flex items-center gap-2 text-[12px] text-[#eab308]">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-            </svg>
-            <span>Sending email...</span>
+            {sending ? (
+              <>
+                <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+                <span>Sending email...</span>
+              </>
+            ) : (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <polyline points="20,6 9,17 4,12" />
+                </svg>
+                <span>Email approved. Waiting to send...</span>
+              </>
+            )}
           </div>
         </div>
       )}

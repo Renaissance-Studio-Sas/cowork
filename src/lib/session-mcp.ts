@@ -11,29 +11,14 @@ import { execSync } from "child_process";
 import { readFileSync, readdirSync, existsSync } from "fs";
 import path from "path";
 import os from "os";
-import { createRequire } from "module";
 
-// Compute path to Claude CLI from the SDK package. Next.js / Turbopack
-// sometimes resolves `@anthropic-ai/claude-agent-sdk` to a bundled or
-// transformed path that doesn't have a `cli.js` sibling. If the computed
-// path doesn't exist as a regular file, fall back to a known-good location
-// inside node_modules (this is the same path Chrome's native-host launcher
-// at ~/.claude/chrome/chrome-native-host uses).
-const require = createRequire(import.meta.url);
-let CLAUDE_CLI_PATH: string;
-try {
-  const sdkPath = require.resolve("@anthropic-ai/claude-agent-sdk");
-  const candidate = path.join(path.dirname(sdkPath), "cli.js");
-  if (existsSync(candidate)) {
-    CLAUDE_CLI_PATH = candidate;
-  } else {
-    // Fall back to node_modules lookup
-    CLAUDE_CLI_PATH = path.join(process.cwd(), "node_modules", "@anthropic-ai", "claude-agent-sdk", "cli.js");
-  }
-} catch {
-  CLAUDE_CLI_PATH = path.join(process.cwd(), "node_modules", "@anthropic-ai", "claude-agent-sdk", "cli.js");
-}
-console.error(`[session-mcp] CLAUDE_CLI_PATH resolved to: ${CLAUDE_CLI_PATH} (exists=${existsSync(CLAUDE_CLI_PATH)})`);
+// SDK 0.3.x no longer ships cli.js — it extracts a native `claude` binary at
+// runtime. Spawn the user-installed global binary instead. Falls back to the
+// PATH lookup if the well-known location isn't there.
+const CLAUDE_BIN_PATH: string = existsSync("/Users/mfucci/.local/bin/claude")
+  ? "/Users/mfucci/.local/bin/claude"
+  : "claude";
+console.error(`[session-mcp] CLAUDE_BIN_PATH resolved to: ${CLAUDE_BIN_PATH}`);
 
 // Chrome profile detection utilities
 interface ChromeProfile {
@@ -45,17 +30,34 @@ interface ChromeProfile {
 
 const CLAUDE_EXTENSION_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn";
 
-// Check if the Chrome native messaging socket exists (indicates extension is connected)
-function getChromeSocketPath(): string {
-  // On macOS, tmpdir() returns /var/folders/... but the socket is in the actual /tmp
-  // The Chrome MCP uses os.tmpdir() which on macOS returns /var/folders/...
+// The native-messaging bridge directory. SDK 0.3.x switched from a single
+// socket file to a directory containing one <pid>.sock file per running
+// native-host instance — this lets multiple Chrome profiles coexist.
+//
+// IMPORTANT: the new `claude` binary hardcodes `/tmp` on darwin/linux for
+// this directory, NOT `os.tmpdir()`. On macOS `os.tmpdir()` returns the
+// per-user `$TMPDIR` (e.g. `/var/folders/.../T/`), so checking there would
+// always come up empty even when the bridge is live in `/tmp`. Pin to `/tmp`
+// on POSIX; fall back to `os.tmpdir()` only on Windows where the binary
+// uses the platform temp dir.
+function getChromeSocketDir(): string {
   const username = os.userInfo().username;
-  return path.join(os.tmpdir(), `claude-mcp-browser-bridge-${username}`);
+  const base = process.platform === "win32" ? os.tmpdir() : "/tmp";
+  return path.join(base, `claude-mcp-browser-bridge-${username}`);
+}
+
+function listChromeSocketFiles(): string[] {
+  const dir = getChromeSocketDir();
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir).filter((f) => f.endsWith(".sock"));
+  } catch {
+    return [];
+  }
 }
 
 function isChromeExtensionConnected(): boolean {
-  const socketPath = getChromeSocketPath();
-  return existsSync(socketPath);
+  return listChromeSocketFiles().length > 0;
 }
 
 // Read Chrome's "Local State" file for cross-profile metadata: which profile
@@ -333,15 +335,16 @@ the user to click anything; the handshake is automatic.`,
           console.error(`[session-mcp] chrome_connect called for sessionId: ${sessionId}`);
 
           // First check if the Chrome extension socket exists
-          const socketPath = getChromeSocketPath();
-          const socketExists = isChromeExtensionConnected();
-          console.error(`[session-mcp] Chrome socket path: ${socketPath}, exists: ${socketExists}`);
+          const socketDir = getChromeSocketDir();
+          const socketFiles = listChromeSocketFiles();
+          const socketExists = socketFiles.length > 0;
+          console.error(`[session-mcp] Chrome socket dir: ${socketDir}, sockets: ${socketFiles.join(", ") || "none"}`);
 
           if (!socketExists) {
             return {
               content: [{
                 type: "text",
-                text: `Chrome native-messaging socket missing (${socketPath}). Spin one up by calling chrome_open_profile with the target profile_id — Chrome will launch a new window in that profile and the extension auto-handshakes (no user click). Wait ~2-3s, then call chrome_connect again. Do not instruct the user to click Connect; the extension claims the socket on its own.`
+                text: `Chrome native-messaging socket missing (no *.sock files in ${socketDir}). Spin one up by calling chrome_open_profile with the target profile_id — Chrome will launch a new window in that profile and the extension auto-handshakes (no user click). Wait ~2-3s, then call chrome_connect again. Do not instruct the user to click Connect; the extension claims the socket on its own.`
               }],
               isError: true,
             };
@@ -374,7 +377,7 @@ the user to click anything; the handshake is automatic.`,
               ...baseStaticMcps(),
               "claude-in-chrome": {
                 type: "stdio" as const,
-                command: CLAUDE_CLI_PATH,
+                command: CLAUDE_BIN_PATH,
                 args: ["--claude-in-chrome-mcp"],
               },
             });
@@ -562,8 +565,9 @@ Use this before any browser tool call to confirm the right account is in
 control. If "Connection: not connected", call chrome_open_profile.`,
         {},
         async () => {
-          const socketPath = getChromeSocketPath();
-          const socketExists = isChromeExtensionConnected();
+          const socketDir = getChromeSocketDir();
+          const socketFiles = listChromeSocketFiles();
+          const socketExists = socketFiles.length > 0;
           const nativeHostPids = findNativeHostPids();
           const localState = readChromeLocalState();
           const expected = expectedProfileBySession.get(sessionId) ?? null;
@@ -589,7 +593,12 @@ control. If "Connection: not connected", call chrome_open_profile.`,
 
           // 2. Bridge plumbing
           lines.push(``, `Bridge:`);
-          lines.push(`  socket: ${socketExists ? "present" : "missing"} (${socketPath})`);
+          lines.push(
+            `  socket dir: ${existsSync(socketDir) ? "present" : "missing"} (${socketDir})`,
+          );
+          lines.push(
+            `  .sock files: ${socketFiles.length > 0 ? `${socketFiles.length} (${socketFiles.join(", ")})` : "none"}`,
+          );
           lines.push(
             `  native-host PIDs: ${nativeHostPids.length > 0 ? nativeHostPids.join(", ") : "none"}`
               + (nativeHostPids.length > 1 ? "  ⚠ multiple — chrome_force_reset recommended" : ""),
@@ -630,6 +639,7 @@ control. If "Connection: not connected", call chrome_open_profile.`,
                 failed: "❌ failed — call chrome_force_reset, then chrome_open_profile",
                 "needs-auth": "⏳ handshake in progress — wait ~2s and re-check",
                 pending: "⏳ pending",
+                disabled: "⏸ disabled",
               }[chromeStatus.status] || chromeStatus.status;
               lines.push(`  claude-in-chrome: ${label}`);
             }
@@ -660,13 +670,15 @@ auto-handshake (no user click needed), then chrome_connect.`,
               killed.push(pid);
             } catch { /* already gone */ }
           }
-          // Best-effort remove stale socket file if it lingers
-          const socketPath = getChromeSocketPath();
-          let socketRemoved = false;
+          // Best-effort remove stale .sock files if any linger. Native hosts
+          // normally clean up on SIGTERM, but kill -9 / crashes can leave
+          // stragglers in the directory.
+          const socketDir = getChromeSocketDir();
+          let socketsRemoved = 0;
           try {
-            if (existsSync(socketPath)) {
-              execSync(`rm -f "${socketPath}"`, { stdio: "ignore" });
-              socketRemoved = true;
+            for (const f of listChromeSocketFiles()) {
+              execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" });
+              socketsRemoved++;
             }
           } catch { /* ignore */ }
           // Forget which profile cowork thought was bound — nothing is now
@@ -675,7 +687,7 @@ auto-handshake (no user click needed), then chrome_connect.`,
 
           const lines = [
             `Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
-            `Socket file: ${socketRemoved ? "removed" : "was not present"}`,
+            `Stale .sock files removed: ${socketsRemoved}`,
             `Last-bound profile: cleared`,
             ``,
             `Next: call chrome_open_profile(profile_id) — Chrome auto-handshakes, no user click — then chrome_connect.`,
@@ -794,13 +806,7 @@ Returns the status and, if approved, the approval token needed to send the email
               break;
             case "approved":
               response.approvalToken = preview.approvalHash;
-              response.message = `Email approved! Run this command to send:\n\n` +
-                `rowads email send-approved --session-id "${sessionId}" --preview-id "${previewId}" ` +
-                `--approval-token "${preview.approvalHash}" --to "${preview.to}" ` +
-                `--subject "${preview.subject.replace(/"/g, '\\"')}" ` +
-                `--body '${preview.body.replace(/'/g, "'\\''")}'` +
-                (preview.cc ? ` --cc "${preview.cc}"` : "") +
-                (preview.threadId ? ` --thread-id "${preview.threadId}"` : "");
+              response.message = "Email approved and being sent by the UI. Check again shortly for 'sent' status.";
               break;
             case "rejected":
               response.message = "User rejected this email. Compose a new version if needed.";

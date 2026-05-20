@@ -512,13 +512,13 @@ async function reconcileSessionDir(
   expectedTask: string,
   expectedCwd: string,
 ): Promise<void> {
-  let entries: Awaited<ReturnType<typeof fs.readdir>>;
+  let entries: import("node:fs").Dirent[];
   try {
-    entries = await fs.readdir(sessDir, { withFileTypes: true });
+    entries = await fs.readdir(sessDir, { withFileTypes: true }) as import("node:fs").Dirent[];
   } catch { return; }
   for (const d of entries) {
     if (!d.isDirectory()) continue;
-    const metaPath = path.join(sessDir, d.name, "meta.json");
+    const metaPath = path.join(sessDir, String(d.name), "meta.json");
     let meta: { project?: string; task?: string; cwd?: string; [k: string]: unknown };
     try {
       meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
@@ -530,7 +530,7 @@ async function reconcileSessionDir(
 
     const oldCwd = typeof meta.cwd === "string" ? meta.cwd : null;
     console.log(
-      `[reconcile] session ${d.name}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
+      `[reconcile] session ${String(d.name)}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
     );
     meta.project = expectedProject;
     meta.task = expectedTask;
