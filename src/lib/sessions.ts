@@ -23,8 +23,29 @@ import { getRuntime } from "./runtimes";
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./workbench-tools/planning";
+import { buildCommentsTools } from "./workbench-tools/comments";
+import { buildSessionTools } from "./workbench-tools/session";
+import { buildEmailTools } from "./workbench-tools/email";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildStaticWorkbenchMcps } from "./claude-chrome-tools";
+import type { WorkbenchTool } from "./workbench-tools/types";
+
+// Build the runtime-agnostic workbench tool groups for a session. Used by
+// the Gemini runtime to register into gemini-cli-core's ToolRegistry; the
+// Claude runtime continues to read the Claude-wrapped versions from
+// `mcpServers` (built via buildStaticWorkbenchMcps). Both paths source
+// from the same underlying tool definitions.
+function buildStaticWorkbenchToolGroups(
+  sessionId: string,
+  projectSlug: string,
+  taskSlug: string,
+): Array<{ name: string; tools: WorkbenchTool[] }> {
+  return [
+    { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
+    { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
+    { name: "workbench-email", tools: buildEmailTools(sessionId) },
+  ];
+}
 import {
   type SessionState,
   isValidTransition,
@@ -778,6 +799,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // ignores this field today and registers workbench tools through its
       // own ToolRegistry path (TODO step 4 of gemini-runtime-parity).
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
+      workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1197,6 +1219,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
+      workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
       ...(systemPrompt ? { systemPrompt } : {}),
       ...(p.model ? { model: p.model } : {}),
     },
@@ -1476,6 +1499,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
+        workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(s.model ? { model: s.model } : {}),
       },

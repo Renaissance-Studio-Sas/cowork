@@ -35,6 +35,8 @@ import type {
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
 } from "../agent-runtime";
+import type { WorkbenchTool } from "../workbench-tools/types";
+import { registerWorkbenchToolsInGemini } from "./gemini-tool-adapter";
 
 const DEFAULT_MODEL = "gemini-3.5-flash";
 
@@ -45,6 +47,7 @@ class GeminiAgentQuery implements AgentQuery {
   private readonly sessionId: string;
   private readonly systemInstruction: string | undefined;
   private readonly abort = new AbortController();
+  private readonly workbenchToolGroups: Array<{ name: string; tools: WorkbenchTool[] }>;
 
   // Lazy: Config + GeminiChat bootstrap is async (refreshAuth → initialize)
   // so we set up on first iteration rather than in the constructor (which
@@ -57,6 +60,7 @@ class GeminiAgentQuery implements AgentQuery {
     this.cwd = opts.cwd || process.cwd();
     this.model = opts.model || DEFAULT_MODEL;
     this.sessionId = `gemini-${randomUUID().slice(0, 8)}`;
+    this.workbenchToolGroups = opts.workbenchToolGroups ?? [];
 
     if (typeof opts.systemPrompt === "object" && opts.systemPrompt) {
       this.systemInstruction = opts.systemPrompt.append;
@@ -68,9 +72,7 @@ class GeminiAgentQuery implements AgentQuery {
   private async bootstrap(): Promise<void> {
     if (this.chat) return;
     // Config is gemini-cli-core's central AgentLoopContext — it owns the
-    // tool registry, MCP client manager, content generator, etc. We feed
-    // it the minimum it needs for plain text chat. When we add tools/MCP
-    // in step 4, this constructor blob expands.
+    // tool registry, MCP client manager, content generator, etc.
     this.config = new Config({
       sessionId: this.sessionId,
       clientName: "cowork",
@@ -86,11 +88,18 @@ class GeminiAgentQuery implements AgentQuery {
     // refreshAuth reads GOOGLE_GENAI_USE_VERTEXAI / GOOGLE_CLOUD_PROJECT
     // from env and wires the content generator for Vertex.
     await this.config.refreshAuth(AuthType.USE_VERTEX_AI);
-    // initialize() builds the tool registry, registers MCP servers from
-    // ConfigParameters.mcpServers (empty for now), and runs other setup.
+    // initialize() builds the tool registry (empty by default), MCP client
+    // manager, etc.
     await this.config.initialize();
 
-    // No tools, no resumed history in step 1.
+    // Register cowork's workbench tools into gemini-cli-core's ToolRegistry
+    // so the agent can call them (comments, planning, email, session). The
+    // Claude-specific chrome_connect/disconnect tools are not in this set —
+    // gemini-cli-core needs its own Chrome integration (out of scope).
+    for (const group of this.workbenchToolGroups) {
+      registerWorkbenchToolsInGemini(this.config, group.tools);
+    }
+
     this.chat = new GeminiChat(this.config, this.systemInstruction, [], []);
   }
 

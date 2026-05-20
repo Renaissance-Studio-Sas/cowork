@@ -70,6 +70,12 @@ export interface AgentQueryOptions {
   // Static MCP servers registered at start; AgentQuery.setMcpServers() can
   // mutate later (e.g. when chrome_connect wires the browser bridge).
   mcpServers?: Record<string, AgentMcpServer>;
+  // Runtime-agnostic in-process tool groups (cowork's workbench tools).
+  // Each runtime's adapter handles registration in its native way: Claude
+  // wraps each group as a createSdkMcpServer MCP and merges into
+  // mcpServers; Gemini registers them as native Tools in gemini-cli-core's
+  // ToolRegistry. See src/lib/workbench-tools/ for definitions.
+  workbenchToolGroups?: Array<{ name: string; tools: import("./workbench-tools/types").WorkbenchTool[] }>;
   // Runtime-specific knobs we don't want to enumerate here pass through
   // verbatim. The runtime implementation is responsible for what it accepts.
   [key: string]: unknown;
