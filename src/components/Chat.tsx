@@ -908,19 +908,8 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       const parts = (mm.message?.content as Part[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
-          // Shell calls get their own row — their command/description tends
-          // to be informative and long, so squeezing them next to other
-          // chips just truncates the useful bit. All other tool calls keep
-          // batching into a compact chip row.
-          const name = (p.name as string) || "";
-          const isShell = name === "Bash" || name.endsWith("run_shell_command");
-          if (isShell) {
-            flush();
-            items.push({ kind: "chip-row", key: `c-${i}-${j}`, chips: [{ kind: "tool", part: p }] });
-          } else {
-            if (!batch.length) batchKey = `c-${i}-${j}`;
-            batch.push({ kind: "tool", part: p });
-          }
+          if (!batch.length) batchKey = `c-${i}-${j}`;
+          batch.push({ kind: "tool", part: p });
         } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
           flush();
           items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
@@ -1139,14 +1128,6 @@ function shortenToolName(name: string): string {
 
 function ToolChip({ p }: { p: Part }) {
   const name = shortenToolName(p.name as string);
-  // Surface a short label for the call when the tool provides one. Gemini's
-  // built-in tools (run_shell_command, edit, write_file, …) pass a
-  // `description` field; for shell calls without a description we fall
-  // back to the command itself; the Claude SDK's Bash tool likewise has a
-  // `description` field. Keeps the chip informative without forcing the
-  // user to expand for context.
-  const input = p.input as Record<string, unknown> | undefined;
-  const summary = chipSummary(p.name as string, input);
   return (
     <details className="group inline-block align-top max-w-full">
       <summary
@@ -1155,54 +1136,12 @@ function ToolChip({ p }: { p: Part }) {
       >
         <span className="text-[9px] opacity-70">▸</span>
         <span className="font-mono shrink-0">{name}</span>
-        {summary && (
-          <span className="text-[var(--text-soft)] truncate max-w-[480px]" title={summary}>
-            · {summary}
-          </span>
-        )}
       </summary>
       <pre className="mt-1 overflow-x-auto text-[11px] text-[var(--text-soft)] bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 max-w-full whitespace-pre-wrap break-words">
         {JSON.stringify(p.input, null, 2)}
       </pre>
     </details>
   );
-}
-
-// Pick the most informative short label for a tool-use chip. Looks for
-// well-known input fields in priority order. Truncates at 120 chars so
-// long shell commands or file paths don't overflow the chip; the full
-// content is still in the expanded view + the title tooltip.
-function chipSummary(toolName: string, input: Record<string, unknown> | undefined): string {
-  if (!input) return "";
-  const pick = (key: string): string => {
-    const v = input[key];
-    return typeof v === "string" ? v : "";
-  };
-  // Prefer an explicit description if present (Gemini's shell/edit tools,
-  // Claude's Bash tool).
-  const desc = pick("description");
-  if (desc) return shorten(desc);
-  // Shell — show the command verbatim.
-  if (toolName.endsWith("run_shell_command") || toolName === "Bash") {
-    const cmd = pick("command");
-    if (cmd) return shorten(cmd.replace(/\s+/g, " "));
-  }
-  // File ops — show the path.
-  for (const k of ["file_path", "filePath", "path", "dir_path"]) {
-    const v = pick(k);
-    if (v) return shorten(v);
-  }
-  // Globs / queries.
-  for (const k of ["pattern", "query"]) {
-    const v = pick(k);
-    if (v) return shorten(v);
-  }
-  return "";
-}
-
-function shorten(s: string): string {
-  const trimmed = s.trim();
-  return trimmed.length > 120 ? trimmed.slice(0, 117) + "…" : trimmed;
 }
 
 function extractText(content: unknown): string {
