@@ -226,6 +226,12 @@ function runWatchdog() {
   touchHeartbeat();
   const now = Date.now();
   for (const s of registry.values()) {
+    // A session blocked on a user decision (ExitPlanMode approval or an
+    // AskUserQuestion) is "running" only because the SDK turn is parked
+    // awaiting the user — no events flow, so lastActivity goes stale even
+    // though nothing is wrong. Don't let the watchdog kill it out from under
+    // a pending card; the user may take minutes to answer.
+    if (s.pendingPermissions.size > 0 || (s.pendingQuestions?.size ?? 0) > 0) continue;
     const sinceActivity = now - s.lastActivity.getTime();
     if (s.state === "running" && sinceActivity > STALE_THRESHOLD_MS) {
       console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(sinceActivity / 1000)}s — auto-stopping`);
