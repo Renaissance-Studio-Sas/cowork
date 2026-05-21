@@ -241,6 +241,7 @@ function runWatchdog() {
           subtype: "error",
           message: "Session timed out due to inactivity",
         } as unknown as SDKMessage);
+        s.interrupted = true;
         s.input.close();
         s.log.end();
         s.inputLog.end();
@@ -931,6 +932,14 @@ function extractModifiedFilePath(msg: SDKMessage): string | null {
   return null;
 }
 
+// When a turn is interrupted, the SDK aborts the in-flight request, which the
+// query iterator surfaces by throwing an abort / "ede_diagnostic" error. That's
+// the expected outcome of a user pressing stop — not a crash — so we recognize
+// it and record a clean "stopped" instead of flipping the session to "error".
+function isInterruptError(message: string): boolean {
+  return /request was aborted|ede_diagnostic|returned an error result/i.test(message);
+}
+
 async function pumpEvents(s: RuntimeSession) {
   try {
     for await (const msg of s.q) {
@@ -941,6 +950,12 @@ async function pumpEvents(s: RuntimeSession) {
       // gets logged. Otherwise events.jsonl bloats ~30× per turn and the
       // in-memory replay buffer grows without bound.
       const isStreamEvent = (msg as { type?: string }).type === "stream_event";
+      // After the user hits Stop, q.interrupt() resolves but the SDK keeps
+      // flushing trailing per-token deltas of the aborted response. Drop them so
+      // the UI stops growing text after Stop. Non-stream events (the interrupt
+      // marker, the final result) still flow through so the log and the
+      // "interrupted" note stay correct — they just won't resurrect state below.
+      if (s.interrupted && isStreamEvent) continue;
       if (!isStreamEvent) {
         s.log.write(JSON.stringify(msg) + "\n");
         s.history.push(msg);
@@ -991,11 +1006,17 @@ async function pumpEvents(s: RuntimeSession) {
             message: errorText,
           } as unknown as SDKMessage);
         }
-        const text = lastAssistantText(s.history);
-        const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
-        setState(s, stateAfterResult(isQuestion));
+        // A user interrupt already drove the session to "stopped"; don't let the
+        // trailing result flip it back to idle/awaiting_input.
+        if (!s.interrupted) {
+          const text = lastAssistantText(s.history);
+          const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
+          setState(s, stateAfterResult(isQuestion));
+        }
       } else if (msg.type === "assistant" || msg.type === "user") {
-        if (s.state !== "running") setState(s, "running");
+        // Buffered in-flight messages arriving after an interrupt must not
+        // resurrect "running" over the user's stop.
+        if (s.state !== "running" && !s.interrupted) setState(s, "running");
       }
     }
     // Only transition to "stopped" if the state machine allows it.
@@ -1009,6 +1030,15 @@ async function pumpEvents(s: RuntimeSession) {
     if (s.state === "running" || s.state === "stopped") return;
 
     const errorMsg = err instanceof Error ? err.message : String(err);
+
+    // A user interrupt aborts the request mid-turn; the iterator then throws an
+    // abort diagnostic. Treat it as a clean stop — the "[Request interrupted by
+    // user]" message the SDK already emitted is what the UI surfaces.
+    if (isInterruptError(errorMsg)) {
+      setState(s, "stopped");
+      return;
+    }
+
     console.error(`[session ${s.id}] Error in pumpEvents:`, errorMsg);
     s.events.emit("event", {
       type: "system",
@@ -1670,6 +1700,9 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     s.input.push(msg);
     s.lastActivity = new Date();
     s.completedAt = null; // Clear completion — session is running again
+    // Clear the interrupt latch — a fresh turn is starting, so the new
+    // pumpEvents loop should track "running" normally again.
+    s.interrupted = false;
     setState(s, "running");
 
     // Start pumping events from the new query
@@ -1691,6 +1724,11 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
 export async function interrupt(id: string): Promise<boolean> {
   const s = registry.get(id);
   if (!s) return false;
+  // Set BEFORE awaiting q.interrupt(): the pumpEvents loop is concurrently
+  // consuming events, and the SDK keeps flushing buffered in-flight messages
+  // while/after the interrupt resolves. The flag tells that loop to stop
+  // resurrecting "running" so the stop actually sticks.
+  s.interrupted = true;
   try {
     await s.q.interrupt();
     setState(s, "stopped");
@@ -1709,6 +1747,7 @@ export function forceStop(id: string): boolean {
   const s = registry.get(id);
   if (!s) return false;
   try {
+    s.interrupted = true;
     setState(s, "stopped");
     s.input.close();
     s.log.end();

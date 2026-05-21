@@ -1094,6 +1094,16 @@ function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: S
   );
 }
 
+// Errors the agent SDK throws when an in-flight turn is interrupted/aborted.
+// These are the expected consequence of a user stopping the agent — not real
+// failures — so we render the neutral interruption note instead of an error
+// box. Matched both for live `system: error` events and when replaying older
+// session logs that persisted the diagnostic before the server-side fix.
+function isInterruptNoise(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return /request was aborted|ede_diagnostic|returned an error result/i.test(text);
+}
+
 // Flatten the message stream into render items, batching consecutive tool
 // calls (across messages) into a single inline-flex row of compact chips.
 // Visible text and user messages break the row.
@@ -1105,6 +1115,7 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
     | { kind: "chip-row"; key: string; chips: Chip[] }
     | { kind: "result"; key: string }
     | { kind: "system-info"; key: string; text: string }
+    | { kind: "system-note"; key: string; text: string }
     | { kind: "system-error"; key: string; text: string };
 
   const items: Item[] = [];
@@ -1129,9 +1140,16 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       // server restart — but it's not actually FROM the user). Surfaced as
       // a small "session resumed" note via system-info instead.
       const isResumePrompt = text === "[Server restarted — please continue where you left off.]";
+      // The SDK injects "[Request interrupted by user]" as a user message when a
+      // turn is stopped. It's not something the user typed — surface it as a
+      // neutral interruption note instead of a chat bubble.
+      const isInterruptNote = text === "[Request interrupted by user]";
       if (isResumePrompt) {
         flush();
         items.push({ kind: "system-info", key: `sr-${i}`, text: "Session resumed after server restart." });
+      } else if (isInterruptNote) {
+        flush();
+        items.push({ kind: "system-note", key: `int-${i}`, text: "Session interrupted by the user." });
       } else if (text) {
         flush();
         items.push({ kind: "user", key: `u-${i}`, text });
@@ -1158,8 +1176,13 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       // A result with is_error (e.g. api_error_status 429 rate limit) means the
       // turn ended in failure. Surface it as an error box; the SDK's `result`
       // text is already human-readable ("You've hit your session limit …").
-      const res = m as { is_error?: boolean; result?: string };
-      if (res.is_error) {
+      const res = m as { is_error?: boolean; result?: string; subtype?: string };
+      // An interrupted turn ends with an "error_during_execution" result (or an
+      // abort diagnostic in `result`). That's the user stopping the agent, not a
+      // failure — the interruption note already covers it, so skip the error box.
+      if (res.subtype === "error_during_execution" || isInterruptNoise(res.result)) {
+        items.push({ kind: "result", key: `r-${i}` });
+      } else if (res.is_error) {
         const text = res.result?.trim() || "The agent stopped due to an error.";
         items.push({ kind: "system-error", key: `re-${i}`, text });
       } else {
@@ -1172,6 +1195,11 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
         items.push({ kind: "system-info", key: `si-${i}`, text: sysMsg.message });
       } else if (sysMsg.subtype === "error" && sysMsg.message) {
         flush();
+        // An interrupt aborts the in-flight SDK request, which can surface as an
+        // abort/"ede_diagnostic" error. Don't render it — the interruption note
+        // already explains what happened. (Older session logs persisted this
+        // before the server-side fix, so keep filtering it on replay.)
+        if (isInterruptNoise(sysMsg.message)) return;
         items.push({ kind: "system-error", key: `se-${i}`, text: sysMsg.message });
       }
     }
@@ -1212,6 +1240,15 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
           return (
             <div key={it.key} className="flex justify-center">
               <div className="rounded-lg bg-[var(--ok-soft)] border border-[var(--ok)] text-[var(--ok)] px-3 py-1.5 text-[12.5px] font-medium">
+                {it.text}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "system-note") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-[var(--bg-2)] border border-[var(--border)] text-[var(--muted)] px-3 py-1.5 text-[12.5px] font-medium">
                 {it.text}
               </div>
             </div>

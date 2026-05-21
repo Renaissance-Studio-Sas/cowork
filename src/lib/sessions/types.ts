@@ -39,6 +39,12 @@ export interface RuntimeSession {
   inputLog: WriteStream;         // input.jsonl
   history: SDKMessage[];         // in-memory replay buffer for new SSE clients
   state: SessionState;
+  // Set true by interrupt()/forceStop() so the running pumpEvents loop knows a
+  // stop is in flight. The SDK keeps delivering buffered in-flight events after
+  // q.interrupt() resolves; without this flag those trailing assistant/result
+  // events flip the session back to "running" and the Stop button looks broken.
+  // Cleared by resumeSession() when a fresh turn starts.
+  interrupted?: boolean;
   // Tool calls awaiting user approval via canUseTool. Keyed by toolUseID.
   // Today this is used for ExitPlanMode (the agent finishes a plan, the SDK
   // asks for user approval before exiting plan mode). The resolver is called
