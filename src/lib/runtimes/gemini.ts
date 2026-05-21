@@ -23,6 +23,7 @@ import {
   GeminiEventType,
   Scheduler,
   MCPServerConfig,
+  getCoreSystemPrompt,
   type GeminiClient,
   type GeminiChat,
   type ServerGeminiStreamEvent,
@@ -153,7 +154,13 @@ class GeminiAgentQuery implements AgentQuery {
     await this.client.initialize();
     this.chat = this.client.getChat();
     if (this.systemInstruction) {
-      this.chat.setSystemInstruction(this.systemInstruction);
+      // Mirror Claude SDK's `{ preset, append }` semantics: keep the
+      // gemini-cli-core default system prompt and append cowork's context
+      // onto it, rather than replacing it. setSystemInstruction is a
+      // wholesale replace, so we recompute the default the same way
+      // GeminiClient.startChat does (client.js:255) and concatenate.
+      const base = getCoreSystemPrompt(this.config, this.config.getSystemInstructionMemory());
+      this.chat.setSystemInstruction(`${base}\n\n${this.systemInstruction}`);
     }
 
     // Reload prior conversation history from disk if this session has
@@ -680,7 +687,7 @@ function translateEvent(
         error?: Error;
       };
       const toolUseId = callIdToToolUseId.get(resp.callId) ?? `toolu_${randomUUID().slice(0, 12)}`;
-      const text = resp.responseParts
+      let text = resp.responseParts
         ?.map((p) => {
           if (typeof p.text === "string") return p.text;
           if (p.functionResponse?.response) return JSON.stringify(p.functionResponse.response);
@@ -688,6 +695,9 @@ function translateEvent(
         })
         .filter(Boolean)
         .join("\n") ?? (resp.error ? String(resp.error.message ?? resp.error) : "");
+      if (text.includes("permission_required")) {
+        text += "\n\nTip: Claude in Chrome uses a per-domain permission model. If this domain is not yet approved, you will see this error. When using browser_batch, the batch is instantly aborted on failure. To request/surface the permission approval flow, try navigating directly via a standalone tool call (e.g. using the navigate tool directly on this tab). This will trigger the permission pop-up which you can then approve in Chrome.";
+      }
       return [{
         type: "user",
         session_id: sessionId,
@@ -741,7 +751,7 @@ function toolResultEventFromCompleted(
   const toolUseId = (callId && callIdToToolUseId.get(callId)) ?? `toolu_${randomUUID().slice(0, 12)}`;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const resp = (c as any).response as { responseParts?: Array<{ text?: string; functionResponse?: { response?: unknown } }>; error?: Error } | undefined;
-  const text = resp?.responseParts
+  let text = resp?.responseParts
     ?.map((p) => {
       if (typeof p.text === "string") return p.text;
       if (p.functionResponse?.response) return JSON.stringify(p.functionResponse.response);
@@ -749,6 +759,9 @@ function toolResultEventFromCompleted(
     })
     .filter(Boolean)
     .join("\n") ?? (resp?.error ? String(resp.error.message ?? resp.error) : "");
+  if (text.includes("permission_required")) {
+    text += "\n\nTip: Claude in Chrome uses a per-domain permission model. If this domain is not yet approved, you will see this error. When using browser_batch, the batch is instantly aborted on failure. To request/surface the permission approval flow, try navigating directly via a standalone tool call (e.g. using the navigate tool directly on this tab). This will trigger the permission pop-up which you can then approve in Chrome.";
+  }
   return {
     type: "user",
     session_id: sessionId,
