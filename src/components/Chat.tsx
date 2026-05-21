@@ -20,6 +20,13 @@ interface UploadedFile {
   size: number;
 }
 
+interface PendingQuestionItem {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: Array<{ label: string; description: string; preview?: string }>;
+}
+
 // Number of messages to load initially and per batch
 const PAGE_SIZE = 50;
 
@@ -46,11 +53,42 @@ interface Props {
   onBack: () => void;
 }
 
+// Draft text persisted in localStorage, keyed by session id. Survives both:
+//   - state transitions inside Chat (live composer ↔ ContinueComposer swap on pause)
+//   - component unmount/remount (navigating away and back)
+// Both composers pass the same sessionId so they share the same storage slot.
+function useStickyDraft(sessionId: string): [string, (v: string) => void] {
+  const storageKey = `wb-draft-${sessionId}`;
+  const [draft, setDraftState] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    try { return localStorage.getItem(storageKey) ?? ""; } catch { return ""; }
+  });
+
+  // If sessionId changes (rare — same Chat instance reused for a different
+  // session), reload the new session's saved draft.
+  const prevKeyRef = useRef(storageKey);
+  useEffect(() => {
+    if (prevKeyRef.current === storageKey) return;
+    prevKeyRef.current = storageKey;
+    try { setDraftState(localStorage.getItem(storageKey) ?? ""); } catch { /* ignore */ }
+  }, [storageKey]);
+
+  const setDraft = useCallback((v: string) => {
+    setDraftState(v);
+    try {
+      if (v) localStorage.setItem(storageKey, v);
+      else localStorage.removeItem(storageKey);
+    } catch { /* ignore */ }
+  }, [storageKey]);
+
+  return [draft, setDraft];
+}
+
 export function Chat({ session, onChange, onBack }: Props) {
   const router = useRouter();
   const [messages, setMessages] = useState<SDKMessageLite[]>([]);
   const [state, setState] = useState<string>("idle");
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useStickyDraft(session.id);
   const [sending, setSending] = useState(false);
   // Track whether we have an active SSE connection (session is truly live)
   const [streamConnected, setStreamConnected] = useState(false);
@@ -76,6 +114,12 @@ export function Chat({ session, onChange, onBack }: Props) {
   // `permission_resolved` (echoed when the user clicks Approve/Deny).
   const [pendingPermissions, setPendingPermissions] = useState<
     Map<string, { toolName: string; input: Record<string, unknown> }>
+  >(new Map());
+
+  // AskUserQuestion calls the agent has parked. Keyed by questionId.
+  // Populated from `question_request`, cleared on `question_resolved`.
+  const [pendingQuestions, setPendingQuestions] = useState<
+    Map<string, { questions: PendingQuestionItem[] }>
   >(new Map());
 
   // Lazy loading state
@@ -126,6 +170,7 @@ export function Chat({ session, onChange, onBack }: Props) {
     setStreamConnected(false);
     setHistoryMeta(null);
     setPendingPermissions(new Map());
+    setPendingQuestions(new Map());
     isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
@@ -239,6 +284,27 @@ export function Chat({ session, onChange, onBack }: Props) {
           if (!prev.has(toolUseId)) return prev;
           const next = new Map(prev);
           next.delete(toolUseId);
+          return next;
+        });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("question_request", (ev) => {
+      try {
+        const { questionId, questions } = JSON.parse((ev as MessageEvent).data);
+        setPendingQuestions((prev) => {
+          const next = new Map(prev);
+          next.set(questionId, { questions });
+          return next;
+        });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("question_resolved", (ev) => {
+      try {
+        const { questionId } = JSON.parse((ev as MessageEvent).data);
+        setPendingQuestions((prev) => {
+          if (!prev.has(questionId)) return prev;
+          const next = new Map(prev);
+          next.delete(questionId);
           return next;
         });
       } catch { /* ignore */ }
@@ -656,6 +722,21 @@ export function Chat({ session, onChange, onBack }: Props) {
         </div>
       )}
 
+      {pendingQuestions.size > 0 && (
+        <div className="border-t border-[var(--border)] px-6 py-3 bg-[var(--bg-2)]">
+          <div className="max-w-[760px] mx-auto space-y-2">
+            {Array.from(pendingQuestions.entries()).map(([questionId, p]) => (
+              <QuestionCard
+                key={questionId}
+                sessionId={session.id}
+                questionId={questionId}
+                questions={p.questions}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="border-t border-[var(--border)] px-6 py-4 bg-[var(--bg)]">
         <div className="max-w-[760px] mx-auto">
           {/* Show ContinueComposer for stopped/error sessions that need resuming,
@@ -800,11 +881,162 @@ function PlanApprovalCard({
   );
 }
 
+// AskUserQuestion card. The agent has parked one or more questions and is
+// blocked on a tool result; submitting here POSTs the user's selections to
+// /api/sessions/[id]/question, which resolves the parked Promise on the
+// server. The SSE `question_resolved` echo then clears this card.
+function QuestionCard({
+  sessionId,
+  questionId,
+  questions,
+}: {
+  sessionId: string;
+  questionId: string;
+  questions: PendingQuestionItem[];
+}) {
+  // selected[i] is the set of option indices the user has picked for
+  // question i. otherText[i] is the free text typed into the "Other" input
+  // for question i. Both feed into the answers payload at submit time.
+  const [selected, setSelected] = useState<Array<Set<number>>>(
+    () => questions.map(() => new Set<number>()),
+  );
+  const [otherText, setOtherText] = useState<string[]>(() => questions.map(() => ""));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggle = (qi: number, oi: number, multi: boolean) => {
+    setSelected((prev) => {
+      const next = prev.map((s) => new Set(s));
+      if (multi) {
+        if (next[qi].has(oi)) next[qi].delete(oi);
+        else next[qi].add(oi);
+      } else {
+        next[qi] = next[qi].has(oi) ? new Set() : new Set([oi]);
+      }
+      return next;
+    });
+  };
+
+  const canSubmit = questions.every((_, qi) => {
+    return selected[qi].size > 0 || otherText[qi].trim().length > 0;
+  });
+
+  const submit = async () => {
+    if (!canSubmit || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const answers = questions.map((q, qi) => {
+        const sel = Array.from(selected[qi]).map((oi) => q.options[oi].label);
+        const other = otherText[qi].trim();
+        const out: { selected?: string[]; other?: string } = {};
+        if (sel.length > 0) out.selected = sel;
+        if (other) out.other = other;
+        return out;
+      });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/question`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questionId, answers }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        setError(j.error ?? "failed");
+        return;
+      }
+      // SSE question_resolved event will clear this card from parent state
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-4 space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] font-semibold text-[var(--accent)]">
+          {questions.length === 1 ? "Agent is asking" : `Agent is asking ${questions.length} questions`}
+        </div>
+        <button
+          onClick={submit}
+          disabled={!canSubmit || busy}
+          className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] disabled:opacity-40 hover:brightness-110 transition"
+        >
+          {busy ? "…" : "Send answer"}
+        </button>
+      </div>
+
+      {questions.map((q, qi) => (
+        <div key={qi} className="space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10.5px] uppercase tracking-wide font-semibold text-[var(--accent)] bg-[var(--accent-soft)] rounded px-1.5 py-0.5">
+              {q.header}
+            </span>
+            {q.multiSelect && (
+              <span className="text-[10.5px] text-[var(--muted)]">multi-select</span>
+            )}
+          </div>
+          <div className="text-[14px] leading-snug">{q.question}</div>
+          <div className="space-y-1.5">
+            {q.options.map((opt, oi) => {
+              const checked = selected[qi].has(oi);
+              return (
+                <label
+                  key={oi}
+                  className={`flex items-start gap-2 rounded-lg border px-3 py-2 cursor-pointer transition ${
+                    checked
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                      : "border-[var(--border)] hover:border-[var(--border-strong)]"
+                  }`}
+                >
+                  <input
+                    type={q.multiSelect ? "checkbox" : "radio"}
+                    name={`q-${questionId}-${qi}`}
+                    checked={checked}
+                    onChange={() => toggle(qi, oi, q.multiSelect)}
+                    className="mt-0.5"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-medium">{opt.label}</div>
+                    <div className="text-[12px] text-[var(--muted)] leading-snug">{opt.description}</div>
+                    {opt.preview && (
+                      <pre className="mt-1 text-[11px] bg-[var(--bg)] rounded px-2 py-1 overflow-x-auto whitespace-pre-wrap">
+                        {opt.preview}
+                      </pre>
+                    )}
+                  </div>
+                </label>
+              );
+            })}
+            <div className="rounded-lg border border-[var(--border)] px-3 py-2">
+              <div className="text-[11.5px] text-[var(--muted)] mb-1">Other</div>
+              <input
+                type="text"
+                value={otherText[qi]}
+                onChange={(e) => setOtherText((prev) => {
+                  const next = [...prev];
+                  next[qi] = e.target.value;
+                  return next;
+                })}
+                placeholder="Type your own answer…"
+                className="w-full bg-transparent outline-none text-[13px] placeholder:text-[var(--muted)]"
+              />
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {error && <div className="text-[12px] text-[#dc2626]">{error}</div>}
+    </div>
+  );
+}
+
 // Composer for past sessions: resume the existing session via the SDK resume
 // mechanism, which preserves full conversation context natively.
 function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: SDKMessageLite[] }) {
   const router = useRouter();
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useStickyDraft(session.id);
   const [busy, setBusy] = useState(false);
 
   const resume = async () => {
@@ -905,6 +1137,12 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
         items.push({ kind: "user", key: `u-${i}`, text });
       }
     } else if (mm.type === "assistant") {
+      // Synthetic assistant messages are SDK-generated error/status carriers
+      // (e.g. rate limits, aborts), not real model output. The matching
+      // `result` message surfaces the error as a proper error box below, so
+      // skip the synthetic text here to avoid rendering it twice.
+      const model = (mm.message as { model?: string } | undefined)?.model;
+      if (model === "<synthetic>") return;
       const parts = (mm.message?.content as Part[] | undefined) ?? [];
       parts.forEach((p, j) => {
         if (p.type === "tool_use") {
@@ -917,7 +1155,16 @@ function MessageStream({ messages }: { messages: SDKMessageLite[] }) {
       });
     } else if (mm.type === "result") {
       flush();
-      items.push({ kind: "result", key: `r-${i}` });
+      // A result with is_error (e.g. api_error_status 429 rate limit) means the
+      // turn ended in failure. Surface it as an error box; the SDK's `result`
+      // text is already human-readable ("You've hit your session limit …").
+      const res = m as { is_error?: boolean; result?: string };
+      if (res.is_error) {
+        const text = res.result?.trim() || "The agent stopped due to an error.";
+        items.push({ kind: "system-error", key: `re-${i}`, text });
+      } else {
+        items.push({ kind: "result", key: `r-${i}` });
+      }
     } else if (mm.type === "system") {
       const sysMsg = m as { subtype?: string; message?: string };
       if (sysMsg.subtype === "info" && sysMsg.message) {

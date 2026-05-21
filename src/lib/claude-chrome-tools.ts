@@ -1,7 +1,7 @@
 // Claude-specific static MCP wiring.
 //
 // Defines buildStaticWorkbenchMcps which wraps static workbench tools
-// (comments and session) as Claude-SDK-compatible MCP servers.
+// (comments, session, user-input) as Claude-SDK-compatible MCP servers.
 
 import {
   type McpSdkServerConfigWithInstance,
@@ -9,6 +9,7 @@ import {
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
+import { buildUserInputTools } from "./workbench-tools/user-input";
 
 // Build the static workbench-MCP map for a session. Used both at session
 // start (in sessions.ts) and inside chrome_connect/disconnect to re-include
@@ -21,5 +22,11 @@ export function buildStaticWorkbenchMcps(
   return {
     "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(projectSlug, taskSlug)),
     "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, projectSlug, taskSlug)),
+    "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(sessionId)),
   };
 }
+
+// Name AskUserQuestion is aliased to inside the SDK's toolAliases option.
+// Kept here so the aliasing site and the MCP registration agree on the
+// concrete `mcp__<server>__<tool>` shape.
+export const ASK_USER_QUESTION_ALIAS = "mcp__workbench-user-input__ask_user_question";

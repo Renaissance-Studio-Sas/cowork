@@ -63,17 +63,30 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
           input: pending.input,
         });
       }
+      // Same idea for AskUserQuestion — show the card immediately so the
+      // user doesn't have to interact-then-refresh to see what's pending.
+      // The `?? []` guards against sessions that landed in the registry
+      // before pendingQuestions was added to RuntimeSession (the in-memory
+      // map survives HMR via globalThis.__wb_session_registry, so adding a
+      // new field to the type doesn't retroactively populate it).
+      for (const [questionId, pending] of (s.pendingQuestions ?? [])) {
+        sendEvent("question_request", { questionId, questions: pending.questions });
+      }
 
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onState = (state: string) => sendEvent("state", { state });
       const onFileChanged = (data: { path: string }) => sendEvent("file_changed", data);
       const onPermissionRequest = (data: unknown) => sendEvent("permission_request", data);
       const onPermissionResolved = (data: unknown) => sendEvent("permission_resolved", data);
+      const onQuestionRequest = (data: unknown) => sendEvent("question_request", data);
+      const onQuestionResolved = (data: unknown) => sendEvent("question_resolved", data);
       s.events.on("event", onEvent);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
       s.events.on("permission_request", onPermissionRequest);
       s.events.on("permission_resolved", onPermissionResolved);
+      s.events.on("question_request", onQuestionRequest);
+      s.events.on("question_resolved", onQuestionResolved);
 
       const heartbeat = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
@@ -86,6 +99,8 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         s.events.off("file_changed", onFileChanged);
         s.events.off("permission_request", onPermissionRequest);
         s.events.off("permission_resolved", onPermissionResolved);
+        s.events.off("question_request", onQuestionRequest);
+        s.events.off("question_resolved", onQuestionResolved);
         try { controller.close(); } catch { /* already closed */ }
       };
 

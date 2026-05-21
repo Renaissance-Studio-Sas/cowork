@@ -1,8 +1,9 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, readFileSync, writeFileSync, type WriteStream } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 // SDKMessage / SDKUserMessage / CanUseTool / PermissionResult are still
 // imported from the Claude SDK because the AgentRuntime interface (see
 // agent-runtime.ts) defines AgentEvent / AgentUserMessage / AgentCanUseTool
@@ -32,8 +33,9 @@ import {
 } from "./workbench-tools/planning";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
+import { buildUserInputTools } from "./workbench-tools/user-input";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
-import { buildStaticWorkbenchMcps } from "./claude-chrome-tools";
+import { buildStaticWorkbenchMcps, ASK_USER_QUESTION_ALIAS } from "./claude-chrome-tools";
 import type { WorkbenchTool } from "./workbench-tools/types";
 
 // Build the runtime-agnostic workbench tool groups for a session. Used by
@@ -49,8 +51,17 @@ function buildStaticWorkbenchToolGroups(
   return [
     { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
     { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
+    { name: "workbench-user-input", tools: buildUserInputTools(sessionId) },
   ];
 }
+
+// Redirects the built-in AskUserQuestion tool the claude_code preset
+// advertises to our workbench-user-input handler. Without this, the model
+// emits AskUserQuestion and the SDK returns "tool not implemented" because
+// only the type exists.
+const STATIC_TOOL_ALIASES: Record<string, string> = {
+  AskUserQuestion: ASK_USER_QUESTION_ALIAS,
+};
 import {
   type SessionState,
   isValidTransition,
@@ -70,6 +81,7 @@ export type {
   SessionRuntime,
   RuntimeSession,
   PendingPermission,
+  PendingQuestion,
   SessionSummary,
 } from "./sessions/types";
 
@@ -77,6 +89,7 @@ import type {
   SessionRuntime,
   RuntimeSession,
   PendingPermission,
+  PendingQuestion,
   SessionSummary,
 } from "./sessions/types";
 
@@ -95,6 +108,21 @@ declare global {
 }
 const registry: Map<string, RuntimeSession> =
   globalThis.__wb_session_registry ?? (globalThis.__wb_session_registry = REGISTRY);
+
+// Backfill fields added to RuntimeSession after the registry was first
+// populated. In Next.js dev, the registry is preserved across HMR via
+// globalThis, but the session objects inside it keep the shape they had
+// at insertion time. When a required field is added to RuntimeSession
+// (e.g. `pendingQuestions` for AskUserQuestion), any session that predates
+// the schema change still has `undefined` there — and code paths that read
+// it (the SSE stream route iterating `s.pendingQuestions`) throw a TypeError
+// and return HTTP 500, which leaves the UI unable to attach to the session
+// or send messages. Backfill so existing sessions stay usable.
+for (const s of registry.values()) {
+  if (!s.pendingQuestions) {
+    (s as RuntimeSession).pendingQuestions = new Map();
+  }
+}
 
 // Fires "added" with the new RuntimeSession when a session is added to the
 // registry. Lets multiplexed SSE endpoints attach listeners to sessions that
@@ -147,6 +175,43 @@ const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback wit
 const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 
+// Heartbeat used to distinguish a genuine cold start (the whole `next dev`
+// process tree was down) from Next.js dev churn — HMR re-evals and worker /
+// helper-process recycles that all re-run this module's top-level code. Auto-
+// resume must only fire on a true restart; otherwise every churn re-pushes a
+// "[Server restarted...]" prompt into whatever session was mid-turn (we've
+// seen 16+ stack up in a single uninterrupted dev run). A PID guard is no good
+// here because in dev there is no single stable "server" PID — parent, worker
+// and short-lived helpers all execute this file under different PIDs. Instead
+// the watchdog touches a heartbeat file every minute while *any* part of the
+// tree is alive; on boot, a fresh heartbeat means the server was up moments
+// ago (churn → skip), a stale/absent one means a real cold start (→ resume).
+const HEARTBEAT_FILE = path.join(
+  os.tmpdir(),
+  `cowork-server-${createHash("sha1").update(process.cwd()).digest("hex").slice(0, 8)}.heartbeat`,
+);
+const HEARTBEAT_STALE_MS = 2 * WATCHDOG_INTERVAL_MS; // tolerate one missed tick
+
+function touchHeartbeat(): void {
+  // Sync write: called from setInterval and boot init where we don't await.
+  try { writeFileSync(HEARTBEAT_FILE, String(Date.now())); } catch { /* best effort */ }
+}
+
+// True iff the heartbeat is stale/absent — i.e. the server tree was NOT alive
+// within the last couple of watchdog intervals, so this boot is a real cold
+// start rather than dev churn. Touches the heartbeat before returning so the
+// next churn within this same tree sees it fresh even before the first
+// watchdog tick lands.
+function isColdStart(): boolean {
+  let cold = true;
+  try {
+    const ts = parseInt(readFileSync(HEARTBEAT_FILE, "utf8"), 10);
+    if (Number.isFinite(ts) && Date.now() - ts < HEARTBEAT_STALE_MS) cold = false;
+  } catch { /* missing/unreadable → cold start */ }
+  touchHeartbeat();
+  return cold;
+}
+
 // Runtime contract: any session whose streams have been closed MUST be in
 // state "stopped". sendInput dispatches by state — "running"/"idle" goes to
 // the live-write path that pushes into the InputChannel and writes to
@@ -156,6 +221,9 @@ const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 // state to stopped together. resumeSession is responsible for re-opening
 // streams when the user sends another message.
 function runWatchdog() {
+  // Mark the server tree as alive so a boot that follows soon after is
+  // recognised as dev churn rather than a cold start (see isColdStart).
+  touchHeartbeat();
   const now = Date.now();
   for (const s of registry.values()) {
     const sinceActivity = now - s.lastActivity.getTime();
@@ -204,9 +272,19 @@ if (!globalThis.__wb_watchdog_interval) {
 // Defer to the next tick because sessions.ts ↔ fs.ts is a circular import;
 // calling the reconciler synchronously here would hit a TDZ error on
 // PROJECTS_DIR depending on which module the loader entered first.
+//
+// Two guards, because neither alone is enough in Next.js dev:
+//   - globalThis.__wb_reconciled is a fast in-process flag, but dev sometimes
+//     re-evals this module in a fresh VM context whose globalThis isn't shared,
+//     so the flag reads `undefined` and we'd run again.
+//   - isColdStart() is the real gate: it consults the on-disk heartbeat to tell
+//     a true cold start (resume interrupted sessions) from dev churn — HMR and
+//     worker/helper recycles that all re-run this top-level code (skip, so we
+//     don't spam "[Server restarted...]" prompts).
 if (!globalThis.__wb_reconciled) {
   globalThis.__wb_reconciled = true;
   setImmediate(async () => {
+    if (!isColdStart()) return;
     await reconcileSessionsOnDisk();
     // Resume sessions that were mid-process when the server died. Awaited
     // after reconcile so we read freshly-corrected (projectSlug, taskSlug,
@@ -269,8 +347,35 @@ export function resolvePermission(
   return true;
 }
 
+// Resolve a pending AskUserQuestion. Called by /api/sessions/[id]/question
+// when the user submits their selections in the UI. Returns false if the
+// session or pending question can't be found (already answered, or the
+// id is stale).
+export function resolveQuestion(
+  id: string,
+  questionId: string,
+  answers: Array<{ selected?: string[]; other?: string }>,
+): boolean {
+  const s = registry.get(id);
+  if (!s) return false;
+  const pending = s.pendingQuestions.get(questionId);
+  if (!pending) return false;
+  pending.resolve(answers);
+  s.pendingQuestions.delete(questionId);
+  // Echo so any other clients viewing this session can clear their card.
+  s.events.emit("question_resolved", { questionId });
+  return true;
+}
+
 export function getSession(id: string): RuntimeSession | undefined {
-  return registry.get(id);
+  const s = registry.get(id);
+  // The session registry is preserved across Next.js HMR via globalThis,
+  // so sessions created before a field was added to RuntimeSession can be
+  // missing that field after a hot reload. Backfill pendingQuestions
+  // lazily so call sites (stream route, resolveQuestion) can iterate it
+  // without crashing. Cheap one-time-per-stale-session no-op.
+  if (s && !s.pendingQuestions) s.pendingQuestions = new Map();
+  return s;
 }
 
 // Expose the live SDK Query for a session so MCP tools (chrome_connect /
@@ -551,6 +656,7 @@ export async function restoreSession(
   const events = new EventEmitter();
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
+  const pendingQuestions = new Map<string, PendingQuestion>();
 
   // Don't create file streams yet — they'll be created on resume
   const sink = createWriteStream("/dev/null");
@@ -578,6 +684,7 @@ export async function restoreSession(
     // the next user message would silently write to closed streams.
     state: "stopped",
     pendingPermissions,
+    pendingQuestions,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
@@ -732,6 +839,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   const events = new EventEmitter();
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
+  const pendingQuestions = new Map<string, PendingQuestion>();
 
   // First message
   const firstMsg = makeUserMessage(p.firstMessage, id);
@@ -748,6 +856,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
+      toolAliases: STATIC_TOOL_ALIASES,
       // Static workbench MCPs (comments, session-management, chrome
       // connect/disconnect) wrapped for Claude here. Gemini's runtime
       // adapter consumes workbenchToolGroups instead, registering them
@@ -779,6 +888,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     history: [],
     state: "running",
     pendingPermissions,
+    pendingQuestions,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1149,6 +1259,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   const events = new EventEmitter();
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
+  const pendingQuestions = new Map<string, PendingQuestion>();
 
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(makeUserMessage(p.firstMessage, id));
@@ -1164,6 +1275,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       permissionMode: p.permissionMode ?? "bypassPermissions",
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
+      toolAliases: STATIC_TOOL_ALIASES,
       mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
       runtimeStateDir: sessionDir,
@@ -1192,6 +1304,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     history: [firstUserEcho],
     state: "running",
     pendingPermissions,
+    pendingQuestions,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1217,6 +1330,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
   const events = new EventEmitter();
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
+  const pendingQuestions = new Map<string, PendingQuestion>();
 
   input.push(makeUserMessage(firstMessage, id));
 
@@ -1231,8 +1345,12 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
       systemPrompt: { type: "preset", preset: "claude_code", append: PLANNING_SYSTEM_PROMPT },
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
+      toolAliases: STATIC_TOOL_ALIASES,
       mcpServers: {
         "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildPlanningTools()),
+        // toolAliases above redirects AskUserQuestion here, so the MCP
+        // backing it has to be registered even for planning sessions.
+        "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(id)),
       },
       // Don't specify model — use SDK default (latest Claude)
     },
@@ -1260,6 +1378,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     history: [firstUserEcho],
     state: "running",
     pendingPermissions,
+    pendingQuestions,
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
@@ -1291,6 +1410,7 @@ export async function startTaskPlanningSession(
   const events = new EventEmitter();
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
+  const pendingQuestions = new Map<string, PendingQuestion>();
 
   input.push(makeUserMessage(firstMessage, id));
 
@@ -1309,8 +1429,10 @@ export async function startTaskPlanningSession(
       systemPrompt: { type: "preset", preset: "claude_code", append },
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
+      toolAliases: STATIC_TOOL_ALIASES,
       mcpServers: {
         "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildTaskPlanningTools()),
+        "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(id)),
       },
     },
   });
@@ -1336,6 +1458,7 @@ export async function startTaskPlanningSession(
     history: [firstUserEcho],
     state: "running",
     pendingPermissions,
+    pendingQuestions,
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
@@ -1521,6 +1644,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
+        toolAliases: STATIC_TOOL_ALIASES,
         mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
         runtimeStateDir: sessionDir,

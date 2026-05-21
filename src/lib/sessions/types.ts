@@ -44,6 +44,11 @@ export interface RuntimeSession {
   // asks for user approval before exiting plan mode). The resolver is called
   // by the /api/sessions/[id]/permission endpoint with the user's decision.
   pendingPermissions: Map<string, PendingPermission>;
+  // Questions the agent is waiting on (AskUserQuestion). Keyed by a question
+  // id we generate at park time. The resolver is called by
+  // /api/sessions/[id]/question with the user's selected answers, and its
+  // return is what the agent sees as the tool_result.
+  pendingQuestions: Map<string, PendingQuestion>;
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
@@ -54,6 +59,23 @@ export interface PendingPermission {
   toolName: string;
   input: Record<string, unknown>;
   resolve: (r: PermissionResult) => void;
+  requestedAt: Date;
+}
+
+// One AskUserQuestion call parked on the session. The agent's tool handler
+// returns once `resolve` is invoked with the user's selections.
+export interface AskUserQuestionItem {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: Array<{ label: string; description: string; preview?: string }>;
+}
+
+export interface PendingQuestion {
+  questions: AskUserQuestionItem[];
+  // Each question gets back either an array of selected option labels (from
+  // the provided list) or a single free-text answer typed under "Other".
+  resolve: (answers: Array<{ selected?: string[]; other?: string }>) => void;
   requestedAt: Date;
 }
 
