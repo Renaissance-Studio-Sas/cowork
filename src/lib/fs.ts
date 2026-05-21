@@ -4,43 +4,6 @@ import path from "node:path";
 import matter from "gray-matter";
 import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
 
-// The Claude Agent SDK stores per-session transcripts under
-// `~/.claude/projects/<encoded-cwd>/<sdkSessionId>.jsonl`, where encoded-cwd
-// is the absolute cwd with `/` swapped for `-`. When we rename or move a
-// project/task folder, the cwd of every session in it changes — and the SDK
-// won't find the prior transcript at the new encoded path. Resuming silently
-// fails: only an `init` event is emitted and the agent never replies. Rename
-// the SDK transcript directories alongside the project/task folders so resume
-// keeps working.
-//
-// Exported so the startup reconciliation pass (reconcileSessionsOnDisk) can
-// also call it when it detects that a session's meta.json cwd drifted from
-// the folder it actually lives in.
-export async function relocateSdkTranscripts(oldAbsPath: string, newAbsPath: string): Promise<void> {
-  const encode = (p: string) => p.replaceAll("/", "-");
-  const base = path.join(os.homedir(), ".claude", "projects");
-  const oldPrefix = encode(oldAbsPath);
-  const newPrefix = encode(newAbsPath);
-  let entries: string[];
-  try {
-    entries = await fs.readdir(base);
-  } catch { return; }
-  // Match the project/task itself plus any descendant task dirs whose encoded
-  // names share that prefix (e.g. renaming a project also relocates its tasks).
-  for (const name of entries) {
-    if (name !== oldPrefix && !name.startsWith(oldPrefix + "-")) continue;
-    const renamed = newPrefix + name.slice(oldPrefix.length);
-    try {
-      await fs.rename(path.join(base, name), path.join(base, renamed));
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e.code !== "ENOENT") {
-        console.warn(`[fs] could not relocate SDK transcripts ${name} → ${renamed}:`, e.message);
-      }
-    }
-  }
-}
-
 // Workspace root: the user's own repo / folder that contains `projects/` plus any
 // shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get read/write
 // access to this whole tree via `additionalDirectories` so they can pull in
@@ -280,7 +243,11 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
   const oldPath = path.join(PROJECTS_DIR, project.folderName);
   const newPath = path.join(PROJECTS_DIR, newFolder);
   await fs.rename(oldPath, newPath);
-  await relocateSdkTranscripts(oldPath, newPath);
+  // Note: no SDK-transcript rename needed. Sessions run with cwd=WORKSPACE_ROOT,
+  // so all transcripts live in a single workspace-keyed directory regardless of
+  // which project/task owns the session — renaming a project doesn't change
+  // that path. (Earlier versions did rename per-project transcript dirs but
+  // the prefix-match was buggy and corrupted directory names on every boot.)
   relocateSessionsForProject(slug, clean);
 }
 
@@ -306,7 +273,7 @@ export async function setTaskStatus(projectSlug: string, taskSlug: string, statu
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
   await fs.rename(oldPath, newPath);
-  await relocateSdkTranscripts(oldPath, newPath);
+  // No SDK-transcript rename needed — see renameProject for rationale.
 }
 
 export async function moveTask(projectSlug: string, taskSlug: string, toProjectSlug: string): Promise<{ project: string; task: string }> {
@@ -326,7 +293,7 @@ export async function moveTask(projectSlug: string, taskSlug: string, toProjectS
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, dest.folderName, newFolder);
   await fs.rename(oldPath, newPath);
-  await relocateSdkTranscripts(oldPath, newPath);
+  // No SDK-transcript rename needed — see renameProject for rationale.
   relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
   return { project: toProjectSlug, task: finalSlug };
 }
@@ -344,7 +311,7 @@ export async function renameTask(projectSlug: string, taskSlug: string, newSlug:
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
   await fs.rename(oldPath, newPath);
-  await relocateSdkTranscripts(oldPath, newPath);
+  // No SDK-transcript rename needed — see renameProject for rationale.
   relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
 }
 
@@ -478,8 +445,23 @@ export async function deleteFile(projectSlug: string, taskSlug: string, rel: str
 // rename API (e.g. directly in Finder). Without this, sendInput → resumeSession
 // → getProject(staleSlug) returns null and the session is silently broken.
 //
-// Also relocates the SDK transcript directory if the cwd changed, so
-// resume(sdkSessionId) keeps working.
+// The agent's runtime cwd is always WORKSPACE_ROOT (see startSession) — this
+// is independent of the project/task the session belongs to. So every
+// session's meta.cwd should equal WORKSPACE_ROOT, no matter where its folder
+// lives. There is nothing to relocate at the SDK transcript level because
+// every session's transcript lives in the same `~/.claude/projects/<encode(WORKSPACE_ROOT)>/`
+// directory regardless of project/task.
+//
+// History: this used to set meta.cwd = taskCwd and call relocateSdkTranscripts
+// on every drift. After the WORKSPACE_ROOT cwd refactor, every session was
+// flagged as drifted on every boot, and the relocate call's prefix matcher
+// `name.startsWith(oldPrefix + "-")` would match the workspace transcript dir
+// itself plus every previously-mangled dir. So each task iteration appended
+// another `-projects-wip-X-wip-Y` segment to every transcript dir, leaving
+// SDK transcripts at increasingly absurd nested paths that resume() couldn't
+// find. The current implementation only writes meta.json and skips the
+// rename entirely — the SDK transcript dir for any new session is always
+// the correct one, and the in-place rename was the source of the corruption.
 //
 // Called once on module load with a globalThis guard for HMR. Best effort —
 // failures are logged but never throw.
@@ -487,16 +469,14 @@ export async function reconcileSessionsOnDisk(): Promise<void> {
   try {
     const projects = await listProjects();
     for (const p of projects) {
-      const projectCwd = path.join(PROJECTS_DIR, p.folderName);
       await reconcileSessionDir(
-        path.join(projectCwd, "sessions"),
-        p.slug, "", projectCwd,
+        path.join(PROJECTS_DIR, p.folderName, "sessions"),
+        p.slug, "",
       );
       for (const t of p.tasks) {
-        const taskCwd = path.join(projectCwd, t.folderName);
         await reconcileSessionDir(
-          path.join(taskCwd, "sessions"),
-          p.slug, t.slug, taskCwd,
+          path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
+          p.slug, t.slug,
         );
       }
     }
@@ -510,7 +490,6 @@ async function reconcileSessionDir(
   sessDir: string,
   expectedProject: string,
   expectedTask: string,
-  expectedCwd: string,
 ): Promise<void> {
   let entries: import("node:fs").Dirent[];
   try {
@@ -519,22 +498,23 @@ async function reconcileSessionDir(
   for (const d of entries) {
     if (!d.isDirectory()) continue;
     const metaPath = path.join(sessDir, String(d.name), "meta.json");
-    let meta: { project?: string; task?: string; cwd?: string; [k: string]: unknown };
+    let meta: { project?: string; task?: string; cwd?: string; sdkSessionId?: string; [k: string]: unknown };
     try {
       meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
     } catch { continue; }
     const projectDrift = meta.project !== expectedProject;
     const taskDrift = (meta.task ?? "") !== expectedTask;
-    const cwdDrift = meta.cwd !== expectedCwd;
+    const cwdDrift = meta.cwd !== WORKSPACE_ROOT;
     if (!projectDrift && !taskDrift && !cwdDrift) continue;
 
     const oldCwd = typeof meta.cwd === "string" ? meta.cwd : null;
+    const sdkSessionId = typeof meta.sdkSessionId === "string" ? meta.sdkSessionId : null;
     console.log(
       `[reconcile] session ${String(d.name)}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
     );
     meta.project = expectedProject;
     meta.task = expectedTask;
-    meta.cwd = expectedCwd;
+    meta.cwd = WORKSPACE_ROOT;
     try {
       await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
     } catch (err) {
@@ -543,8 +523,36 @@ async function reconcileSessionDir(
       continue;
     }
 
-    if (oldCwd && oldCwd !== expectedCwd) {
-      await relocateSdkTranscripts(oldCwd, expectedCwd);
+    // Legacy sessions had meta.cwd = task folder, and their SDK transcript
+    // lives in the task-folder-encoded directory. Move just that session's
+    // jsonl to the WORKSPACE_ROOT-encoded directory so `resume({ cwd })` can
+    // find it. We intentionally do NOT rename the encoded directory itself:
+    // that's what produced the concatenated-path corruption in the old
+    // implementation — see reconcileSessionsOnDisk's comment for details.
+    if (oldCwd && oldCwd !== WORKSPACE_ROOT && sdkSessionId) {
+      await moveSdkTranscriptFile(sdkSessionId, oldCwd, WORKSPACE_ROOT);
+    }
+  }
+}
+
+// Move a single SDK transcript jsonl from one cwd's encoded directory to
+// another's. No-op if the source is missing.
+async function moveSdkTranscriptFile(
+  sdkSessionId: string,
+  oldCwd: string,
+  newCwd: string,
+): Promise<void> {
+  const encode = (p: string) => p.replaceAll("/", "-");
+  const base = path.join(os.homedir(), ".claude", "projects");
+  const src = path.join(base, encode(oldCwd), `${sdkSessionId}.jsonl`);
+  const dst = path.join(base, encode(newCwd), `${sdkSessionId}.jsonl`);
+  try {
+    await fs.mkdir(path.dirname(dst), { recursive: true });
+    await fs.rename(src, dst);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "ENOENT") {
+      console.warn(`[reconcile] could not move SDK transcript ${src} → ${dst}:`, e.message);
     }
   }
 }
