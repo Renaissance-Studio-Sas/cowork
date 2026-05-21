@@ -10,6 +10,8 @@ const nextConfig: NextConfig = {
     "@google/gemini-cli-core",
     "better-sqlite3",
     "chokidar",
+    // server-only; we attach over CDP, no bundled browser
+    "playwright-core",
   ],
 };
 

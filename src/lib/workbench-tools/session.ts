@@ -25,6 +25,11 @@ import {
 import { buildStaticWorkbenchMcps } from "../claude-chrome-tools";
 import { defineTool, type WorkbenchTool } from "./types";
 
+// Legacy Claude-in-Chrome bridge tools are gated behind BROWSER_BACKEND.
+// Default ("chrome-mcp") keeps them; "control-plane" hides them in favour of
+// the workbench-browser tools (steelyard + Playwright).
+const BROWSER_BACKEND = (process.env.BROWSER_BACKEND ?? "chrome-mcp").toLowerCase();
+
 export function buildSessionTools(
   sessionId: string,
   _projectSlug: string,
@@ -69,6 +74,7 @@ Do NOT include filler words like "Implemented", "Updated", "Changed" unless nece
       },
     ),
 
+    ...(BROWSER_BACKEND === "chrome-mcp" ? [
     defineTool(
       "chrome_list_profiles",
       `List all Chrome profiles on this machine and their Claude extension status.
@@ -452,5 +458,6 @@ Use this to release the Chrome connection, for example before switching to a dif
         }
       }
     ),
+    ] : []),
   ];
 }
