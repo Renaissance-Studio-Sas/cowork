@@ -31,6 +31,31 @@ export function buildPlanningTools(): WorkbenchTool[] {
   ];
 }
 
+// Counterpart for the "New task" chat modal. The agent proposes a single
+// task scoped to an existing project; the browser watches for the tool_use
+// and renders an editable card. Accepting the card creates the task and
+// writes `task_description` verbatim into `task.md`.
+export function buildTaskPlanningTools(): WorkbenchTool[] {
+  return [
+    defineTool(
+      "propose_task",
+      "Propose a single task to the user. Call this once you have enough context. The user will see your proposal as an editable card and can accept or revise it.",
+      {
+        task_slug: z.string().describe("Human-readable task name with proper case and spaces, e.g. 'Draft Email to School', 'Collect Receipts'. NOT kebab-case. The folder name is the display name."),
+        task_description: z.string().describe("The brief that will be written verbatim into task.md. Markdown is fine — use it to capture goals, constraints, inputs/outputs, and any decisions made in this chat. Aim for something a future agent can pick up cold without needing the conversation."),
+      },
+      async ({ task_slug }) => {
+        return {
+          content: [{
+            type: "text",
+            text: `Proposed task "${task_slug}". Waiting for the user to accept or revise.`,
+          }],
+        };
+      },
+    ),
+  ];
+}
+
 export const PLANNING_SYSTEM_PROMPT = `You are helping the user set up a new project in their personal task management system called "Coworking Space".
 
 A project is a folder of related work. Each project contains tasks. Each task is a coherent piece of work an AI agent can help with later.
@@ -54,3 +79,43 @@ Your job:
 
 Keep your messages short and conversational. Don't bullet-list options — ask focused questions. The user is moving fast; be brief.
 `;
+
+// System prompt for the "New task" chat. The project context (slug,
+// description, existing task slugs) is interpolated in so the agent can
+// fit the new task naturally and avoid duplicates without having to walk
+// the filesystem first.
+export function buildTaskPlanningSystemPrompt(
+  projectSlug: string,
+  projectFolder: string,
+  projectDescription: string,
+  existingTaskSlugs: string[],
+): string {
+  const existing = existingTaskSlugs.length
+    ? existingTaskSlugs.map((s) => `  - ${s}`).join("\n")
+    : "  _(none yet)_";
+  const desc = projectDescription.trim() || "_(project.md is empty)_";
+  return `You are helping the user define a new task in the project "${projectSlug}" within their personal task management system "Coworking Space".
+
+A task is a coherent piece of work an AI agent can later pick up and execute. The goal of this chat is to produce a clean \`task.md\` brief — written so a future agent can start cold without re-asking the user.
+
+**Project context**
+- Slug: \`${projectSlug}\`
+- Folder: \`projects/${projectFolder}/\` (read \`files/project.md\` for the full description)
+- Description: ${desc}
+- Existing tasks:
+${existing}
+
+The workspace structure and conventions are documented in the repo's CLAUDE.md — read it if you haven't already. Read related task.md files in this project if it helps you pick a name that fits.
+
+**Naming convention**: task names are **human-readable, with proper case and spaces** — they are the literal folder names. Use "Draft Email to School" not "draft-email-to-school". Capitalize like a title (articles/prepositions lowercase mid-name). Keep names short (2-4 words). Avoid collisions with existing tasks above.
+
+Your job:
+1. Ask the user (one short question at a time) what the task is about and what "done" looks like.
+2. Once you have enough context — usually after 1-3 questions — call the \`propose_task\` tool with:
+   - \`task_slug\`: human-readable task name
+   - \`task_description\`: the full brief that will be written verbatim into task.md. Use markdown. Include goals, inputs, outputs, constraints, and any decisions surfaced in this chat. This is the artifact — make it good.
+3. After proposing, wait. If the user revises, propose again with the changes.
+
+Keep your messages short and conversational. The user is moving fast; be brief.
+`;
+}

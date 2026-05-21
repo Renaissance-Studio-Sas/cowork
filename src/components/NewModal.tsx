@@ -146,6 +146,7 @@ interface ChatMsg {
   role: "user" | "assistant";
   text: string;
   proposal?: ProposedPlan;
+  taskProposal?: ProposedTask;
   toolUseId?: string;
 }
 
@@ -452,7 +453,10 @@ function PlanCard({
 }
 
 // -----------------------------------------------------------------------
-// NewTaskModal (unchanged from before, kept here for co-location)
+// NewTaskModal — chat-first like NewProjectModal. The agent proposes a
+// single { slug, description } card scoped to the given project; the user
+// edits inline and accepts to materialize the task. A "quick" form is
+// still reachable as an escape hatch.
 // -----------------------------------------------------------------------
 
 export function NewTaskModal({
@@ -463,6 +467,35 @@ export function NewTaskModal({
   projectSlug: string;
   onClose: () => void;
   onCreated: (slug: string) => void;
+}) {
+  const [mode, setMode] = useState<"chat" | "quick">("chat");
+  return mode === "chat" ? (
+    <ChatTaskModal
+      projectSlug={projectSlug}
+      onClose={onClose}
+      onCreated={onCreated}
+      onSwitchToQuick={() => setMode("quick")}
+    />
+  ) : (
+    <QuickTaskModal
+      projectSlug={projectSlug}
+      onClose={onClose}
+      onCreated={onCreated}
+      onSwitchToChat={() => setMode("chat")}
+    />
+  );
+}
+
+function QuickTaskModal({
+  projectSlug,
+  onClose,
+  onCreated,
+  onSwitchToChat,
+}: {
+  projectSlug: string;
+  onClose: () => void;
+  onCreated: (slug: string) => void;
+  onSwitchToChat: () => void;
 }) {
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
@@ -487,10 +520,11 @@ export function NewTaskModal({
   return (
     <ModalShell
       title={`New task in ${projectSlug}`}
-      subtitle="Briefly describe the work."
+      subtitle="Quick form. Switch to chat for a guided setup."
       onClose={onClose}
       footer={
         <>
+          <button onClick={onSwitchToChat} className="mr-auto text-[12.5px] text-[var(--accent)] hover:underline">↩ Plan with an agent</button>
           <button onClick={onClose} className="text-[13px] text-[var(--text-soft)] px-3 py-2 hover:bg-[var(--panel-2)] rounded-lg">Cancel</button>
           <button
             onClick={submit}
@@ -520,6 +554,244 @@ export function NewTaskModal({
         />
       </Field>
     </ModalShell>
+  );
+}
+
+interface ProposedTask {
+  task_slug: string;
+  task_description: string;
+}
+
+function ChatTaskModal({
+  projectSlug,
+  onClose,
+  onCreated,
+  onSwitchToQuick,
+}: {
+  projectSlug: string;
+  onClose: () => void;
+  onCreated: (slug: string) => void;
+  onSwitchToQuick: () => void;
+}) {
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [state, setState] = useState<string>("idle");
+  const [draft, setDraft] = useState("");
+  const [proposal, setProposal] = useState<ProposedTask | null>(null);
+  const [creating, setCreating] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const startSession = async (firstMessage: string) => {
+    const r = await fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "task", project: projectSlug, message: firstMessage }),
+    });
+    const j = await r.json();
+    if (!j.id) { alert(j.error ?? "failed to start"); return; }
+    setSessionId(j.id);
+    setMessages([{ role: "user", text: firstMessage }]);
+  };
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const es = new EventSource(`/api/sessions/${sessionId}/stream`);
+    es.addEventListener("message", (ev) => {
+      try {
+        const msg = JSON.parse((ev as MessageEvent).data);
+        handleTaskSdkMessage(msg, setMessages, setProposal);
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("state", (ev) => {
+      try { setState(JSON.parse((ev as MessageEvent).data).state); } catch { /* ignore */ }
+    });
+    return () => es.close();
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages.length, proposal]);
+
+  useEffect(() => {
+    return () => {
+      if (sessionId) fetch(`/api/sessions/${sessionId}/interrupt`, { method: "POST" }).catch(() => {});
+    };
+  }, [sessionId]);
+
+  const send = async () => {
+    const text = draft.trim();
+    if (!text) return;
+    setDraft("");
+    if (!sessionId) {
+      await startSession(text);
+      return;
+    }
+    setMessages((p) => [...p, { role: "user", text }]);
+    await fetch(`/api/sessions/${sessionId}/input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text }),
+    });
+  };
+
+  const createFromPlan = async () => {
+    if (!proposal || creating) return;
+    setCreating(true);
+    try {
+      const slug = sluggify(proposal.task_slug);
+      const r = await fetch(`/api/projects/${projectSlug}/tasks/from-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          slug,
+          description: proposal.task_description,
+          session_id: sessionId,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) { alert(j.error ?? "failed to create"); return; }
+      onCreated(j.slug);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const isWorking = state === "running";
+
+  return (
+    <ModalShell
+      title={`New task in ${projectSlug} — plan with an agent`}
+      subtitle="Tell the agent what you want. It'll propose a name + a clean task.md."
+      onClose={onClose}
+      width={620}
+      footer={
+        <>
+          <button onClick={onSwitchToQuick} className="mr-auto text-[12.5px] text-[var(--accent)] hover:underline">↪ Skip and just enter a name</button>
+          <button onClick={onClose} className="text-[13px] text-[var(--text-soft)] px-3 py-2 hover:bg-[var(--panel-2)] rounded-lg">Cancel</button>
+        </>
+      }
+    >
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto -mx-2 px-2 space-y-3 pb-1">
+        {messages.length === 0 && !sessionId && (
+          <div className="text-[13px] text-[var(--text-soft)] leading-relaxed py-2">
+            What is this task about? A few sentences are plenty — the agent will ask follow-ups if it needs them.
+          </div>
+        )}
+        {messages.map((m, i) =>
+          m.taskProposal ? (
+            <TaskCard
+              key={i}
+              task={m.taskProposal}
+              onChange={(next) => {
+                setProposal(next);
+                setMessages((prev) => prev.map((mm, ii) => (ii === i ? { ...mm, taskProposal: next } : mm)));
+              }}
+              onCreate={createFromPlan}
+              creating={creating}
+            />
+          ) : (
+            <Bubble key={i} role={m.role} text={m.text} />
+          ),
+        )}
+        {isWorking && (
+          <div className="flex items-center gap-2 text-[12.5px] text-[var(--accent)]">
+            <span className="inline-block w-2 h-2 rounded-full bg-[var(--accent)] pulse" />
+            <span>Working<span className="dots" aria-hidden /></span>
+          </div>
+        )}
+      </div>
+
+      <div className="shrink-0 rounded-xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-2 py-1.5 focus-within:border-[var(--accent)] transition">
+        <textarea
+          ref={composerRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={sessionId ? "Reply…" : "Tell the agent about this task…"}
+          rows={2}
+          style={{ maxHeight: 140 }}
+          onInput={(e) => {
+            const el = e.currentTarget;
+            el.style.height = "auto";
+            el.style.height = Math.min(el.scrollHeight, 140) + "px";
+          }}
+          onKeyDown={(e) => handleComposerEnter(e, send)}
+          className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
+        />
+        <button
+          onClick={send}
+          disabled={!draft.trim()}
+          className="rounded-md bg-[var(--accent)] text-[var(--accent-text)] w-8 h-8 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 shrink-0"
+          title="Send (↵)"
+        >↑</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function handleTaskSdkMessage(
+  msg: Record<string, unknown>,
+  setMessages: React.Dispatch<React.SetStateAction<ChatMsg[]>>,
+  setProposal: React.Dispatch<React.SetStateAction<ProposedTask | null>>,
+): void {
+  if (msg.type !== "assistant") return;
+  const message = msg.message as { content?: unknown[] } | undefined;
+  const parts = (message?.content ?? []) as Array<{ type?: string; text?: string; name?: string; input?: unknown }>;
+  for (const p of parts) {
+    if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
+      const text = p.text;
+      setMessages((prev) => [...prev, { role: "assistant", text }]);
+    } else if (p.type === "tool_use" && p.name && /propose_task/.test(p.name)) {
+      const input = p.input as Partial<ProposedTask> | undefined;
+      const proposal: ProposedTask = {
+        task_slug: input?.task_slug ?? "untitled",
+        task_description: input?.task_description ?? "",
+      };
+      setProposal(proposal);
+      setMessages((prev) => [...prev, { role: "assistant", text: "", taskProposal: proposal }]);
+    }
+  }
+}
+
+function TaskCard({
+  task, onChange, onCreate, creating,
+}: {
+  task: ProposedTask;
+  onChange: (next: ProposedTask) => void;
+  onCreate: () => void;
+  creating: boolean;
+}) {
+  const update = (patch: Partial<ProposedTask>) => onChange({ ...task, ...patch });
+  return (
+    <div className="rounded-xl border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-3">
+      <div className="text-[10.5px] uppercase tracking-wider text-[var(--accent)] font-semibold mb-2">Proposed task</div>
+      <div className="space-y-2">
+        <div>
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Task name</div>
+          <input
+            value={task.task_slug}
+            onChange={(e) => update({ task_slug: e.target.value })}
+            className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13.5px] outline-none focus:border-[var(--accent)] font-mono"
+          />
+        </div>
+        <div>
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">task.md</div>
+          <textarea
+            value={task.task_description}
+            onChange={(e) => update({ task_description: e.target.value })}
+            rows={8}
+            className="w-full resize-y bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] font-mono leading-relaxed"
+          />
+        </div>
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <button
+          onClick={onCreate}
+          disabled={creating || !task.task_slug.trim()}
+          className="bg-[var(--accent)] text-[var(--accent-text)] rounded-md px-3 py-1.5 text-[13px] font-medium disabled:opacity-40 hover:brightness-110"
+        >{creating ? "Creating…" : "Create task"}</button>
+      </div>
+    </div>
   );
 }
 

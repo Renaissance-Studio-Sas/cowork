@@ -24,7 +24,12 @@ import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageCon
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { updateMeta, persistSdkSessionId, persistSessionState } from "./sessions/meta";
-import { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./workbench-tools/planning";
+import {
+  buildPlanningTools,
+  buildTaskPlanningTools,
+  buildTaskPlanningSystemPrompt,
+  PLANNING_SYSTEM_PROMPT,
+} from "./workbench-tools/planning";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
@@ -1034,6 +1039,71 @@ export async function adoptSessionToProject(id: string, projectSlug: string): Pr
   return true;
 }
 
+// Same idea as adoptSessionToProject but for a single new task — promote a
+// task-planning chat into `projects/<project>/<task>/sessions/<id>/` so the
+// conversation that produced the task is preserved alongside it.
+export async function adoptSessionToTask(
+  id: string,
+  projectSlug: string,
+  taskSlug: string,
+): Promise<boolean> {
+  const s = registry.get(id);
+  if (!s) return false;
+  const project = await getProject(projectSlug);
+  if (!project) return false;
+  const task = project.tasks.find((t) => t.slug === taskSlug);
+  if (!task) return false;
+
+  const newCwd = path.join(PROJECTS_DIR, project.folderName, task.folderName);
+  const sessionDir = path.join(newCwd, "sessions", id);
+  await fs.mkdir(sessionDir, { recursive: true });
+
+  await fs.writeFile(path.join(sessionDir, "meta.json"), JSON.stringify({
+    id,
+    name: s.title,
+    project: projectSlug,
+    task: taskSlug,
+    cwd: newCwd,
+    startedAt: s.startedAt.toISOString(),
+    originatedFrom: "planning",
+    runtime: s.runtime,
+  }, null, 2));
+
+  await fs.writeFile(
+    path.join(sessionDir, "events.jsonl"),
+    s.history.map((m) => JSON.stringify(m)).join("\n") + (s.history.length ? "\n" : ""),
+  );
+
+  const userLines = s.history
+    .filter((m): m is SDKMessage & { type: "user" } => m.type === "user")
+    .map((m) => {
+      const content = (m as { message?: { content?: unknown } }).message?.content;
+      let text = "";
+      if (typeof content === "string") text = content;
+      else if (Array.isArray(content)) {
+        text = (content as Array<{ type?: string; text?: string }>)
+          .filter((p) => p.type === "text" && typeof p.text === "string")
+          .map((p) => p.text as string)
+          .join("");
+      }
+      return JSON.stringify({ at: new Date().toISOString(), text });
+    });
+  await fs.writeFile(
+    path.join(sessionDir, "input.jsonl"),
+    userLines.join("\n") + (userLines.length ? "\n" : ""),
+  );
+
+  try { s.log.end(); } catch { /* already closed */ }
+  try { s.inputLog.end(); } catch { /* already closed */ }
+  s.log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
+  s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+
+  s.projectSlug = projectSlug;
+  s.taskSlug = taskSlug;
+  s.cwd = newCwd;
+  return true;
+}
+
 export function relocateSessionsForProject(oldProject: string, newProject: string): void {
   for (const s of registry.values()) {
     if (s.projectSlug === oldProject) s.projectSlug = newProject;
@@ -1195,6 +1265,80 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     model: null,
     // Planning sessions are always Claude — they predate the runtime selector
     // and run before any project has a configured runtime preference.
+    runtime: "claude",
+  };
+  registerSession(session);
+  session.events.emit("event", firstUserEcho);
+  void pumpEvents(session);
+  return session;
+}
+
+// Ephemeral, in-memory only — used by the "New Task" chat modal. Scoped to
+// a specific project so the agent has its description and existing task list
+// up front. Adopted onto the new task's sessions/ folder once the user
+// accepts the proposal (see adoptSessionToTask).
+export async function startTaskPlanningSession(
+  projectSlug: string,
+  firstMessage: string,
+): Promise<RuntimeSession> {
+  const project = await getProject(projectSlug);
+  if (!project) throw new Error(`unknown project ${projectSlug}`);
+
+  const id = `plan-task-${randomUUID().slice(0, 8)}`;
+  const name = generateSessionLabel(firstMessage);
+  const cwd = WORKSPACE_ROOT;
+  const input = new InputChannel();
+  const events = new EventEmitter();
+  events.setMaxListeners(0);
+  const pendingPermissions = new Map<string, PendingPermission>();
+
+  input.push(makeUserMessage(firstMessage, id));
+
+  const append = buildTaskPlanningSystemPrompt(
+    project.slug,
+    project.folderName,
+    project.description,
+    project.tasks.map((t) => t.slug),
+  );
+
+  const q = createAgentQuery("claude", {
+    prompt: input,
+    options: {
+      cwd,
+      permissionMode: "bypassPermissions",
+      systemPrompt: { type: "preset", preset: "claude_code", append },
+      settingSources: ["project", "user"],
+      canUseTool: buildCanUseTool(pendingPermissions, events),
+      mcpServers: {
+        "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildTaskPlanningTools()),
+      },
+    },
+  });
+
+  const now = new Date();
+  const sink: WriteStream = createWriteStream("/dev/null");
+  const firstUserEcho = makeUserMessage(firstMessage, id);
+  const session: RuntimeSession = {
+    id,
+    projectSlug: "__planning__",
+    taskSlug: "__planning__",
+    cwd,
+    title: name,
+    startedAt: now,
+    lastActivity: now,
+    seenAt: null,
+    completedAt: null,
+    q,
+    input,
+    events,
+    log: sink,
+    inputLog: createWriteStream("/dev/null"),
+    history: [firstUserEcho],
+    state: "running",
+    pendingPermissions,
+    sdkSessionId: null,
+    permissionMode: "bypassPermissions",
+    model: null,
     runtime: "claude",
   };
   registerSession(session);
