@@ -398,7 +398,7 @@ function SessionSelector({
           >
             <button
               onClick={() => onSelect(s.id)}
-              className="w-full text-left px-3 py-2"
+              className="w-full text-left px-3 py-1.5"
             >
               <div className="flex items-center gap-2">
                 <span
@@ -419,12 +419,16 @@ function SessionSelector({
                     className="text-[13px] flex-1 bg-[var(--panel)] border border-[var(--accent)] rounded px-1.5 py-0.5 outline-none"
                   />
                 ) : (
-                  <span className="text-[13px] truncate flex-1">{s.title || "(no title)"}</span>
+                  <>
+                    <span className="text-[13px] truncate flex-1">{s.title || "(no title)"}</span>
+                    <span className="text-[11px] text-[var(--muted)] shrink-0">
+                      {formatRelative(s.lastActivity)}
+                    </span>
+                    <span className="text-[11px] shrink-0" style={{ color }}>
+                      · {STATE_LABEL[s.state] ?? s.state}
+                    </span>
+                  </>
                 )}
-              </div>
-              <div className="text-[11px] text-[var(--muted)] mt-0.5 flex items-center gap-2">
-                <span style={{ color }}>{STATE_LABEL[s.state] ?? s.state}</span>
-                <span>· {formatRelative(s.lastActivity)}</span>
               </div>
             </button>
 

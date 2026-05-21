@@ -471,7 +471,7 @@ export default function TaskPage() {
                       return (
                         <div
                           key={s.id}
-                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-3 ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-2.5 ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
                         >
                           <div className="flex items-center gap-2">
                             <span
@@ -492,12 +492,12 @@ export default function TaskPage() {
                               className="flex-1 bg-transparent border-b border-[var(--accent)] outline-none text-[13.5px] py-0.5"
                               placeholder="Session name"
                             />
-                            <span className="text-[11.5px] whitespace-nowrap" style={{ color: STATE_COLOR[s.state] }}>
-                              {STATE_LABEL[s.state]}
+                            <span className="text-[11.5px] text-[var(--muted)] shrink-0">
+                              {formatRelative(s.lastActivity)}
                             </span>
-                          </div>
-                          <div className="mt-1 text-[11.5px] text-[var(--muted)]">
-                            {formatRelative(s.lastActivity)}
+                            <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
+                              · {STATE_LABEL[s.state]}
+                            </span>
                           </div>
                         </div>
                       );
@@ -507,7 +507,7 @@ export default function TaskPage() {
                         key={s.id}
                         href={taskSessionRoute(projectSlug, taskSlug, s.id)}
                         onContextMenu={(ev) => openSessionContextMenu(ev, s)}
-                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-3 transition ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-2.5 transition ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
                       >
                         <div className="flex items-center gap-2">
                           <span
@@ -520,12 +520,12 @@ export default function TaskPage() {
                               NEW
                             </span>
                           )}
-                          <span className="text-[11.5px] whitespace-nowrap" style={{ color: STATE_COLOR[s.state] }}>
-                            {STATE_LABEL[s.state]}
+                          <span className="text-[11.5px] text-[var(--muted)] shrink-0">
+                            {formatRelative(s.lastActivity)}
                           </span>
-                        </div>
-                        <div className="mt-1 text-[11.5px] text-[var(--muted)]">
-                          {formatRelative(s.lastActivity)}
+                          <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
+                            · {STATE_LABEL[s.state]}
+                          </span>
                         </div>
                       </Link>
                     );

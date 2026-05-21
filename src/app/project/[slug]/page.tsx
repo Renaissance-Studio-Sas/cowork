@@ -354,7 +354,7 @@ export default function ProjectPage() {
                       return (
                         <div
                           key={s.id}
-                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-3 ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-2.5 ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
                         >
                           <div className="flex items-center gap-2">
                             <span
@@ -375,11 +375,13 @@ export default function ProjectPage() {
                               className="flex-1 bg-transparent border-b border-[var(--accent)] outline-none text-[13.5px] py-0.5"
                               placeholder="Session name"
                             />
-                            <span className="text-[11.5px] whitespace-nowrap" style={{ color: STATE_COLOR[s.state] }}>
-                              {STATE_LABEL[s.state]}
+                            <span className="text-[11.5px] text-[var(--muted)] shrink-0">
+                              {formatRelative(s.lastActivity)}
+                            </span>
+                            <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
+                              · {STATE_LABEL[s.state]}
                             </span>
                           </div>
-                          <div className="mt-1 text-[11.5px] text-[var(--muted)]">{formatRelative(s.lastActivity)}</div>
                         </div>
                       );
                     }
@@ -388,7 +390,7 @@ export default function ProjectPage() {
                         key={s.id}
                         href={projectSessionRoute(slug, s.id)}
                         onContextMenu={(ev) => openSessionContextMenu(ev, s)}
-                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-3 transition ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-2.5 transition ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
                       >
                         <div className="flex items-center gap-2">
                           <span
@@ -401,9 +403,13 @@ export default function ProjectPage() {
                               NEW
                             </span>
                           )}
-                          <span className="text-[11.5px] whitespace-nowrap" style={{ color: STATE_COLOR[s.state] }}>{STATE_LABEL[s.state]}</span>
+                          <span className="text-[11.5px] text-[var(--muted)] shrink-0">
+                            {formatRelative(s.lastActivity)}
+                          </span>
+                          <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
+                            · {STATE_LABEL[s.state]}
+                          </span>
                         </div>
-                        <div className="mt-1 text-[11.5px] text-[var(--muted)]">{formatRelative(s.lastActivity)}</div>
                       </Link>
                     );
                   })}
