@@ -136,6 +136,46 @@ export function Chat({ session, onChange, onBack }: Props) {
   // suggestion is approved.
   const [completed, setCompletedState] = useState<boolean>(session.completed);
 
+  // Inline app preview bound to this session (from `preview_session` SSE).
+  const [previewSession, setPreviewSession] = useState<{ app: string; url: string; remote: boolean } | null>(null);
+  // Panel open/closed intent persists across refresh so an open preview stays
+  // visible when the page reloads.
+  const [showPreviewPanel, setShowPreviewPanel] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try { return localStorage.getItem("wb-preview-panel-open") === "1"; } catch { return false; }
+  });
+  const persistPanel = useCallback((v: boolean) => {
+    setShowPreviewPanel(v);
+    try { localStorage.setItem("wb-preview-panel-open", v ? "1" : "0"); } catch { /* ignore */ }
+  }, []);
+  // App inferred from the agent's recent file edits (for a "Preview" suggestion).
+  const [detectedApp, setDetectedApp] = useState<string | null>(null);
+  const [previewStarting, setPreviewStarting] = useState(false);
+
+  // Start an inline preview for `app` (also reachable to the agent via the
+  // preview_app tool). The preview_session SSE event will populate the panel.
+  const startPreview = useCallback(async (app: string) => {
+    setPreviewStarting(true);
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ app }),
+      });
+      const j = await r.json();
+      if (j.ok && j.preview) {
+        setPreviewSession({ app: j.preview.app, url: j.preview.url, remote: !!j.preview.remote });
+        persistPanel(true);
+      } else {
+        alert(j.error ?? "Failed to start preview");
+      }
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreviewStarting(false);
+    }
+  }, [session.id, persistPanel]);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -351,6 +391,27 @@ export function Chat({ session, onChange, onBack }: Props) {
         const { completed: c } = JSON.parse((ev as MessageEvent).data);
         setCompletedState(!!c);
         onChangeRef.current();
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("preview_session", (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data);
+        if (d && d.active) {
+          // Surface that a preview is running; the user opens it via the toggle.
+          setPreviewSession({ app: d.app, url: d.url, remote: !!d.remote });
+          setDetectedApp(null);
+        } else {
+          // Preview ended (stopped / dev server died) — drop it so the UI never
+          // shows a dead iframe.
+          setPreviewSession(null);
+        }
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("file_changed", (ev) => {
+      try {
+        const { path } = JSON.parse((ev as MessageEvent).data);
+        const m = typeof path === "string" ? path.match(/(?:^|\/)apps\/([a-z0-9][a-z0-9-_]*)\//) : null;
+        if (m) setDetectedApp(m[1]);
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -579,7 +640,8 @@ export function Chat({ session, onChange, onBack }: Props) {
     "var(--muted)";
 
   return (
-    <>
+    <div className="flex-1 flex min-h-0">
+      <div className="flex-1 min-w-0 flex flex-col">
       <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3">
         <button
           onClick={onBack}
@@ -666,6 +728,26 @@ export function Chat({ session, onChange, onBack }: Props) {
             completed={completed}
           />
         )}
+        {/* Inline preview toggle / suggestion */}
+        {previewSession ? (
+          <button
+            onClick={() => persistPanel(!showPreviewPanel)}
+            title={showPreviewPanel ? "Hide app preview" : `Show app preview (${previewSession.app})`}
+            className={`text-[12px] px-2 py-1 rounded inline-flex items-center gap-1.5 border transition ${showPreviewPanel ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)]"}`}
+          >
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] pulse" />
+            Preview
+          </button>
+        ) : detectedApp ? (
+          <button
+            onClick={() => startPreview(detectedApp)}
+            disabled={previewStarting}
+            title={`Run a live preview of "${detectedApp}"`}
+            className="text-[12px] px-2 py-1 rounded inline-flex items-center gap-1.5 border border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-40 transition"
+          >
+            {previewStarting ? "Starting…" : `▶ Preview ${detectedApp}`}
+          </button>
+        ) : null}
         {/* Session menu for stopped sessions */}
         {canManageSession && !isRenaming && (
           <div className="relative">
@@ -876,7 +958,19 @@ export function Chat({ session, onChange, onBack }: Props) {
           )}
         </div>
       </div>
-    </>
+      </div>
+
+      {previewSession && showPreviewPanel && (
+        <PreviewPanel
+          key={`${previewSession.app}:${previewSession.url}`}
+          sessionId={session.id}
+          app={previewSession.app}
+          url={previewSession.url}
+          remote={previewSession.remote}
+          onClose={() => persistPanel(false)}
+        />
+      )}
+    </div>
   );
 }
 
@@ -1752,6 +1846,227 @@ function Markdown({ text }: { text: string }) {
         skipHtml
         components={markdownComponents}
       >{text}</ReactMarkdown>
+    </div>
+  );
+}
+
+// Docked, resizable right panel embedding a rowads app's live dev server
+// (`rw worker dev`) in an iframe — fully functional, hot-reloading. Has a Logs
+// tab that polls the dev-server output so build/runtime errors are visible.
+function PreviewPanel({
+  sessionId,
+  app,
+  url,
+  remote,
+  onClose,
+}: {
+  sessionId: string;
+  app: string;
+  url: string;
+  remote: boolean;
+  onClose: () => void;
+}) {
+  const [tab, setTab] = useState<"app" | "logs">("app");
+  const [logs, setLogs] = useState<string[]>([]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [dead, setDead] = useState(false); // local dev server stopped/crashed
+  // Editable URL bar (toggleable). currentUrl drives the iframe so the user
+  // can navigate to a specific route of the app.
+  const [showUrlBar, setShowUrlBar] = useState(false);
+  const [currentUrl, setCurrentUrl] = useState(url);
+  const [urlDraft, setUrlDraft] = useState(url);
+
+  // The panel can grow wide, but never so wide the chat becomes unusable:
+  // the chat column always keeps at least MIN_CHAT_PX.
+  const MIN_CHAT_PX = 520;
+  const DEFAULT_W = 600;
+  const maxWidth = () => (typeof window !== "undefined" ? Math.max(420, window.innerWidth - MIN_CHAT_PX) : 900);
+  const clampW = (w: number) => Math.min(maxWidth(), Math.max(360, w));
+  const [width, setWidth] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_W;
+    const v = Number(localStorage.getItem("wb-preview-panel-w"));
+    return v >= 360 ? v : DEFAULT_W;
+  });
+  const prevWidthRef = useRef(width);
+  const widthRef = useRef(width);
+  widthRef.current = width;
+  const draggingRef = useRef(false);
+  const persistWidth = () => {
+    try { localStorage.setItem("wb-preview-panel-w", String(widthRef.current)); } catch { /* ignore */ }
+  };
+
+  // Clamp on mount + on window resize so a stale (too-wide) persisted width or
+  // a shrunk window can never leave the chat unusable / un-restorable.
+  useEffect(() => {
+    const fix = () => setWidth((w) => clampW(w));
+    fix();
+    window.addEventListener("resize", fix);
+    return () => window.removeEventListener("resize", fix);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Maximize ↔ restore. Maximize grows to the max allowed (chat keeps
+  // MIN_CHAT_PX); restore returns to the previous (or default) width.
+  const maximized = typeof window !== "undefined" && width >= maxWidth() - 4;
+  const toggleMaximize = () => {
+    if (maximized) {
+      const prev = prevWidthRef.current;
+      const restore = clampW(prev && prev < maxWidth() - 4 ? prev : DEFAULT_W);
+      setWidth(restore);
+      localStorage.setItem("wb-preview-panel-w", String(restore));
+    } else {
+      prevWidthRef.current = width;
+      const full = clampW(maxWidth());
+      setWidth(full);
+      localStorage.setItem("wb-preview-panel-w", String(full));
+    }
+  };
+
+  const navigate = () => {
+    try {
+      const next = new URL(urlDraft, url).toString();
+      setCurrentUrl(next);
+      setUrlDraft(next);
+      setReloadKey((k) => k + 1);
+    } catch { /* invalid url */ }
+  };
+
+  // Poll dev-server logs while the Logs tab is open (local only).
+  useEffect(() => {
+    if (remote || tab !== "logs") return;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/preview`);
+        const j = await r.json();
+        if (alive) setLogs(Array.isArray(j.logs) ? j.logs : []);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => { alive = false; clearInterval(t); };
+  }, [remote, tab, sessionId]);
+
+  // Health-poll local previews: if the dev server died (idle-reaped, crashed,
+  // or killed by a cowork restart), surface a recoverable state instead of a
+  // dead iframe.
+  useEffect(() => {
+    if (remote) return;
+    let on = true;
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/preview`);
+        const j = await r.json();
+        if (on) setDead(j?.alive === false);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const t = setInterval(poll, 4000);
+    return () => { on = false; clearInterval(t); };
+  }, [remote, sessionId]);
+
+  const restart = async () => {
+    setDead(false);
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ app, target: "local" }),
+      });
+      setReloadKey((k) => k + 1);
+    } catch { /* ignore */ }
+  };
+
+  return (
+    <div className="shrink-0 h-full border-l border-[var(--border)] bg-[var(--bg-2)] flex flex-col relative" style={{ width }}>
+      <div
+        onPointerDown={(e) => {
+          draggingRef.current = true;
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+          document.body.style.userSelect = "none";
+          e.preventDefault();
+        }}
+        onPointerMove={(e) => {
+          if (!draggingRef.current) return;
+          setWidth(clampW(window.innerWidth - e.clientX));
+        }}
+        onPointerUp={(e) => {
+          if (!draggingRef.current) return;
+          draggingRef.current = false;
+          try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+          document.body.style.userSelect = "";
+          persistWidth();
+        }}
+        onPointerCancel={() => { draggingRef.current = false; document.body.style.userSelect = ""; persistWidth(); }}
+        className="absolute left-0 top-0 h-full w-2 -ml-1 cursor-col-resize hover:bg-[var(--accent)] z-10"
+        title="Drag to resize"
+      />
+      <div className="h-14 border-b border-[var(--border)] flex items-center px-3 gap-2 shrink-0">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] pulse" />
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] truncate">Preview · {app}{remote ? " · deployed" : ""}</div>
+          <div className="text-[11px] text-[var(--muted)] truncate">{url}</div>
+        </div>
+        <button onClick={() => setReloadKey((k) => k + 1)} title="Reload" className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] px-1.5 py-0.5 rounded hover:bg-[var(--panel-2)]">↻</button>
+        <button onClick={toggleMaximize} title={maximized ? "Restore width" : "Maximize width"} className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] px-1.5 py-0.5 rounded hover:bg-[var(--panel-2)]">{maximized ? "⤡" : "⤢"}</button>
+        <a href={currentUrl} target="_blank" rel="noreferrer" title="Open in a new tab" className="text-[11px] px-2 py-1 rounded border border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)]">Open ↗</a>
+        <button onClick={onClose} title="Hide" className="text-[var(--muted)] hover:text-[var(--text)] text-[14px] leading-none px-1.5 py-0.5 rounded hover:bg-[var(--panel-2)]">×</button>
+      </div>
+      <div className="shrink-0 flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+        {(["app", ...(remote ? [] : ["logs"])] as ("app" | "logs")[]).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`text-[11px] px-2 py-1 rounded border ${tab === t ? "border-[var(--accent)] text-[var(--accent)]" : "border-transparent text-[var(--muted)] hover:text-[var(--text)]"}`}
+          >
+            {t === "app" ? "App" : "Logs"}
+          </button>
+        ))}
+        <div className="flex-1" />
+        <button
+          onClick={() => setShowUrlBar((v) => !v)}
+          title={showUrlBar ? "Hide URL bar" : "Show URL bar"}
+          className={`text-[11px] px-2 py-1 rounded border ${showUrlBar ? "border-[var(--accent)] text-[var(--accent)]" : "border-transparent text-[var(--muted)] hover:text-[var(--text)]"}`}
+        >
+          URL
+        </button>
+      </div>
+      {tab === "app" && showUrlBar && (
+        <div className="shrink-0 flex items-center gap-1.5 px-2 py-1.5 border-b border-[var(--border)] bg-[var(--bg)]">
+          <input
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") navigate(); }}
+            spellCheck={false}
+            className="flex-1 min-w-0 text-[11px] font-mono bg-[var(--panel)] border border-[var(--border)] rounded px-2 py-1 outline-none focus:border-[var(--accent)]"
+            placeholder="http://localhost:… or /route"
+          />
+          <button onClick={navigate} title="Go" className="text-[11px] px-2 py-1 rounded border border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)]">Go</button>
+        </div>
+      )}
+      {tab === "app" ? (
+        !remote && dead ? (
+          <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-6 text-[var(--muted)]">
+            <div className="text-[13px]">The local dev server for “{app}” stopped.</div>
+            <div className="text-[11px]">(idle timeout, a crash, or a cowork restart)</div>
+            <div className="flex gap-2 mt-1">
+              <button onClick={restart} className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] hover:brightness-110 transition">Restart preview</button>
+              <button onClick={onClose} className="text-[12px] px-3 py-1.5 rounded-md border border-[var(--border-strong)] hover:text-[var(--text)] transition">Hide</button>
+            </div>
+          </div>
+        ) : (
+          <iframe
+            key={reloadKey}
+            src={currentUrl}
+            title={`Preview of ${app}`}
+            className="flex-1 w-full bg-white border-0"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+          />
+        )
+      ) : (
+        <pre className="flex-1 overflow-auto m-0 p-3 text-[11px] leading-relaxed font-mono whitespace-pre-wrap bg-[var(--bg)] text-[var(--text-soft)]">
+          {logs.length ? logs.join("\n") : "(no dev-server output yet)"}
+        </pre>
+      )}
     </div>
   );
 }

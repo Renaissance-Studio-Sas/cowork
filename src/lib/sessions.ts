@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
-import { createWriteStream, readFileSync, writeFileSync, type WriteStream } from "node:fs";
+import { createWriteStream, readFileSync, writeFileSync, existsSync, type WriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -34,6 +34,9 @@ import {
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { buildUserInputTools } from "./workbench-tools/user-input";
+import { buildPreviewTools } from "./workbench-tools/preview";
+import { MONOREPO_DIR } from "./preview/manager";
+import { clearPreviewSession } from "./preview/preview-session-store";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildStaticWorkbenchMcps, ASK_USER_QUESTION_ALIAS } from "./claude-chrome-tools";
 import type { WorkbenchTool } from "./workbench-tools/types";
@@ -43,6 +46,18 @@ import type { WorkbenchTool } from "./workbench-tools/types";
 // Claude runtime continues to read the Claude-wrapped versions from
 // `mcpServers` (built via buildStaticWorkbenchMcps). Both paths source
 // from the same underlying tool definitions.
+// Inline-preview tools are only useful when the rowads monorepo is present.
+// Checked lazily (not at module load) to avoid a circular-import TDZ on
+// MONOREPO_DIR (preview-session-store ↔ sessions form an import cycle).
+function previewEnabled(): boolean {
+  return existsSync(path.join(MONOREPO_DIR, "apps"));
+}
+function previewToolGroups(id: string, projectSlug: string, taskSlug: string) {
+  return previewEnabled()
+    ? [{ name: "workbench-preview", tools: buildPreviewTools(id, projectSlug, taskSlug) }]
+    : [];
+}
+
 function buildStaticWorkbenchToolGroups(
   sessionId: string,
   projectSlug: string,
@@ -52,6 +67,7 @@ function buildStaticWorkbenchToolGroups(
     { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
     { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
     { name: "workbench-user-input", tools: buildUserInputTools(sessionId) },
+    ...previewToolGroups(sessionId, projectSlug, taskSlug),
   ];
 }
 
@@ -2051,6 +2067,9 @@ export async function deleteSession(
     if (liveSession.state === "running") {
       return false;
     }
+    // Stop any inline app preview bound to this session (kills the dev server
+    // when no other session is showing it).
+    clearPreviewSession(sessionId);
     // Session is stopped/idle/error — clean up streams and remove from registry
     try {
       liveSession.input.close();

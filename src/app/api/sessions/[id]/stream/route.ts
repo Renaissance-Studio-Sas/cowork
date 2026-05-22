@@ -1,4 +1,5 @@
 import { getSession, restoreSession } from "@/lib/sessions";
+import { getPreviewSession } from "@/lib/preview/preview-session-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -79,6 +80,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       }
       sendEvent("completed_changed", { completed: !!s.completed });
 
+      // Replay the current inline-preview binding (if any).
+      const ps = getPreviewSession(id);
+      if (ps) sendEvent("preview_session", ps);
+
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onState = (state: string) => sendEvent("state", { state });
       const onFileChanged = (data: { path: string }) => sendEvent("file_changed", data);
@@ -89,6 +94,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       const onCompletionRequest = (data: unknown) => sendEvent("completion_request", data);
       const onCompletionResolved = (data: unknown) => sendEvent("completion_resolved", data);
       const onCompletedChanged = (data: unknown) => sendEvent("completed_changed", data);
+      const onPreviewSession = (data: unknown) => sendEvent("preview_session", data);
       s.events.on("event", onEvent);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
@@ -99,6 +105,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       s.events.on("completion_request", onCompletionRequest);
       s.events.on("completion_resolved", onCompletionResolved);
       s.events.on("completed_changed", onCompletedChanged);
+      s.events.on("preview_session", onPreviewSession);
 
       const heartbeat = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
@@ -116,6 +123,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         s.events.off("completion_request", onCompletionRequest);
         s.events.off("completion_resolved", onCompletionResolved);
         s.events.off("completed_changed", onCompletedChanged);
+        s.events.off("preview_session", onPreviewSession);
         try { controller.close(); } catch { /* already closed */ }
       };
 
