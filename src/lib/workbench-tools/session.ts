@@ -17,8 +17,6 @@ import {
   listChromeProfiles,
   openChromeReconnectPage,
   expectedProfileBySession,
-  lastBoundProfile,
-  setLastBoundProfile,
   boundProfileBySession,
   CLAUDE_BIN_PATH,
 } from "../chrome-bridge";
@@ -184,11 +182,17 @@ to verify the socket appeared.`,
           };
         }
 
-        // Track for this session + globally (the socket is single across all
-        // sessions; last opened profile owns it). See
-        // docs/chrome-mcp-per-session.md for the per-session isolation gap.
+        // Record this session's expected + bound profile. The underlying
+        // native-messaging socket is shared across sessions on the same OS
+        // user — see docs/chrome-mcp-per-session.md — but this map gives
+        // chrome_status a reliable per-session attribution.
         expectedProfileBySession.set(sessionId, { id: profile_id, email: profile.email });
-        setLastBoundProfile({ id: profile_id, name: profile.name, email: profile.email, boundAt: new Date() });
+        boundProfileBySession.set(sessionId, {
+          id: profile_id,
+          name: profile.name,
+          email: profile.email,
+          boundAt: new Date(),
+        });
 
         return {
           content: [{
@@ -336,7 +340,6 @@ auto-handshake (no user click needed), then chrome_connect.`,
           } catch { /* ignore */ }
           
           boundProfileBySession.clear();
-          setLastBoundProfile(null);
 
           lines.push(
             `Performed GLOBAL nuclear reset:`,

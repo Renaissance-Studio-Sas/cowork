@@ -117,20 +117,14 @@ export interface BoundProfile {
   boundAt: Date;
 }
 
-// Maps sessionId -> BoundProfile
+// Maps sessionId -> BoundProfile. Set by chrome_open_profile, read by
+// chrome_status, cleared by chrome_disconnect / chrome_force_reset. We can't
+// read the profile from the socket or native-host process itself, so this
+// map is the source of truth for which profile each session believes it is
+// bound to. The Chrome native-messaging socket itself is per-user (not
+// per-profile), so concurrent sessions still share the underlying bridge —
+// see docs/chrome-mcp-per-session.md.
 export const boundProfileBySession = new Map<string, BoundProfile>();
-
-// The Chrome native-messaging socket is per-user (not per-profile) so only
-// ONE profile can own it at a time across all sessions. We can't read the
-// profile from the socket or native-host process itself, so we track the
-// last profile that launched a successful handshake via chrome_open_profile.
-// chrome_force_reset clears this. chrome_status surfaces it as
-// "Connected profile (last bound)".
-export let lastBoundProfile: BoundProfile | null = null;
-
-export function setLastBoundProfile(p: BoundProfile | null): void {
-  lastBoundProfile = p;
-}
 
 export function getChromeUserDataDir(): string | null {
   const home = os.homedir();
