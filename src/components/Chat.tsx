@@ -122,6 +122,15 @@ export function Chat({ session, onChange, onBack }: Props) {
     Map<string, { questions: PendingQuestionItem[] }>
   >(new Map());
 
+  // Live browser-control-plane session bound to this chat (null = none).
+  // Populated from SSE `browser_session` events; drives the live-view panel.
+  const [browserSession, setBrowserSession] = useState<{
+    profile: string;
+    viewerUrl: string;
+    steelUiUrl: string | null;
+  } | null>(null);
+  const [showBrowserPanel, setShowBrowserPanel] = useState(false);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -307,6 +316,19 @@ export function Chat({ session, onChange, onBack }: Props) {
           next.delete(questionId);
           return next;
         });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("browser_session", (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data);
+        if (data && data.active) {
+          // Surface that a browser is bound; the user opens the panel via the
+          // header toggle (hidden by default).
+          setBrowserSession({ profile: data.profile, viewerUrl: data.viewerUrl, steelUiUrl: data.steelUiUrl ?? null });
+        } else {
+          setBrowserSession(null);
+          setShowBrowserPanel(false);
+        }
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -533,7 +555,8 @@ export function Chat({ session, onChange, onBack }: Props) {
     "var(--muted)";
 
   return (
-    <>
+    <div className="flex-1 flex min-h-0">
+      <div className="flex-1 min-w-0 flex flex-col">
       <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3">
         <button
           onClick={onBack}
@@ -594,6 +617,17 @@ export function Chat({ session, onChange, onBack }: Props) {
             )}
           </div>
         </div>
+        {/* Live browser toggle — visible whenever a control-plane session is bound */}
+        {browserSession && (
+          <button
+            onClick={() => setShowBrowserPanel((v) => !v)}
+            title={showBrowserPanel ? "Hide live browser" : `Show live browser (${browserSession.profile})`}
+            className={`text-[12px] px-2 py-1 rounded inline-flex items-center gap-1.5 border transition ${showBrowserPanel ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)]"}`}
+          >
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] pulse" />
+            Browser
+          </button>
+        )}
         {/* Session menu for stopped sessions */}
         {canManageSession && !isRenaming && (
           <div className="relative">
@@ -709,15 +743,24 @@ export function Chat({ session, onChange, onBack }: Props) {
       {pendingPermissions.size > 0 && (
         <div className="border-t border-[var(--border)] px-6 py-3 bg-[var(--bg-2)]">
           <div className="max-w-[760px] mx-auto space-y-2">
-            {Array.from(pendingPermissions.entries()).map(([toolUseId, p]) => (
-              <PlanApprovalCard
-                key={toolUseId}
-                sessionId={session.id}
-                toolUseId={toolUseId}
-                toolName={p.toolName}
-                input={p.input}
-              />
-            ))}
+            {Array.from(pendingPermissions.entries()).map(([toolUseId, p]) =>
+              p.toolName === "browser_handoff" ? (
+                <BrowserHandoffCard
+                  key={toolUseId}
+                  sessionId={session.id}
+                  toolUseId={toolUseId}
+                  input={p.input}
+                />
+              ) : (
+                <PlanApprovalCard
+                  key={toolUseId}
+                  sessionId={session.id}
+                  toolUseId={toolUseId}
+                  toolName={p.toolName}
+                  input={p.input}
+                />
+              ),
+            )}
           </div>
         </div>
       )}
@@ -789,7 +832,18 @@ export function Chat({ session, onChange, onBack }: Props) {
           )}
         </div>
       </div>
-    </>
+      </div>
+
+      {browserSession && showBrowserPanel && (
+        <BrowserLivePanel
+          sessionId={session.id}
+          profile={browserSession.profile}
+          viewerUrl={browserSession.viewerUrl}
+          steelUiUrl={browserSession.steelUiUrl}
+          onClose={() => setShowBrowserPanel(false)}
+        />
+      )}
+    </div>
   );
 }
 
@@ -1519,6 +1573,234 @@ function Markdown({ text }: { text: string }) {
         skipHtml
         components={markdownComponents}
       >{text}</ReactMarkdown>
+    </div>
+  );
+}
+
+const BROWSER_MANAGER_URL = process.env.NEXT_PUBLIC_BROWSER_UI_URL ?? "http://localhost:4000";
+
+// Docked, resizable right panel embedding the control-plane live-view player so
+// the user can watch the agent drive the browser. The view is fit to a 16:10
+// box so the whole page is visible (no clipping), and it lives in the flex row
+// (not a fixed overlay) so it shrinks the chat instead of covering it.
+function BrowserLivePanel({
+  sessionId,
+  profile,
+  viewerUrl,
+  steelUiUrl,
+  onClose,
+}: {
+  sessionId: string;
+  profile: string;
+  viewerUrl: string;
+  steelUiUrl: string | null;
+  onClose: () => void;
+}) {
+  const [tabs, setTabs] = useState<{ index: number; url: string; title: string }[]>([]);
+  const [activeIndex, setActiveIndex] = useState(-1);
+
+  // Poll the agent's open tabs so the user can see which tab it's operating on.
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/browser`);
+        const j = await r.json();
+        if (alive) {
+          setTabs(Array.isArray(j.tabs) ? j.tabs : []);
+          setActiveIndex(typeof j.activeIndex === "number" ? j.activeIndex : -1);
+        }
+      } catch { /* ignore */ }
+    };
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => { alive = false; clearInterval(t); };
+  }, [sessionId]);
+
+  const [width, setWidth] = useState(() => {
+    if (typeof window === "undefined") return 520;
+    const v = Number(localStorage.getItem("wb-browser-panel-w"));
+    return v >= 360 && v <= 1000 ? v : 520;
+  });
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      if (!draggingRef.current) return;
+      setWidth(Math.min(1000, Math.max(360, window.innerWidth - e.clientX)));
+    };
+    const onUp = () => {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      document.body.style.userSelect = "";
+      localStorage.setItem("wb-browser-panel-w", String(width));
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [width]);
+
+  return (
+    <div className="shrink-0 h-full border-l border-[var(--border)] bg-[var(--bg-2)] flex flex-col relative" style={{ width }}>
+      <div
+        onPointerDown={(e) => { draggingRef.current = true; document.body.style.userSelect = "none"; e.preventDefault(); }}
+        className="absolute left-0 top-0 h-full w-1.5 -ml-[3px] cursor-col-resize hover:bg-[var(--accent)] z-10"
+        title="Drag to resize"
+      />
+      <div className="h-14 border-b border-[var(--border)] flex items-center px-3 gap-2 shrink-0">
+        <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] pulse" />
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] truncate">Live browser</div>
+          <div className="text-[11px] text-[var(--muted)] truncate">profile: {profile}</div>
+        </div>
+        <a
+          href={steelUiUrl ?? BROWSER_MANAGER_URL}
+          target="_blank"
+          rel="noreferrer"
+          title="Open full dashboard (DevTools/console)"
+          className="text-[11px] px-2 py-1 rounded border border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--text)]"
+        >
+          Dashboard ↗
+        </a>
+        <button
+          onClick={onClose}
+          title="Hide"
+          className="text-[var(--muted)] hover:text-[var(--text)] text-[14px] leading-none px-1.5 py-0.5 rounded hover:bg-[var(--panel-2)]"
+        >
+          ×
+        </button>
+      </div>
+      {tabs.length > 0 && (
+        <div className="shrink-0 flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)] overflow-x-auto">
+          {tabs.map((t) => {
+            const active = t.index === activeIndex;
+            return (
+              <div
+                key={t.index}
+                title={`${t.title}\n${t.url}`}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] max-w-[180px] shrink-0 border ${
+                  active
+                    ? "border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--text)]"
+                    : "border-[var(--border)] text-[var(--muted)]"
+                }`}
+              >
+                {active && <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] shrink-0" />}
+                <span className="truncate">{t.title || t.url || "about:blank"}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div className="flex-1 overflow-y-auto p-3">
+        <div className="relative w-full aspect-[16/10] rounded-lg overflow-hidden border border-[var(--border)] bg-black">
+          <iframe
+            src={viewerUrl}
+            title="Live browser view"
+            className="absolute inset-0 h-full w-full border-0"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+          />
+        </div>
+        {activeIndex >= 0 && tabs[activeIndex] && (
+          <div className="mt-2 text-[11px] text-[var(--muted)] truncate" title={tabs[activeIndex].url}>
+            Operating on: <span className="text-[var(--text)]">{tabs[activeIndex].title}</span> — {tabs[activeIndex].url}
+          </div>
+        )}
+        <p className="mt-2 text-[11px] text-[var(--muted)] leading-relaxed">
+          Live mirror of the agent’s browser. To interact (log in, solve 2FA), use the handoff card when the agent asks, or open the{" "}
+          <a href={steelUiUrl ?? BROWSER_MANAGER_URL} target="_blank" rel="noreferrer" className="underline hover:text-[var(--text)]">full dashboard ↗</a>.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// Manual-handoff card: the agent paused (browser_request_human) for a step a
+// human must do — login, 2FA, captcha. Shows the live view inline plus
+// Done/Cancel, which resolve the pending permission via the /permission route.
+function BrowserHandoffCard({
+  sessionId,
+  toolUseId,
+  input,
+}: {
+  sessionId: string;
+  toolUseId: string;
+  input: Record<string, unknown>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reason = typeof input.reason === "string" ? input.reason : "Manual step required.";
+  const viewerUrl = typeof input.viewerUrl === "string" ? input.viewerUrl : null;
+  const steelUiUrl = typeof input.steelUiUrl === "string" ? input.steelUiUrl : null;
+  const profile = typeof input.profile === "string" ? input.profile : "";
+
+  const decide = async (behavior: "allow" | "deny") => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/permission`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toolUseId,
+          behavior,
+          updatedInput: behavior === "allow" ? {} : undefined,
+          message: behavior === "deny" ? "User cancelled the manual step." : undefined,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) setError(j.error ?? "failed");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-[var(--warn)] bg-[var(--panel)] p-3">
+      <div className="flex items-center justify-between mb-2 gap-2">
+        <div className="text-[12px] font-semibold text-[var(--warn)] min-w-0">
+          Action needed{profile ? ` · ${profile}` : ""}
+        </div>
+        <div className="flex gap-2 shrink-0">
+          <button
+            onClick={() => decide("deny")}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[#dc2626] hover:border-[#dc2626] disabled:opacity-40 transition"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => decide("allow")}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] disabled:opacity-40 hover:brightness-110 transition"
+          >
+            {busy ? "…" : "Done, continue"}
+          </button>
+        </div>
+      </div>
+      <div className="text-[13px] mb-2">{reason}</div>
+      {viewerUrl && (
+        <div className="relative w-full aspect-[16/10] rounded-md overflow-hidden border border-[var(--border)] bg-black">
+          <iframe
+            src={viewerUrl}
+            title="Live browser view"
+            className="absolute inset-0 h-full w-full border-0"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+          />
+        </div>
+      )}
+      <div className="mt-2 text-[11px] text-[var(--muted)]">
+        Log in / solve the challenge in the view above, then click “Done, continue”.{" "}
+        <a href={steelUiUrl ?? BROWSER_MANAGER_URL} target="_blank" rel="noreferrer" className="underline hover:text-[var(--text)]">
+          Open full window ↗
+        </a>
+      </div>
+      {error && <div className="text-[12px] text-[#dc2626] mt-2">{error}</div>}
     </div>
   );
 }

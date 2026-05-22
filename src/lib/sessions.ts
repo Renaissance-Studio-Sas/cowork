@@ -34,6 +34,17 @@ import {
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { buildUserInputTools } from "./workbench-tools/user-input";
+import { buildBrowserTools } from "./workbench-tools/browser";
+import { releaseBrowser } from "./browser/playwright-manager";
+
+// Browser-automation backend. "control-plane" exposes the workbench-browser
+// tools (steelyard + Playwright); "chrome-mcp" keeps the legacy Claude-in-Chrome
+// bridge tools (in workbench-session). Default keeps the legacy behaviour.
+const BROWSER_BACKEND = (process.env.BROWSER_BACKEND ?? "chrome-mcp").toLowerCase();
+const browserToolGroups = (id: string, projectSlug: string, taskSlug: string) =>
+  BROWSER_BACKEND === "control-plane"
+    ? [{ name: "workbench-browser", tools: buildBrowserTools(id, projectSlug, taskSlug) }]
+    : [];
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildStaticWorkbenchMcps, ASK_USER_QUESTION_ALIAS } from "./claude-chrome-tools";
 import type { WorkbenchTool } from "./workbench-tools/types";
@@ -52,6 +63,7 @@ function buildStaticWorkbenchToolGroups(
     { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
     { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
     { name: "workbench-user-input", tools: buildUserInputTools(sessionId) },
+    ...browserToolGroups(sessionId, projectSlug, taskSlug),
   ];
 }
 
@@ -372,6 +384,28 @@ export function resolveQuestion(
   // Echo so any other clients viewing this session can clear their card.
   s.events.emit("question_resolved", { questionId });
   return true;
+}
+
+// Pause the agent and ask the human to perform a manual browser step (login,
+// 2FA, captcha). Registers a synthetic pending "permission" (toolName
+// "browser_handoff") so the existing /permission route + UI resolve it; the
+// returned promise settles when the user clicks Done/Cancel. Null if unknown.
+export function requestBrowserHandoff(
+  id: string,
+  input: Record<string, unknown>,
+): Promise<PermissionResult> | null {
+  const s = registry.get(id);
+  if (!s) return null;
+  return new Promise<PermissionResult>((resolve) => {
+    const toolUseId = `browser-handoff-${randomUUID()}`;
+    s.pendingPermissions.set(toolUseId, {
+      toolName: "browser_handoff",
+      input,
+      resolve,
+      requestedAt: new Date(),
+    });
+    s.events.emit("permission_request", { toolUseId, toolName: "browser_handoff", input });
+  });
 }
 
 export function getSession(id: string): RuntimeSession | undefined {
@@ -1861,6 +1895,9 @@ export async function deleteSession(
     if (liveSession.state === "running") {
       return false;
     }
+    // Release any control-plane browser bound to this session (stops the Steel
+    // container; profile cookies are preserved on disk).
+    void releaseBrowser(sessionId).catch(() => {});
     // Session is stopped/idle/error — clean up streams and remove from registry
     try {
       liveSession.input.close();

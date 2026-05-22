@@ -10,6 +10,9 @@ import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { buildUserInputTools } from "./workbench-tools/user-input";
+import { buildBrowserTools } from "./workbench-tools/browser";
+
+const BROWSER_BACKEND = (process.env.BROWSER_BACKEND ?? "chrome-mcp").toLowerCase();
 
 // Build the static workbench-MCP map for a session. Used both at session
 // start (in sessions.ts) and inside chrome_connect/disconnect to re-include
@@ -23,6 +26,9 @@ export function buildStaticWorkbenchMcps(
     "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(projectSlug, taskSlug)),
     "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, projectSlug, taskSlug)),
     "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(sessionId)),
+    ...(BROWSER_BACKEND === "control-plane"
+      ? { "workbench-browser": workbenchToolsAsClaudeMcp("workbench-browser", buildBrowserTools(sessionId, projectSlug, taskSlug)) }
+      : {}),
   };
 }
 
