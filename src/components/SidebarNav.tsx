@@ -12,6 +12,7 @@ import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTask
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
 const RECENT_COLLAPSED_KEY = "wb-recent-sessions-collapsed";
+const PROJECTS_SECTION_COLLAPSED_KEY = "wb-projects-section-collapsed";
 
 function loadCollapsed(): Record<string, boolean> {
   try {
@@ -33,6 +34,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [recentCollapsed, setRecentCollapsed] = useState(false);
+  const [projectsCollapsed, setProjectsCollapsed] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   type Rename = { kind: "task"; project: string; task: string } | { kind: "project"; project: string };
   const [renaming, setRenaming] = useState<Rename | null>(null);
@@ -46,6 +48,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
     setCollapsed(loadCollapsed());
     try {
       setRecentCollapsed(localStorage.getItem(RECENT_COLLAPSED_KEY) === "true");
+      setProjectsCollapsed(localStorage.getItem(PROJECTS_SECTION_COLLAPSED_KEY) === "true");
     } catch { /* ignore */ }
   }, []);
 
@@ -60,6 +63,11 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const updateRecentCollapsed = (value: boolean) => {
     setRecentCollapsed(value);
     try { localStorage.setItem(RECENT_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
+  };
+
+  const updateProjectsCollapsed = (value: boolean) => {
+    setProjectsCollapsed(value);
+    try { localStorage.setItem(PROJECTS_SECTION_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
   };
 
   const visibleProjects = [...projects].sort((a, b) => {
@@ -229,21 +237,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
         </button>
       </div>
 
-      <div className="px-3 pb-3 flex items-center gap-2">
-        <button
-          onClick={onNewProject}
-          className="flex-1 rounded-xl border border-[var(--border-strong)] bg-[var(--panel)] text-[var(--text)] px-3 py-2 text-[13px] font-medium hover:bg-[var(--panel-2)] transition"
-        >
-          + Project
-        </button>
-        {awaitingCount > 0 && (
-          <span className="text-[11.5px] text-[var(--warn)] pulse whitespace-nowrap" title={`${awaitingCount} agent(s) awaiting input`}>
-            ● {awaitingCount}
-          </span>
-        )}
-      </div>
-
-      <div className="flex-1 overflow-y-auto px-2 pb-4">
+      <div className="flex-1 overflow-y-auto px-2 pb-4 pt-1">
         {/* Active Sessions */}
         {activeSessions.length > 0 && (
           <div className="mb-3">
@@ -275,14 +269,45 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
         )}
 
         {/* Projects */}
-        <div className="px-2 py-1.5 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
-          Projects
+        <div className="group flex items-center gap-1 px-1 py-1.5">
+          <button
+            onClick={() => updateProjectsCollapsed(!projectsCollapsed)}
+            className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
+            title={projectsCollapsed ? "Expand" : "Collapse"}
+          >
+            <svg
+              width="18" height="18" viewBox="0 0 24 24"
+              className={`text-[var(--muted)] transition-transform ${projectsCollapsed ? "" : "rotate-90"}`}
+              fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+              aria-hidden
+            ><path d="M9 6l6 6-6 6" /></svg>
+          </button>
+          <span className="flex-1 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
+            Projects
+          </span>
+          {awaitingCount > 0 && (
+            <span className="text-[10px] text-[var(--warn)] pulse whitespace-nowrap" title={`${awaitingCount} agent(s) awaiting input`}>
+              ●{awaitingCount}
+            </span>
+          )}
+          <span
+            role="button" tabIndex={0}
+            onClick={onNewProject}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onNewProject();
+              }
+            }}
+            className="text-[var(--muted)] hover:text-[var(--text)] text-[16px] leading-none px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--panel-2)] transition cursor-pointer"
+            title="New project"
+          >+</span>
         </div>
-        {visibleProjects.length === 0 && (
+        {!projectsCollapsed && visibleProjects.length === 0 && (
           <div className="px-3 py-4 text-[12.5px] text-[var(--muted)]">No projects yet.</div>
         )}
 
-        {visibleProjects.map((p) => {
+        {!projectsCollapsed && visibleProjects.map((p) => {
           const visibleTasks = [...p.tasks].sort((a, b) => {
             if (a.status !== b.status) return a.status === "wip" ? -1 : 1;
             return a.slug.localeCompare(b.slug);
@@ -316,11 +341,11 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
               >
                 <button
                   onClick={() => updateCollapsed(p.slug, !isCollapsed)}
-                  className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
+                  className="w-5 h-5 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
                   title={isCollapsed ? "Expand" : "Collapse"}
                 >
                   <svg
-                    width="18" height="18" viewBox="0 0 24 24"
+                    width="12" height="12" viewBox="0 0 24 24"
                     className={`text-[var(--text)] transition-transform ${isCollapsed ? "" : "rotate-90"}`}
                     fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
                     aria-hidden
