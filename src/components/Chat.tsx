@@ -644,6 +644,16 @@ export function Chat({ session, onChange, onBack }: Props) {
                 >
                   {session.model ?? session.runtime}
                 </span>
+                <span
+                  className="font-mono text-[var(--muted)]"
+                  title={
+                    session.effort
+                      ? `Thinking effort: ${session.effort}`
+                      : "Thinking effort: high (SDK default)"
+                  }
+                >
+                  ({session.effort ?? "high"})
+                </span>
               </>
             )}
           </div>

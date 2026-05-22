@@ -18,6 +18,12 @@ import type { SessionState } from "../session-state-machine";
 // runtime.
 export type SessionRuntime = "claude" | "gemini";
 
+// Thinking effort level. Mirrors the Claude Agent SDK's EffortLevel
+// (see @anthropic-ai/claude-agent-sdk). Passed to query() as `effort` and
+// also accepted by the CLI's /model command. When null, the SDK uses its
+// default ('high').
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
 // In-memory live session state. Held in the registry (see registry.ts).
 // Created by lifecycle.startSession et al, mutated by pump.ts as the
 // runtime streams events, and torn down by watchdog.ts or
@@ -67,6 +73,7 @@ export interface RuntimeSession {
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
+  effort: EffortLevel | null;    // thinking effort, null = SDK default ('high')
   runtime: SessionRuntime;       // claude (default) | gemini
 }
 
@@ -117,4 +124,5 @@ export interface SessionSummary {
   completed: boolean;            // sticky "marked complete" flag (manual or agent-suggested + approved)
   runtime: SessionRuntime;
   model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")
+  effort: EffortLevel | null;    // thinking effort, null = SDK default ('high')
 }

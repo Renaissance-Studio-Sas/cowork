@@ -16,6 +16,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ project: strin
       firstMessage: body.message,
       permissionMode: body.permissionMode,
       model: body.model,
+      effort: body.effort,
       runtime: body.runtime,
     });
     return NextResponse.json({ id: s.id, state: s.state });

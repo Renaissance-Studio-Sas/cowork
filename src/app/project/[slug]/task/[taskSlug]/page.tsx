@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter, useSearchParams, usePathname } from "next/navigation";
 import Link from "next/link";
-import type { SessionSummaryDTO, SessionRuntime } from "@/lib/types";
+import type { SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { StatusChip } from "@/components/StatusChip";
@@ -87,6 +87,8 @@ export default function TaskPage() {
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
+  // "" = use SDK default ('high'); otherwise pass through as effort.
+  const [effort, setEffort] = useState<EffortLevel | "">("");
   const [files, setFiles] = useState<string[]>([]);
   const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
@@ -188,7 +190,11 @@ export default function TaskPage() {
       const r = await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: draft.trim(), runtime }),
+        body: JSON.stringify({
+          message: draft.trim(),
+          runtime,
+          ...(effort ? { effort } : {}),
+        }),
       });
       const j = await r.json();
       if (j.id) {
@@ -582,6 +588,21 @@ export default function TaskPage() {
             >
               <option value="claude">Claude</option>
               <option value="gemini">Gemini</option>
+            </select>
+            <span className="text-[11px] text-[var(--muted)]">Effort:</span>
+            <select
+              value={effort}
+              onChange={(e) => setEffort(e.target.value as EffortLevel | "")}
+              className="text-[11px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1.5 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer disabled:opacity-50"
+              title="Thinking effort (Claude only)"
+              disabled={runtime !== "claude"}
+            >
+              <option value="">default (high)</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
             </select>
           </div>
         </div>

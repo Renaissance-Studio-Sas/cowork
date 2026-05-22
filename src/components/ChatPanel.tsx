@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useWorkspace } from "@/lib/workspace-context";
 import { handleComposerEnter } from "@/lib/composer";
-import type { SessionSummaryDTO, SessionRuntime } from "@/lib/types";
+import type { SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
 import { TodoList, extractTodosFromMessages } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
 import ReactMarkdown from "react-markdown";
@@ -103,6 +103,8 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
   const [draft, setDraft] = useState("");
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
+  // "" = use SDK default (currently 'high'); otherwise pass through as effort.
+  const [effort, setEffort] = useState<EffortLevel | "">("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const startNewSession = async () => {
@@ -113,7 +115,11 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
       const r = await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: contextPrefix + draft.trim(), runtime }),
+        body: JSON.stringify({
+          message: contextPrefix + draft.trim(),
+          runtime,
+          ...(effort ? { effort } : {}),
+        }),
       });
       const j = await r.json();
       if (j.id) {
@@ -158,6 +164,8 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
           placeholder={filePath ? `Ask about ${filePath}…` : "Start a conversation…"}
           runtime={runtime}
           onRuntime={setRuntime}
+          effort={effort}
+          onEffort={setEffort}
         />
       </aside>
     );
@@ -216,6 +224,8 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
           placeholder={filePath ? `Ask about ${filePath}…` : "Start a new conversation…"}
           runtime={runtime}
           onRuntime={setRuntime}
+          effort={effort}
+          onEffort={setEffort}
         />
       )}
     </aside>
@@ -285,12 +295,24 @@ function ChatPanelHeader({
             </span>
             <span className="text-[var(--muted)] shrink-0">· {label}</span>
             {(session.model || session.runtime) && (
-              <span
-                className="text-[var(--muted)] shrink-0 font-mono"
-                title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-              >
-                · {session.model ?? session.runtime}
-              </span>
+              <>
+                <span
+                  className="text-[var(--muted)] shrink-0 font-mono"
+                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+                >
+                  · {session.model ?? session.runtime}
+                </span>
+                <span
+                  className="text-[var(--muted)] shrink-0 font-mono opacity-70"
+                  title={
+                    session.effort
+                      ? `Thinking effort: ${session.effort}`
+                      : "Thinking effort: high (SDK default)"
+                  }
+                >
+                  ({session.effort ?? "high"})
+                </span>
+              </>
             )}
           </div>
         )}
@@ -917,6 +939,8 @@ function NewSessionComposer({
   placeholder,
   runtime,
   onRuntime,
+  effort,
+  onEffort,
 }: {
   draft: string;
   onDraft: (v: string) => void;
@@ -926,6 +950,8 @@ function NewSessionComposer({
   placeholder: string;
   runtime: SessionRuntime;
   onRuntime: (r: SessionRuntime) => void;
+  effort: EffortLevel | "";
+  onEffort: (e: EffortLevel | "") => void;
 }) {
   return (
     <div className="border-t border-[var(--border)] p-2.5 bg-[var(--bg-2)]">
@@ -956,15 +982,31 @@ function NewSessionComposer({
       </div>
       <div className="flex items-center justify-between px-1 pt-1">
         <div className="text-[10.5px] text-[var(--muted)]">New session</div>
-        <select
-          value={runtime}
-          onChange={(e) => onRuntime(e.target.value as SessionRuntime)}
-          className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
-          title="Agent runtime"
-        >
-          <option value="claude">Claude</option>
-          <option value="gemini">Gemini</option>
-        </select>
+        <div className="flex items-center gap-1">
+          <select
+            value={runtime}
+            onChange={(e) => onRuntime(e.target.value as SessionRuntime)}
+            className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
+            title="Agent runtime"
+          >
+            <option value="claude">Claude</option>
+            <option value="gemini">Gemini</option>
+          </select>
+          <select
+            value={effort}
+            onChange={(e) => onEffort(e.target.value as EffortLevel | "")}
+            className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
+            title="Thinking effort (Claude only — guides how much the model thinks)"
+            disabled={runtime !== "claude"}
+          >
+            <option value="">default (high)</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+        </div>
       </div>
     </div>
   );

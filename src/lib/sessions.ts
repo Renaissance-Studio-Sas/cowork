@@ -79,6 +79,7 @@ export type { SessionState } from "./session-state-machine";
 // from ./sessions/types.
 export type {
   SessionRuntime,
+  EffortLevel,
   RuntimeSession,
   PendingPermission,
   PendingQuestion,
@@ -88,6 +89,7 @@ export type {
 
 import type {
   SessionRuntime,
+  EffortLevel,
   RuntimeSession,
   PendingPermission,
   PendingQuestion,
@@ -438,6 +440,7 @@ export function getSession(id: string): RuntimeSession | undefined {
   if (s && !s.pendingQuestions) s.pendingQuestions = new Map();
   if (s && !s.pendingCompletions) s.pendingCompletions = new Map();
   if (s && typeof s.completed !== "boolean") s.completed = false;
+  if (s && s.effort === undefined) s.effort = null;
   return s;
 }
 
@@ -516,6 +519,7 @@ export function listLiveSessions(): SessionSummary[] {
       completed: !!s.completed,
       runtime: s.runtime,
       model: s.model,
+      effort: s.effort ?? null,
     };
   });
 }
@@ -530,7 +534,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; runtime?: SessionRuntime; model?: string | null } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -569,6 +573,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       completed: meta.completed === true,
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
+      effort: meta.effort ?? null,
     });
   }
   return out;
@@ -694,6 +699,7 @@ export async function restoreSession(
     sdkSessionId?: string;
     permissionMode?: string;
     model?: string;
+    effort?: EffortLevel;
     finalState?: SessionState;
     seenAt?: string;
     lastActivity?: string;
@@ -759,6 +765,7 @@ export async function restoreSession(
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
+    effort: (meta.effort as EffortLevel | undefined) ?? null,
     // Older meta.json files predate the runtime field — default to "claude"
     // so they keep working unchanged.
     runtime: (meta.runtime as SessionRuntime) ?? "claude",
@@ -859,6 +866,7 @@ export interface StartSessionParams {
   firstMessage: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model?: string;
+  effort?: EffortLevel;
   runtime?: SessionRuntime;       // defaults to "claude"
 }
 
@@ -892,6 +900,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
         startedAt: new Date().toISOString(),
         permissionMode: p.permissionMode ?? "bypassPermissions",
         model: p.model ?? null,
+        effort: p.effort ?? null,
         runtime,
         // Marks the session as in-flight so the boot-time auto-resume pass
         // can detect a server crash mid-process. Overwritten by setState
@@ -938,6 +947,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       runtimeStateDir: sessionDir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
+      ...(p.effort ? { effort: p.effort } : {}),
     },
   });
 
@@ -966,6 +976,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
+    effort: p.effort ?? null,
     runtime,
   };
   registerSession(session);
@@ -1333,7 +1344,7 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
 // Project-level session — cwd is the project folder, sessions persist to
 // `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
 // sessions but at one level up.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; runtime?: SessionRuntime }): Promise<RuntimeSession> {
+export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime }): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
@@ -1357,6 +1368,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       startedAt: new Date().toISOString(),
       permissionMode: p.permissionMode ?? "bypassPermissions",
       model: p.model ?? null,
+      effort: p.effort ?? null,
       runtime,
       finalState: "running",
     }, null, 2),
@@ -1392,6 +1404,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       runtimeStateDir: sessionDir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
+      ...(p.effort ? { effort: p.effort } : {}),
     },
   });
 
@@ -1421,6 +1434,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
+    effort: p.effort ?? null,
     runtime,
   };
   registerSession(session);
@@ -1498,6 +1512,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
+    effort: null,
     // Planning sessions are always Claude — they predate the runtime selector
     // and run before any project has a configured runtime preference.
     runtime: "claude",
@@ -1581,6 +1596,7 @@ export async function startTaskPlanningSession(
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
+    effort: null,
     runtime: "claude",
   };
   registerSession(session);
@@ -1794,6 +1810,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         runtimeStateDir: sessionDir,
         systemPrompt,
         ...(s.model ? { model: s.model } : {}),
+        ...(s.effort ? { effort: s.effort } : {}),
       },
     });
 

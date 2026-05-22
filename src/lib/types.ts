@@ -20,6 +20,10 @@ export interface TaskDTO {
 
 export type SessionRuntime = "claude" | "gemini";
 
+// Thinking effort level. Matches @anthropic-ai/claude-agent-sdk's EffortLevel
+// and the Claude Code CLI's /model command labels.
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface SessionSummaryDTO {
   id: string;
   projectSlug: string;
@@ -33,4 +37,5 @@ export interface SessionSummaryDTO {
   completed: boolean; // sticky "marked complete" flag (manual or agent-suggested + approved)
   runtime: SessionRuntime;
   model: string | null; // actual model id captured from the SDK init event (e.g. "claude-opus-4-7", "gemini-3.5-flash")
+  effort: EffortLevel | null; // thinking effort, null = SDK default ('high')
 }
