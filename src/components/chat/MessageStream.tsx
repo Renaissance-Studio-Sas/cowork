@@ -1,0 +1,313 @@
+// Flatten the SDK message stream into render items, batching consecutive
+// tool calls (across messages) into a single inline-flex row of compact
+// chips. Visible text and user messages break the row. Detects a handful of
+// SDK-injected synthetic messages (resume prompt, interrupt note, compaction
+// summary) and surfaces them as neutral pills instead of regular bubbles.
+// `propose_plan` / `propose_task` tool_uses become interactive cards rather
+// than chips — the most recent one is actionable, earlier ones render dimmed.
+
+import { useState } from "react";
+import type { SessionSummaryDTO } from "@/lib/types";
+import { Markdown } from "./Markdown";
+import { ToolChip } from "./ToolChip";
+import { ProposalCard } from "./proposals";
+import { extractText, isInterruptNoise, isProposalToolName } from "./utils";
+import type { Part, SDKMessageLite } from "./types";
+
+export function MessageStream({
+  messages,
+  session,
+  onChange,
+}: {
+  messages: SDKMessageLite[];
+  session: SessionSummaryDTO;
+  onChange: () => void;
+}) {
+  type Chip = { kind: "tool"; part: Part };
+  type Item =
+    | { kind: "user"; key: string; text: string }
+    | { kind: "asst-text"; key: string; text: string }
+    | { kind: "chip-row"; key: string; chips: Chip[] }
+    | { kind: "proposal"; key: string; name: string; input: Record<string, unknown>; toolUseId: string; isLatest: boolean }
+    | { kind: "result"; key: string }
+    | { kind: "system-info"; key: string; text: string }
+    | { kind: "system-note"; key: string; text: string }
+    | { kind: "system-error"; key: string; text: string }
+    | { kind: "system-compaction"; key: string; summary: string };
+
+  // Find the (i, j) index of the last propose_plan / propose_task tool_use
+  // so we know which one to render as an actionable card. Earlier proposals
+  // fall through to the regular chip rendering.
+  let latestProposalI = -1;
+  let latestProposalJ = -1;
+  for (let i = messages.length - 1; i >= 0 && latestProposalI < 0; i--) {
+    const mm = messages[i] as { type?: string; message?: { content?: unknown } };
+    if (mm.type !== "assistant") continue;
+    const parts = (mm.message?.content as Part[] | undefined) ?? [];
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const p = parts[j];
+      if (p.type === "tool_use" && isProposalToolName(p.name as string)) {
+        latestProposalI = i;
+        latestProposalJ = j;
+        break;
+      }
+    }
+  }
+
+  const items: Item[] = [];
+  let batch: Chip[] = [];
+  let batchKey = "";
+  const flush = () => {
+    if (batch.length) {
+      items.push({ kind: "chip-row", key: batchKey, chips: batch });
+      batch = [];
+      batchKey = "";
+    }
+  };
+
+  messages.forEach((m, i) => {
+    const mm = m as { type?: string; message?: { content?: unknown } };
+    if (mm.type === "user") {
+      // User messages can also be tool-result echoes (no visible text). Those
+      // mustn't break the chip row — only flush when there's actual text.
+      const text = extractText(mm.message?.content).trim();
+      // Hide system-injected resume prompts (sessions.ts pushes this as a
+      // user message so the model has something to continue from after a
+      // server restart — but it's not actually FROM the user). Surfaced as
+      // a small "session resumed" note via system-info instead.
+      const isResumePrompt = text === "[Server restarted — please continue where you left off.]";
+      // The SDK injects "[Request interrupted by user]" as a user message when a
+      // turn is stopped. It's not something the user typed — surface it as a
+      // neutral interruption note instead of a chat bubble.
+      const isInterruptNote = text === "[Request interrupted by user]";
+      // When the SDK auto-compacts a conversation, the next turn starts with a
+      // synthetic user message containing the full summary. Collapse it into a
+      // small "Session compacted" pill so the chat isn't dominated by it.
+      const isCompactionSummary = text.startsWith("This session is being continued from a previous conversation that ran out of context.");
+      if (isResumePrompt) {
+        flush();
+        items.push({ kind: "system-info", key: `sr-${i}`, text: "Session resumed after server restart." });
+      } else if (isInterruptNote) {
+        flush();
+        items.push({ kind: "system-note", key: `int-${i}`, text: "Session interrupted by the user." });
+      } else if (isCompactionSummary) {
+        flush();
+        items.push({ kind: "system-compaction", key: `cp-${i}`, summary: text });
+      } else if (text) {
+        flush();
+        items.push({ kind: "user", key: `u-${i}`, text });
+      }
+    } else if (mm.type === "assistant") {
+      // Synthetic assistant messages are SDK-generated error/status carriers
+      // (e.g. rate limits, aborts), not real model output. The matching
+      // `result` message surfaces the error as a proper error box below, so
+      // skip the synthetic text here to avoid rendering it twice.
+      const model = (mm.message as { model?: string } | undefined)?.model;
+      if (model === "<synthetic>") return;
+      const parts = (mm.message?.content as Part[] | undefined) ?? [];
+      parts.forEach((p, j) => {
+        if (p.type === "tool_use" && isProposalToolName(p.name as string)) {
+          flush();
+          items.push({
+            kind: "proposal",
+            key: `pp-${i}-${j}`,
+            name: p.name as string,
+            input: (p.input ?? {}) as Record<string, unknown>,
+            toolUseId: (p.id as string) ?? `${i}-${j}`,
+            isLatest: i === latestProposalI && j === latestProposalJ,
+          });
+        } else if (p.type === "tool_use") {
+          if (!batch.length) batchKey = `c-${i}-${j}`;
+          batch.push({ kind: "tool", part: p });
+        } else if (p.type === "text" && typeof p.text === "string" && (p.text as string).trim()) {
+          flush();
+          items.push({ kind: "asst-text", key: `at-${i}-${j}`, text: p.text as string });
+        }
+      });
+    } else if (mm.type === "result") {
+      flush();
+      // A result with is_error (e.g. api_error_status 429 rate limit) means the
+      // turn ended in failure. Surface it as an error box; the SDK's `result`
+      // text is already human-readable ("You've hit your session limit …").
+      const res = m as { is_error?: boolean; result?: string; subtype?: string };
+      // An interrupted turn ends with an "error_during_execution" result (or an
+      // abort diagnostic in `result`). That's the user stopping the agent, not a
+      // failure — the interruption note already covers it, so skip the error box.
+      if (res.subtype === "error_during_execution" || isInterruptNoise(res.result)) {
+        items.push({ kind: "result", key: `r-${i}` });
+      } else if (res.is_error) {
+        const text = res.result?.trim() || "The agent stopped due to an error.";
+        items.push({ kind: "system-error", key: `re-${i}`, text });
+      } else {
+        items.push({ kind: "result", key: `r-${i}` });
+      }
+    } else if (mm.type === "system") {
+      const sysMsg = m as { subtype?: string; message?: string };
+      if (sysMsg.subtype === "info" && sysMsg.message) {
+        flush();
+        items.push({ kind: "system-info", key: `si-${i}`, text: sysMsg.message });
+      } else if (sysMsg.subtype === "error" && sysMsg.message) {
+        flush();
+        // An interrupt aborts the in-flight SDK request, which can surface as an
+        // abort/"ede_diagnostic" error. Don't render it — the interruption note
+        // already explains what happened. (Older session logs persisted this
+        // before the server-side fix, so keep filtering it on replay.)
+        if (isInterruptNoise(sysMsg.message)) return;
+        items.push({ kind: "system-error", key: `se-${i}`, text: sysMsg.message });
+      }
+    }
+  });
+  flush();
+
+  return (
+    <>
+      {items.map((it) => {
+        if (it.kind === "user") {
+          const parsed = parseAddressCommentsMessage(it.text);
+          return (
+            <div key={it.key} className="flex justify-end">
+              <div className="max-w-[80%] rounded-2xl rounded-br-md bg-[var(--user-bubble)] text-[var(--text)] px-4 py-2.5 text-[14px] leading-relaxed border border-[var(--border)]">
+                {parsed ? <CommentBriefBubble parsed={parsed} /> : <span className="whitespace-pre-wrap">{it.text}</span>}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "asst-text") {
+          return (
+            <div key={it.key} className="text-[14px] leading-relaxed">
+              <Markdown text={it.text} />
+            </div>
+          );
+        }
+        if (it.kind === "chip-row") {
+          return (
+            <div key={it.key} className="flex flex-wrap gap-1">
+              {it.chips.map((c, j) => <ToolChip key={j} p={c.part} />)}
+            </div>
+          );
+        }
+        if (it.kind === "proposal") {
+          return (
+            <ProposalCard
+              key={it.key}
+              name={it.name}
+              input={it.input}
+              isLatest={it.isLatest}
+              session={session}
+              onCreated={onChange}
+            />
+          );
+        }
+        if (it.kind === "result") {
+          return null;
+        }
+        if (it.kind === "system-info") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-[var(--ok-soft)] border border-[var(--ok)] text-[var(--ok)] px-3 py-1.5 text-[12.5px] font-medium">
+                {it.text}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "system-note") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-[var(--bg-2)] border border-[var(--border)] text-[var(--muted)] px-3 py-1.5 text-[12.5px] font-medium">
+                {it.text}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "system-error") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <div className="rounded-lg bg-red-500/10 border border-red-500/40 text-red-400 px-3 py-1.5 text-[12.5px] font-medium max-w-[80%] text-center">
+                {it.text}
+              </div>
+            </div>
+          );
+        }
+        if (it.kind === "system-compaction") {
+          return (
+            <div key={it.key} className="flex justify-center">
+              <details className="group max-w-[80%]">
+                <summary className="cursor-pointer select-none list-none rounded-lg bg-[var(--bg-2)] border border-[var(--border)] text-[var(--muted)] px-3 py-1.5 text-[12.5px] font-medium inline-flex items-center gap-1.5">
+                  <span className="text-[9px] opacity-70 group-open:rotate-90 transition-transform">▸</span>
+                  <span>Session compacted</span>
+                </summary>
+                <div className="mt-2 rounded-lg bg-[var(--bg-2)] border border-[var(--border)] text-[var(--text-soft)] px-3 py-2 text-[13px] leading-relaxed">
+                  <Markdown text={it.summary} />
+                </div>
+              </details>
+            </div>
+          );
+        }
+        return null;
+      })}
+    </>
+  );
+}
+
+// Detects the "Send to agent" comment-briefing message and pulls the file
+// path + each comment chip out so we can render it as a card instead of a
+// wall of text.
+function parseAddressCommentsMessage(text: string): null | {
+  filePath: string;
+  items: Array<{ id?: number; quote: string; body: string }>;
+  footer: string;
+} {
+  const headerMatch = text.match(/^Please address (?:the following )?comments? on `([^`]+)`:/);
+  if (!headerMatch) return null;
+  const filePath = headerMatch[1];
+  const lines = text.split("\n");
+  const items: Array<{ id?: number; quote: string; body: string }> = [];
+  let footer = "";
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^- (?:\[comment #(\d+)\] )?on "([^"]*)" — (.+)$/);
+    if (m) {
+      items.push({ id: m[1] ? Number(m[1]) : undefined, quote: m[2], body: m[3] });
+      continue;
+    }
+    if (items.length > 0 && line.trim() && !line.startsWith("-")) {
+      footer = lines.slice(i).join("\n").trim();
+      break;
+    }
+  }
+  if (items.length === 0) return null;
+  return { filePath, items, footer };
+}
+
+function CommentBriefBubble({ parsed }: { parsed: NonNullable<ReturnType<typeof parseAddressCommentsMessage>> }) {
+  const [showFooter, setShowFooter] = useState(false);
+  return (
+    <div className="space-y-2">
+      <div className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold">
+        Address comments
+      </div>
+      <div className="text-[13px]">
+        on <span className="font-mono text-[12.5px] bg-[rgba(0,0,0,0.06)] rounded px-1.5 py-0.5">{parsed.filePath}</span>
+      </div>
+      <div className="space-y-1.5 pt-1">
+        {parsed.items.map((c, i) => (
+          <div key={i} className="rounded-lg bg-[rgba(255,255,255,0.55)] border border-[rgba(0,0,0,0.06)] px-2.5 py-1.5 text-[12.5px]">
+            <div className="italic text-[var(--text-soft)] truncate">&ldquo;{c.quote}&rdquo;</div>
+            <div className="mt-0.5">{c.body}</div>
+          </div>
+        ))}
+      </div>
+      {parsed.footer && (
+        <button
+          onClick={() => setShowFooter((v) => !v)}
+          className="text-[11.5px] text-[var(--muted)] hover:text-[var(--text)] underline underline-offset-2"
+        >
+          {showFooter ? "hide instructions" : "show instructions"}
+        </button>
+      )}
+      {showFooter && (
+        <div className="text-[12px] text-[var(--text-soft)] whitespace-pre-wrap pt-1">{parsed.footer}</div>
+      )}
+    </div>
+  );
+}
