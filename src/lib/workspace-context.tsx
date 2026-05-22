@@ -6,8 +6,19 @@ import type { ProjectDTO, SessionSummaryDTO } from "./types";
 interface WorkspaceContextValue {
   projects: ProjectDTO[];
   sessions: SessionSummaryDTO[];
-  awaitingCount: number;
+  pendingCount: number;
   refresh: () => Promise<void>;
+}
+
+// A session is "pending" — needs user attention — when it isn't actively
+// working and hasn't been marked complete. That covers awaiting_input, idle,
+// stopped, and "running but parked on a permission/question/completion card."
+// "error" gets its own treatment.
+export function isPending(s: SessionSummaryDTO): boolean {
+  if (s.completed) return false;
+  if (s.state === "error") return false;
+  if (s.state === "running" && !s.hasPendingPrompt) return false;
+  return true;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
@@ -31,14 +42,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(t);
   }, [refresh]);
 
-  const awaitingCount = useMemo(
-    () => sessions.filter((s) => s.state === "awaiting_input").length,
+  const pendingCount = useMemo(
+    () => sessions.filter(isPending).length,
     [sessions],
   );
 
   const value = useMemo(
-    () => ({ projects, sessions, awaitingCount, refresh }),
-    [projects, sessions, awaitingCount, refresh],
+    () => ({ projects, sessions, pendingCount, refresh }),
+    [projects, sessions, pendingCount, refresh],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
@@ -47,7 +58,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 const defaultContext: WorkspaceContextValue = {
   projects: [],
   sessions: [],
-  awaitingCount: 0,
+  pendingCount: 0,
   refresh: async () => {},
 };
 

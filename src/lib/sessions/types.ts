@@ -93,11 +93,15 @@ export interface AskUserQuestionItem {
   options: Array<{ label: string; description: string; preview?: string }>;
 }
 
+// A user's answer to a single AskUserQuestion item. `refused: true` means
+// the user dismissed the prompt instead of picking an option.
+export type AskUserQuestionAnswer = { selected?: string[]; other?: string } | { refused: true };
+
 export interface PendingQuestion {
   questions: AskUserQuestionItem[];
-  // Each question gets back either an array of selected option labels (from
-  // the provided list) or a single free-text answer typed under "Other".
-  resolve: (answers: Array<{ selected?: string[]; other?: string }>) => void;
+  // The user either answers every question or refuses the whole prompt. We
+  // resolve with `null` for refusal and an array otherwise.
+  resolve: (answers: AskUserQuestionAnswer[] | null) => void;
   requestedAt: Date;
 }
 
@@ -122,6 +126,7 @@ export interface SessionSummary {
   isLive: boolean;
   unread: boolean;               // completed session not yet viewed
   completed: boolean;            // sticky "marked complete" flag (manual or agent-suggested + approved)
+  hasPendingPrompt: boolean;     // agent's turn is parked on a user decision (permission/question/completion)
   runtime: SessionRuntime;
   model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")
   effort: EffortLevel | null;    // thinking effort, null = SDK default ('high')

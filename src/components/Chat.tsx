@@ -509,22 +509,23 @@ export function Chat({ session, onChange, onBack }: Props) {
     return false;
   }, [messages, pendingPermissions]);
 
-  const isWorking = state === "running";
-  const isAwaiting = state === "awaiting_input";
-  const isPaused = state === "idle" || state === "stopped"; // paused, not necessarily complete
+  // A "pending prompt" — agent's turn is parked on a permission, question, or
+  // completion card. State stays "running" while the prompt is open, but the
+  // user is the one being asked to act, so we treat it as pending.
+  const hasPendingPrompt =
+    pendingPermissions.size > 0 || pendingQuestions.size > 0 || pendingCompletions.size > 0;
+  const isWorking = state === "running" && !hasPendingPrompt;
+  const isPending = !completed && state !== "error" && !isWorking;
   const stateLabel =
     completed ? "completed" :
-    isAwaiting ? "needs your reply" :
-    isWorking ? "working" :
     state === "error" ? "error" :
-    isPaused ? "pending" : "idle";
+    isWorking ? "working" :
+    "pending";
   const stateColor =
     completed ? "var(--ok)" :
-    isAwaiting ? "var(--warn)" :
-    isWorking ? "var(--accent)" :
     state === "error" ? "#e87a7a" :
-    isPaused ? "var(--muted)" :
-    "var(--muted)";
+    isWorking ? "var(--accent)" :
+    "var(--warn)";
 
   return (
     <>
@@ -557,7 +558,7 @@ export function Chat({ session, onChange, onBack }: Props) {
             <span>{session.projectSlug}{session.taskSlug ? ` · ${session.taskSlug}` : ""}</span>
             <span>·</span>
             <span
-              className={`inline-flex items-center gap-1 ${isAwaiting ? "pulse" : ""}`}
+              className={`inline-flex items-center gap-1 ${isPending ? "pulse" : ""}`}
               style={{ color: stateColor }}
             >
               {isWorking ? (
@@ -772,6 +773,7 @@ export function Chat({ session, onChange, onBack }: Props) {
         </div>
       )}
 
+      {pendingQuestions.size === 0 && (
       <div className="border-t border-[var(--border)] px-6 py-4 bg-[var(--bg)]">
         <div className="max-w-[760px] mx-auto">
           {/* Show ContinueComposer for stopped/error sessions that need resuming,
@@ -789,7 +791,7 @@ export function Chat({ session, onChange, onBack }: Props) {
                   ref={composerRef}
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder={state === "awaiting_input" ? "Reply to your agent…" : "Drop files or type a message…"}
+                  placeholder={isPending ? "Reply to your agent…" : "Drop files or type a message…"}
                   rows={1}
                   style={{ maxHeight: 200 }}
                   onInput={(e) => {
@@ -824,6 +826,7 @@ export function Chat({ session, onChange, onBack }: Props) {
           )}
         </div>
       </div>
+      )}
     </>
   );
 }

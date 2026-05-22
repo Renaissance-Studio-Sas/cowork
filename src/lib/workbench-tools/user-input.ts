@@ -65,7 +65,7 @@ This tool is wired to the built-in AskUserQuestion via toolAliases — calling e
           })),
         }));
 
-        const answers = await new Promise<Array<{ selected?: string[]; other?: string }>>((resolve) => {
+        const answers = await new Promise<Array<{ selected?: string[]; other?: string } | { refused: true }> | null>((resolve) => {
           s.pendingQuestions.set(questionId, {
             questions: items,
             resolve,
@@ -74,20 +74,33 @@ This tool is wired to the built-in AskUserQuestion via toolAliases — calling e
           s.events.emit("question_request", { questionId, questions: items });
         });
 
+        if (answers === null) {
+          return {
+            content: [{
+              type: "text",
+              text: "The user declined to answer this AskUserQuestion. Don't re-ask; either proceed with a reasonable default or wait for the user's next message.",
+            }],
+          };
+        }
+
         const lines: string[] = [];
         items.forEach((q, i) => {
-          const a = answers[i] ?? {};
-          const sel = a.selected ?? [];
-          const other = a.other?.trim();
+          const a = answers[i];
           let answerText: string;
-          if (other && sel.length === 0) {
-            answerText = `Other: ${other}`;
-          } else if (other) {
-            answerText = `${sel.join(", ")}; Other: ${other}`;
-          } else if (sel.length > 0) {
-            answerText = sel.join(", ");
-          } else {
+          if (!a || "refused" in a) {
             answerText = "(no answer)";
+          } else {
+            const sel = a.selected ?? [];
+            const other = a.other?.trim();
+            if (other && sel.length === 0) {
+              answerText = `Other: ${other}`;
+            } else if (other) {
+              answerText = `${sel.join(", ")}; Other: ${other}`;
+            } else if (sel.length > 0) {
+              answerText = sel.join(", ");
+            } else {
+              answerText = "(no answer)";
+            }
           }
           lines.push(`Q${i + 1}: ${q.question}\nA: ${answerText}`);
         });

@@ -31,25 +31,33 @@ function iconForFile(p: string): string {
 }
 
 const STATE_LABEL: Record<SessionSummaryDTO["state"], string> = {
-  awaiting_input: "needs your reply",
+  awaiting_input: "pending",
   running: "working",
-  idle: "pending",   // no longer auto-"done" — completion requires explicit mark
+  idle: "pending",
   stopped: "pending",
   error: "error",
 };
 const STATE_COLOR: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
-  idle: "var(--muted)",
-  stopped: "var(--muted)",
+  idle: "var(--warn)",
+  stopped: "var(--warn)",
   error: "#dc2626",
 };
 
+function effectiveState(s: SessionSummaryDTO): SessionSummaryDTO["state"] {
+  return s.state === "running" && s.hasPendingPrompt ? "awaiting_input" : s.state;
+}
 function sessionLabel(s: SessionSummaryDTO): string {
-  return s.completed ? "completed" : STATE_LABEL[s.state];
+  return s.completed ? "completed" : STATE_LABEL[effectiveState(s)];
 }
 function sessionColor(s: SessionSummaryDTO): string {
-  return s.completed ? "var(--ok)" : STATE_COLOR[s.state];
+  return s.completed ? "var(--ok)" : STATE_COLOR[effectiveState(s)];
+}
+function sessionIsPending(s: SessionSummaryDTO): boolean {
+  if (s.completed) return false;
+  const st = effectiveState(s);
+  return st !== "running" && st !== "error";
 }
 
 export default function TaskPage() {
@@ -626,13 +634,14 @@ function SessionStateIcon({ session }: { session: SessionSummaryDTO }) {
       </span>
     );
   }
-  if (session.state === "running") {
+  const st = effectiveState(session);
+  if (st === "running") {
     return <WorkingIndicator size={12} />;
   }
   return (
     <span
-      className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${session.state === "awaiting_input" ? "pulse" : ""}`}
-      style={{ background: STATE_COLOR[session.state] }}
+      className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${sessionIsPending(session) ? "pulse" : ""}`}
+      style={{ background: STATE_COLOR[st] }}
     />
   );
 }

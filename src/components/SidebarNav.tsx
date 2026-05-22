@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
-import { useWorkspace } from "@/lib/workspace-context";
+import { isPending, useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { StatusChip } from "./StatusChip";
 import { WorkingIndicator } from "./WorkingIndicator";
@@ -30,7 +30,7 @@ interface Props {
 
 export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const pathname = usePathname();
-  const { projects, sessions, awaitingCount, refresh } = useWorkspace();
+  const { projects, sessions, pendingCount, refresh } = useWorkspace();
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [recentCollapsed, setRecentCollapsed] = useState(false);
@@ -79,9 +79,8 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const taskCounts = (project: string, task: string) => {
     const list = sessions.filter((s) => s.projectSlug === project && s.taskSlug === task);
     return {
-      total: list.filter((s) => !s.completed).length,
-      awaiting: list.filter((s) => s.state === "awaiting_input").length,
-      running: list.filter((s) => s.state === "running").length,
+      pending: list.filter(isPending).length,
+      running: list.filter((s) => s.state === "running" && !s.hasPendingPrompt).length,
       unread: list.filter((s) => s.unread).length,
     };
   };
@@ -90,9 +89,8 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const projectCounts = (project: string) => {
     const list = sessions.filter((s) => s.projectSlug === project);
     return {
-      total: list.filter((s) => !s.completed).length,
-      awaiting: list.filter((s) => s.state === "awaiting_input").length,
-      running: list.filter((s) => s.state === "running").length,
+      pending: list.filter(isPending).length,
+      running: list.filter((s) => s.state === "running" && !s.hasPendingPrompt).length,
     };
   };
 
@@ -295,9 +293,9 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
           <span className="flex-1 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
             Projects
           </span>
-          {awaitingCount > 0 && (
-            <span className="text-[10px] text-[var(--warn)] pulse whitespace-nowrap" title={`${awaitingCount} agent(s) awaiting input`}>
-              ●{awaitingCount}
+          {pendingCount > 0 && (
+            <span className="text-[10px] text-[var(--warn)] pulse whitespace-nowrap" title={`${pendingCount} pending session(s)`}>
+              ●{pendingCount}
             </span>
           )}
           <span
@@ -386,12 +384,10 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                     {label}
                   </Link>
                 )}
-                {pCounts.awaiting > 0 ? (
-                  <span className="pulse text-[10px] text-[var(--warn)]" title={`${pCounts.awaiting} awaiting · ${pCounts.total} pending total`}>●{pCounts.total}</span>
+                {pCounts.pending > 0 ? (
+                  <span className="pulse text-[10px] text-[var(--warn)]" title={`${pCounts.pending} pending session(s)`}>●{pCounts.pending}</span>
                 ) : pCounts.running > 0 ? (
-                  <span className="text-[10px] text-[var(--accent)]" title={`${pCounts.running} running · ${pCounts.total} pending total`}>●{pCounts.total}</span>
-                ) : pCounts.total > 0 ? (
-                  <span className="text-[10px] text-[var(--muted)]" title={`${pCounts.total} pending session(s) across project + tasks`}>{pCounts.total}</span>
+                  <span className="text-[10px] text-[var(--accent)]" title={`${pCounts.running} working`}>●{pCounts.running}</span>
                 ) : null}
                 <span
                   role="button" tabIndex={0}
@@ -445,7 +441,7 @@ function TaskRow({
 }: {
   projectSlug: string;
   task: TaskDTO;
-  counts: { total: number; awaiting: number; running: number; unread: number };
+  counts: { pending: number; running: number; unread: number };
   selected: boolean;
   renaming: string | null;
   onRenameChange: (v: string) => void;
@@ -512,12 +508,10 @@ function TaskRow({
               {counts.unread}
             </span>
           )}
-          {counts.awaiting > 0 ? (
-            <span className="pulse text-[10px] text-[var(--warn)]" title={`${counts.awaiting} awaiting`}>●{counts.awaiting}</span>
+          {counts.pending > 0 ? (
+            <span className="pulse text-[10px] text-[var(--warn)]" title={`${counts.pending} pending`}>●{counts.pending}</span>
           ) : counts.running > 0 ? (
-            <span className="text-[10px] text-[var(--accent)]" title={`${counts.running} running`}>●{counts.running}</span>
-          ) : counts.total > 0 ? (
-            <span className="text-[10px] text-[var(--muted)]" title={`${counts.total} session(s)`}>{counts.total}</span>
+            <span className="text-[10px] text-[var(--accent)]" title={`${counts.running} working`}>●{counts.running}</span>
           ) : null}
         </div>
       )}
@@ -559,16 +553,12 @@ function RecentSessionRow({ session, selected }: { session: SessionSummaryDTO; s
   };
 
   const stateIcon = () => {
-    switch (session.state) {
-      case "running":
-        return <WorkingIndicator size={11} title="Working" />;
-      case "awaiting_input":
-        return <span className="pulse text-[var(--warn)]" title="Awaiting input">●</span>;
-      case "error":
-        return <span className="text-red-500" title="Error">●</span>;
-      default:
-        return null;
+    if (session.completed) return null;
+    if (session.state === "error") return <span className="text-red-500" title="Error">●</span>;
+    if (session.state === "running" && !session.hasPendingPrompt) {
+      return <WorkingIndicator size={11} title="Working" />;
     }
+    return <span className="pulse text-[var(--warn)]" title="Pending">●</span>;
   };
 
   return (

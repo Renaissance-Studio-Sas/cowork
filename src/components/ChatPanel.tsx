@@ -47,17 +47,17 @@ type SDKMessageLite =
   | Record<string, unknown>;
 
 const STATE_LABEL: Record<string, string> = {
-  awaiting_input: "needs reply",
+  awaiting_input: "pending",
   running: "working",
-  idle: "done",
-  stopped: "done", // stopped sessions seamlessly resume, show as done
+  idle: "pending",
+  stopped: "pending",
   error: "error",
 };
 const STATE_COLOR: Record<string, string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
-  idle: "var(--ok)",
-  stopped: "var(--ok)", // same as idle/done
+  idle: "var(--warn)",
+  stopped: "var(--warn)",
   error: "#dc2626",
 };
 
@@ -254,8 +254,9 @@ function ChatPanelHeader({
   const state = session?.state ?? "idle";
   const label = STATE_LABEL[state] ?? state;
   const color = STATE_COLOR[state] ?? "var(--muted)";
-  const isWorking = state === "running";
-  const isAwaiting = state === "awaiting_input";
+  const hasPendingPrompt = session?.hasPendingPrompt ?? false;
+  const isWorking = state === "running" && !hasPendingPrompt;
+  const isPending = !session?.completed && state !== "error" && !isWorking;
 
   return (
     <div className="px-3 py-3 border-b border-[var(--border)] flex items-center gap-2">
@@ -286,10 +287,10 @@ function ChatPanelHeader({
         {session && (
           <div className="text-[11px] flex items-center gap-1.5 mt-0.5 truncate" style={{ color }}>
             <span
-              className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${isWorking || isAwaiting ? "pulse" : ""}`}
+              className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${isWorking || isPending ? "pulse" : ""}`}
               style={{ background: color }}
             />
-            <span className={`truncate ${isWorking || isAwaiting ? "pulse" : ""}`}>
+            <span className={`truncate ${isWorking || isPending ? "pulse" : ""}`}>
               {session.title || "(no title)"}
               {isWorking && <span className="dots ml-0.5" aria-hidden />}
             </span>
@@ -424,7 +425,7 @@ function SessionSelector({
             >
               <div className="flex items-center gap-2">
                 <span
-                  className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${s.state === "awaiting_input" || s.state === "running" ? "pulse" : ""}`}
+                  className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${!s.completed && s.state !== "error" ? "pulse" : ""}`}
                   style={{ background: color }}
                 />
                 {isEditing ? (
@@ -803,7 +804,7 @@ function LiveChat({
   };
 
   const isWorking = state === "running";
-  const isAwaiting = state === "awaiting_input";
+  const isPending = !session.completed && state !== "error" && !isWorking;
 
   return (
     <>
@@ -890,7 +891,7 @@ function LiveChat({
               ref={composerRef}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              placeholder={isAwaiting ? "Reply…" : state === "stopped" || state === "error" ? "Continue…" : "Drop files or message…"}
+              placeholder={isPending ? "Reply…" : state === "error" ? "Continue…" : "Drop files or message…"}
               rows={1}
               style={{ maxHeight: 140 }}
               onInput={(e) => {

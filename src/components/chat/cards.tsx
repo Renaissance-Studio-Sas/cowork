@@ -174,19 +174,48 @@ export function QuestionCard({
     }
   };
 
+  const refuse = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/question`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questionId, refused: true }),
+      });
+      const j = await r.json();
+      if (!j.ok) setError(j.error ?? "failed");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-4 space-y-4">
       <div className="flex items-center justify-between">
         <div className="text-[12px] font-semibold text-[var(--accent)]">
           {questions.length === 1 ? "Agent is asking" : `Agent is asking ${questions.length} questions`}
         </div>
-        <button
-          onClick={submit}
-          disabled={!canSubmit || busy}
-          className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] disabled:opacity-40 hover:brightness-110 transition"
-        >
-          {busy ? "…" : "Send answer"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={refuse}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[var(--text)] hover:bg-[var(--panel-2)] disabled:opacity-40 transition"
+            title="Skip this prompt — agent will proceed without your answer"
+          >
+            Refuse
+          </button>
+          <button
+            onClick={submit}
+            disabled={!canSubmit || busy}
+            className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--accent)] text-[var(--accent-text)] disabled:opacity-40 hover:brightness-110 transition"
+          >
+            {busy ? "…" : "Send answer"}
+          </button>
+        </div>
       </div>
 
       {questions.map((q, qi) => (

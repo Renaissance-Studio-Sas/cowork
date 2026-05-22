@@ -66,7 +66,13 @@ export function MessageStream({
   };
 
   messages.forEach((m, i) => {
-    const mm = m as { type?: string; message?: { content?: unknown } };
+    const mm = m as { type?: string; message?: { content?: unknown }; parent_tool_use_id?: string | null };
+    // Messages with a non-null parent_tool_use_id come from a Task() subagent's
+    // own turn — they belong to the subagent's transcript, not the parent
+    // chat. The parent already shows the Agent tool_use as a chip (with the
+    // full prompt in its expanded JSON), so suppress the subagent's bubbles
+    // and tool chips here.
+    if (mm.parent_tool_use_id) return;
     if (mm.type === "user") {
       // User messages can also be tool-result echoes (no visible text). Those
       // mustn't break the chip row — only flush when there's actual text.

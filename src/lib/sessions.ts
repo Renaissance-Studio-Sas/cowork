@@ -417,7 +417,8 @@ export function resolveCompletionSuggestion(
 export function resolveQuestion(
   id: string,
   questionId: string,
-  answers: Array<{ selected?: string[]; other?: string }>,
+  // null = the user refused the prompt instead of answering.
+  answers: Array<{ selected?: string[]; other?: string } | { refused: true }> | null,
 ): boolean {
   const s = registry.get(id);
   if (!s) return false;
@@ -506,6 +507,10 @@ export function listLiveSessions(): SessionSummary[] {
     // Running sessions are never marked unread — user sees them update in real-time
     // Sessions marked complete are never unread — completion explicitly clears the badge
     const unread = !s.completed && s.completedAt !== null && (!s.seenAt || s.completedAt > s.seenAt);
+    const hasPendingPrompt =
+      s.pendingPermissions.size > 0
+      || (s.pendingQuestions?.size ?? 0) > 0
+      || (s.pendingCompletions?.size ?? 0) > 0;
     return {
       id: s.id,
       projectSlug: s.projectSlug,
@@ -517,6 +522,7 @@ export function listLiveSessions(): SessionSummary[] {
       isLive: true,
       unread,
       completed: !!s.completed,
+      hasPendingPrompt,
       runtime: s.runtime,
       model: s.model,
       effort: s.effort ?? null,
@@ -571,6 +577,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       isLive: false,
       unread,
       completed: meta.completed === true,
+      hasPendingPrompt: false, // historical sessions have no in-memory pending state
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
       effort: meta.effort ?? null,

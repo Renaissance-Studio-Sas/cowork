@@ -74,10 +74,9 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
   };
 
   const isWorking = state === "running";
-  const isAwaiting = state === "awaiting_input";
-  const isDone = state === "idle" || state === "stopped"; // stopped sessions seamlessly resume, treat as done
-  const label = isAwaiting ? "needs your reply" : isWorking ? "working" : isDone ? "done" : state === "error" ? "error" : "idle";
-  const color = isAwaiting ? "var(--warn)" : isWorking ? "var(--accent)" : isDone ? "var(--ok)" : state === "error" ? "#dc2626" : "var(--muted)";
+  const isPending = !isWorking && state !== "error";
+  const label = isWorking ? "working" : state === "error" ? "error" : "pending";
+  const color = isWorking ? "var(--accent)" : state === "error" ? "#dc2626" : "var(--warn)";
 
   return (
     <aside className="w-[380px] shrink-0 border-l border-[var(--border)] bg-[var(--bg-2)] flex flex-col">
@@ -85,8 +84,8 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
         <div className="flex-1 min-w-0">
           <div className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold">Agent</div>
           <div className="text-[11.5px] flex items-center gap-1.5 mt-0.5" style={{ color }}>
-            <span className={`inline-block w-1.5 h-1.5 rounded-full ${isWorking || isAwaiting ? "pulse" : ""}`} style={{ background: color }} />
-            <span className={isWorking || isAwaiting ? "pulse" : ""}>{label}</span>
+            <span className={`inline-block w-1.5 h-1.5 rounded-full ${isWorking || isPending ? "pulse" : ""}`} style={{ background: color }} />
+            <span className={isWorking || isPending ? "pulse" : ""}>{label}</span>
             {isWorking && <span className="dots" aria-hidden />}
           </div>
         </div>
@@ -116,7 +115,7 @@ export function AgentPanel({ sessionId, projectSlug, taskSlug, onClose, onOpenFu
             ref={composerRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder={isAwaiting ? "Reply…" : "Send a message…"}
+            placeholder={isPending ? "Reply…" : "Send a message…"}
             rows={1}
             style={{ maxHeight: 140 }}
             onInput={(e) => {

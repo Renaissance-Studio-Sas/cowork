@@ -13,7 +13,7 @@ interface Props {
 
 export function AppShell({ children }: Props) {
   const router = useRouter();
-  const { awaitingCount, refresh } = useWorkspace();
+  const { pendingCount, refresh } = useWorkspace();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [newTaskFor, setNewTaskFor] = useState<string | null>(null);
   const [showNewProject, setShowNewProject] = useState(false);
@@ -36,7 +36,7 @@ export function AppShell({ children }: Props) {
           onClose={() => setSidebarOpen(false)}
         />
       ) : (
-        <FoldedRail onExpand={() => setSidebarOpen(true)} awaitingCount={awaitingCount} />
+        <FoldedRail onExpand={() => setSidebarOpen(true)} pendingCount={pendingCount} />
       )}
 
       <main className="flex-1 min-w-0 flex flex-col bg-[var(--bg)] relative">
@@ -68,7 +68,7 @@ export function AppShell({ children }: Props) {
   );
 }
 
-function FoldedRail({ onExpand, awaitingCount }: { onExpand: () => void; awaitingCount: number }) {
+function FoldedRail({ onExpand, pendingCount }: { onExpand: () => void; pendingCount: number }) {
   return (
     <aside className="w-12 shrink-0 bg-[var(--bg-2)] border-r border-[var(--border)] flex flex-col items-center pt-3 gap-3">
       <button
@@ -82,9 +82,9 @@ function FoldedRail({ onExpand, awaitingCount }: { onExpand: () => void; awaitin
           <line x1="4" y1="18" x2="20" y2="18" />
         </svg>
       </button>
-      {awaitingCount > 0 && (
-        <span className="pulse text-[10.5px] text-[var(--warn)] font-medium" title={`${awaitingCount} awaiting`}>
-          ●{awaitingCount}
+      {pendingCount > 0 && (
+        <span className="pulse text-[10.5px] text-[var(--warn)] font-medium" title={`${pendingCount} pending`}>
+          ●{pendingCount}
         </span>
       )}
     </aside>
