@@ -86,6 +86,16 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
     };
   };
 
+  // Aggregate counts across all sessions in a project (root + every task).
+  const projectCounts = (project: string) => {
+    const list = sessions.filter((s) => s.projectSlug === project);
+    return {
+      total: list.filter((s) => !s.completed).length,
+      awaiting: list.filter((s) => s.state === "awaiting_input").length,
+      running: list.filter((s) => s.state === "running").length,
+    };
+  };
+
   // Check if a project has any unread sessions (across all its tasks)
   const projectHasUnread = (projectSlug: string) => {
     return sessions.some((s) => s.projectSlug === projectSlug && s.unread);
@@ -317,6 +327,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
           const isDragOver = dragOver === p.slug;
           const projectDone = p.status === "done";
           const isProjectSelected = selected.project === p.slug && !selected.task;
+          const pCounts = projectCounts(p.slug);
 
           return (
             <div key={p.slug} className="mb-2">
@@ -375,6 +386,13 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                     {label}
                   </Link>
                 )}
+                {pCounts.awaiting > 0 ? (
+                  <span className="pulse text-[10px] text-[var(--warn)]" title={`${pCounts.awaiting} awaiting · ${pCounts.total} pending total`}>●{pCounts.total}</span>
+                ) : pCounts.running > 0 ? (
+                  <span className="text-[10px] text-[var(--accent)]" title={`${pCounts.running} running · ${pCounts.total} pending total`}>●{pCounts.total}</span>
+                ) : pCounts.total > 0 ? (
+                  <span className="text-[10px] text-[var(--muted)]" title={`${pCounts.total} pending session(s) across project + tasks`}>{pCounts.total}</span>
+                ) : null}
                 <span
                   role="button" tabIndex={0}
                   onClick={(e) => { e.stopPropagation(); onNewTask(p.slug); }}
