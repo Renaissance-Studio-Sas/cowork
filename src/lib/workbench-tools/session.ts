@@ -138,26 +138,20 @@ exactly one extension-enabled profile open and you don't care which.`,
 
     defineTool(
       "chrome_open_profile",
-      `Open a new Chrome window in a specific profile and bind the MCP bridge
-to that profile. Steps performed:
+      `Open a new Chrome window in a specific profile, pointed at the Claude
+reconnect URL. The extension in that profile auto-handshakes silently — there
+is no Connect button and the user does not need to click anything. The
+launched tab will flash open and close on its own within ~2-3 seconds; that
+flash IS the success path.
 
-1. Kill any existing --chrome-native-host processes and remove their .sock
-   files. The Claude SDK's claude-in-chrome-mcp CLI picks one .sock
-   non-deterministically when several are present, and the picked socket
-   determines which profile's extension answers tool calls — wiping first
-   guarantees the new sock belongs to the requested profile.
-2. Launch Chrome with --profile-directory=<id> --new-window pointed at the
-   Claude reconnect URL. The extension auto-handshakes; the launched tab
-   closes on its own within ~3s.
-3. Wait up to 10s for the new native-messaging .sock to appear.
-4. Record the per-session profile binding so chrome_status can report it.
+Implementation note: this invokes the Chrome binary directly with
+--profile-directory + --new-window so the profile flag is respected even
+when Chrome is already running (macOS \`open -a\` silently routes the URL
+to whatever window is focused).
 
-After this returns success, call chrome_connect to wire the bridge into
-the session's MCP map.
-
-Side effect: any other concurrent cowork session bound to a different
-profile will lose its bridge — see docs/chrome-mcp-per-session.md. Multiple
-sessions on the same profile coexist fine.`,
+After calling this, wait briefly then call chrome_connect to wire the
+freshly-established bridge into this session's MCP map. Use chrome_status
+to verify the socket appeared.`,
       {
         profile_id: z.string().describe('The Chrome profile ID (e.g., "Default" or "Profile 1"). Use chrome_list_profiles to see available IDs.'),
       },
@@ -180,23 +174,6 @@ sessions on the same profile coexist fine.`,
           };
         }
 
-        // Step 1: kill all existing native-host processes and their socks so
-        // the new sock that appears is guaranteed to belong to the target
-        // profile's extension.
-        const socketDir = getChromeSocketDir();
-        const existingPids = findNativeHostPids();
-        const existingSocks = listChromeSocketFiles();
-        for (const pid of existingPids) {
-          try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-        }
-        for (const f of existingSocks) {
-          try { execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" }); } catch { /* ignore */ }
-        }
-        // All session bindings are invalidated by the wipe.
-        expectedProfileBySession.clear();
-        boundProfileBySession.clear();
-
-        // Step 2: launch Chrome in the target profile.
         const opened = openChromeReconnectPage(profile_id);
         if (!opened) {
           return {
@@ -205,26 +182,10 @@ sessions on the same profile coexist fine.`,
           };
         }
 
-        // Step 3: wait up to 10s for the new sock to appear.
-        const deadline = Date.now() + 10_000;
-        let socksAfter: string[] = [];
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 200));
-          socksAfter = listChromeSocketFiles();
-          if (socksAfter.length >= 1) break;
-        }
-
-        if (socksAfter.length === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: `Chrome window opened in profile "${profile.name}" (${profile.email}), but no native-messaging socket appeared within 10s. The Claude extension may be disabled in that profile, or Chrome routed the URL to a different window. Check chrome://extensions in profile "${profile_id}" and retry.`,
-            }],
-            isError: true,
-          };
-        }
-
-        // Step 4: record bindings for this session.
+        // Record this session's expected + bound profile. The underlying
+        // native-messaging socket is shared across sessions on the same OS
+        // user — see docs/chrome-mcp-per-session.md — but this map gives
+        // chrome_status a reliable per-session attribution.
         expectedProfileBySession.set(sessionId, { id: profile_id, email: profile.email });
         boundProfileBySession.set(sessionId, {
           id: profile_id,
@@ -233,13 +194,10 @@ sessions on the same profile coexist fine.`,
           boundAt: new Date(),
         });
 
-        const wiped = existingPids.length > 0
-          ? ` Killed ${existingPids.length} stale native-host process(es) first.`
-          : "";
         return {
           content: [{
             type: "text",
-            text: `Opened Chrome in profile "${profile.name}" (${profile.email}).${wiped} Bridge sock(s): ${socksAfter.join(", ")}. Call chrome_connect to wire the MCP, then chrome_status to verify.`,
+            text: `Opened a new Chrome window in profile "${profile.name}" (${profile.email}). The extension auto-handshakes silently — the launched tab will close on its own within a few seconds; that is success, not failure. Wait ~3s, then call chrome_status to confirm the socket appeared, then chrome_connect.`,
           }],
         };
       },
