@@ -1635,9 +1635,22 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
   // Interrupt any existing query to stop the old pumpEvents loop.
   // This prevents race conditions where the old loop overwrites state after
   // the new one has already set it.
+  //
+  // Wrap with a 2s timeout: the Claude SDK's interrupt() writes a
+  // control_request to the bridge subprocess and waits for an ack on the
+  // same channel. If the bridge has already exited (e.g. after the user
+  // hit Stop, which left s.q referencing a dead transport), the write
+  // succeeds locally but no response ever arrives — the promise hangs
+  // forever. Without this guard, resume-after-stop blocks for tens of
+  // seconds and ends up creating a new query against a dead transport,
+  // so the UI sees "send button does nothing" — the request is in flight
+  // for ~30s and produces zero agent output.
   if (s.q) {
     try {
-      await s.q.interrupt();
+      await Promise.race([
+        s.q.interrupt(),
+        new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+      ]);
     } catch {
       // Ignore errors — query may already be done
     }
