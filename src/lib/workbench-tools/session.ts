@@ -315,59 +315,49 @@ control. If "Connection: not connected", call chrome_open_profile.`,
 
     defineTool(
       "chrome_force_reset",
-      `Reset the Chrome MCP plumbing. By default, it clears this session's profile binding and only kills the native-host processes if no other sessions are active (session-scoped reset). If global is set to true, it performs a nuclear reset: SIGKILLs all --chrome-native-host processes and deletes all socket files, affecting all concurrent sessions.
+      `SIGTERM every --chrome-native-host process, remove every .sock file in
+the bridge directory, and clear all session profile bindings. Disrupts any
+concurrent cowork session using Chrome — by design, since the SDK reads all
+socks into one pool and a stale sock from a dead profile causes non-tabId
+tool calls (notably tabs_create_mcp) to land in the wrong profile.
 
-After running this, call chrome_open_profile(profile_id) to spin a fresh
-auto-handshake (no user click needed), then chrome_connect.`,
-      {
-        global: z.boolean().optional().describe("Perform a global, nuclear reset across all sessions on the machine.")
-      },
-      async ({ global }) => {
-        boundProfileBySession.delete(sessionId);
-        expectedProfileBySession.delete(sessionId);
-
-        const otherSessions = Array.from(boundProfileBySession.keys());
-        const shouldDoNuclear = global || otherSessions.length === 0;
-
-        const lines: string[] = [];
-        if (shouldDoNuclear) {
-          const pids = findNativeHostPids();
-          const killed: number[] = [];
-          for (const pid of pids) {
-            try {
-              process.kill(pid, "SIGTERM");
-              killed.push(pid);
-            } catch { /* already gone */ }
-          }
-          const socketDir = getChromeSocketDir();
-          let socketsRemoved = 0;
+After this, call chrome_open_profile(profile_id) to spin a fresh handshake,
+then chrome_connect.`,
+      {},
+      async () => {
+        const pids = findNativeHostPids();
+        const killed: number[] = [];
+        for (const pid of pids) {
           try {
-            for (const f of listChromeSocketFiles()) {
-              execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" });
-              socketsRemoved++;
-            }
-          } catch { /* ignore */ }
-          
-          boundProfileBySession.clear();
-
-          lines.push(
-            `Performed GLOBAL nuclear reset:`,
-            `  Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
-            `  Stale .sock files removed: ${socketsRemoved}`,
-            `  All session bindings cleared.`,
-            ``,
-            `Next: call chrome_open_profile(profile_id) — Chrome auto-handshakes, no user click — then chrome_connect.`
-          );
-        } else {
-          lines.push(
-            `Performed SCOPED reset for this session:`,
-            `  This session's profile binding is cleared.`,
-            `  Stale native-host processes and socket files were left intact to avoid disrupting other active sessions: ${otherSessions.join(", ")}.`,
-            `  To force-kill all processes and clear all sockets, run chrome_force_reset with { global: true }.`
-          );
+            process.kill(pid, "SIGTERM");
+            killed.push(pid);
+          } catch { /* already gone */ }
         }
+        const socketDir = getChromeSocketDir();
+        let socketsRemoved = 0;
+        try {
+          for (const f of listChromeSocketFiles()) {
+            execSync(`rm -f "${path.join(socketDir, f)}"`, { stdio: "ignore" });
+            socketsRemoved++;
+          }
+        } catch { /* ignore */ }
 
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        boundProfileBySession.clear();
+        expectedProfileBySession.clear();
+
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Chrome bridge nuked:`,
+              `  Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
+              `  Removed ${socketsRemoved} .sock file(s)`,
+              `  All session bindings cleared`,
+              ``,
+              `Next: chrome_open_profile(profile_id), then chrome_connect.`,
+            ].join("\n"),
+          }],
+        };
       },
     ),
 
