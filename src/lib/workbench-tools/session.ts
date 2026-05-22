@@ -228,15 +228,24 @@ control. If "Connection: not connected", call chrome_open_profile.`,
 
         const currentBound = boundProfileBySession.get(sessionId) ?? null;
         const connected = socketExists && nativeHostPids.length > 0;
+        const multiSocket = nativeHostPids.length > 1;
         if (connected && currentBound) {
-          lines.push(`Connection: ✅ CONNECTED to ${currentBound.id} (${currentBound.email})`);
+          lines.push(`Connection: ✅ CONNECTED`);
+          lines.push(`  Profile: "${currentBound.name}" — ${currentBound.email} (id: ${currentBound.id})`);
+          if (multiSocket) {
+            lines.push(
+              `  ⚠ ${nativeHostPids.length} native-host sockets are live — the MCP CLI may have picked a different one`,
+              `    than the bound profile. If browser tools target the wrong account, call chrome_force_reset`,
+              `    then chrome_open_profile("${currentBound.id}") again.`,
+            );
+          }
         } else if (connected) {
           const guess = localState.lastUsed ? profileById.get(localState.lastUsed) : null;
-          lines.push(
-            `Connection: ✅ connected, but profile unknown to this session`
-              + (guess ? ` (likely ${localState.lastUsed} / ${guess.email} — Chrome's last-focused)` : "")
-              + `. To attribute reliably, call chrome_open_profile next time.`,
-          );
+          lines.push(`Connection: ✅ connected, but profile unknown to this session`);
+          if (guess) {
+            lines.push(`  Likely: "${guess.name}" — ${guess.email} (id: ${localState.lastUsed}, Chrome's last-focused)`);
+          }
+          lines.push(`  → To attribute reliably, call chrome_open_profile(profile_id).`);
         } else {
           lines.push(`Connection: ❌ NOT CONNECTED — call chrome_open_profile(profile_id) to bind one.`);
         }
@@ -246,23 +255,23 @@ control. If "Connection: not connected", call chrome_open_profile.`,
         lines.push(`  .sock files: ${socketFiles.length > 0 ? `${socketFiles.length} (${socketFiles.join(", ")})` : "none"}`);
         lines.push(
           `  native-host PIDs: ${nativeHostPids.length > 0 ? nativeHostPids.join(", ") : "none"}`
-            + (nativeHostPids.length > 1 ? "  ⚠ multiple — chrome_force_reset recommended" : ""),
+            + (multiSocket ? "  ⚠ multiple — chrome_force_reset recommended" : ""),
         );
+
+        const fmtProfile = (id: string) => {
+          const p = profileById.get(id);
+          return p ? `"${p.name}" — ${p.email} (id: ${id})` : id;
+        };
 
         lines.push(``, `Chrome windows:`);
         if (localState.lastUsed) {
-          const lu = profileById.get(localState.lastUsed);
-          lines.push(`  last-focused: ${localState.lastUsed}${lu ? ` (${lu.email})` : ""}`);
+          lines.push(`  last-focused: ${fmtProfile(localState.lastUsed)}`);
         }
         if (localState.lastActive.length > 0) {
-          const labels = localState.lastActive.map((id) => {
-            const p = profileById.get(id);
-            return p ? `${id} (${p.email})` : id;
-          });
-          lines.push(`  currently open: ${labels.join(", ")}`);
+          lines.push(`  currently open: ${localState.lastActive.map(fmtProfile).join(", ")}`);
         }
         if (expected) {
-          lines.push(`  this session previously asked for: ${expected.id} (${expected.email})`);
+          lines.push(`  this session previously asked for: ${fmtProfile(expected.id)}`);
         }
 
         lines.push(``, `Global Session Bindings:`);
@@ -271,7 +280,7 @@ control. If "Connection: not connected", call chrome_open_profile.`,
         } else {
           for (const [sid, bp] of boundProfileBySession.entries()) {
             const isThis = sid === sessionId ? " (this session)" : "";
-            lines.push(`  Session "${sid}"${isThis}: profile "${bp.id}" (${bp.email}) [bound at ${bp.boundAt.toISOString()}]`);
+            lines.push(`  Session "${sid}"${isThis}: "${bp.name}" — ${bp.email} (id: ${bp.id}) [bound at ${bp.boundAt.toISOString()}]`);
           }
         }
 
