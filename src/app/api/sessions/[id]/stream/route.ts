@@ -72,6 +72,12 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       for (const [questionId, pending] of (s.pendingQuestions ?? [])) {
         sendEvent("question_request", { questionId, questions: pending.questions });
       }
+      // Same for parked completion suggestions, plus the current completed flag
+      // so the header badge renders immediately on load.
+      for (const [requestId, pending] of (s.pendingCompletions ?? [])) {
+        sendEvent("completion_request", { requestId, reason: pending.reason ?? null });
+      }
+      sendEvent("completed_changed", { completed: !!s.completed });
 
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onState = (state: string) => sendEvent("state", { state });
@@ -80,6 +86,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       const onPermissionResolved = (data: unknown) => sendEvent("permission_resolved", data);
       const onQuestionRequest = (data: unknown) => sendEvent("question_request", data);
       const onQuestionResolved = (data: unknown) => sendEvent("question_resolved", data);
+      const onCompletionRequest = (data: unknown) => sendEvent("completion_request", data);
+      const onCompletionResolved = (data: unknown) => sendEvent("completion_resolved", data);
+      const onCompletedChanged = (data: unknown) => sendEvent("completed_changed", data);
       s.events.on("event", onEvent);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
@@ -87,6 +96,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       s.events.on("permission_resolved", onPermissionResolved);
       s.events.on("question_request", onQuestionRequest);
       s.events.on("question_resolved", onQuestionResolved);
+      s.events.on("completion_request", onCompletionRequest);
+      s.events.on("completion_resolved", onCompletionResolved);
+      s.events.on("completed_changed", onCompletedChanged);
 
       const heartbeat = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
@@ -101,6 +113,9 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         s.events.off("permission_resolved", onPermissionResolved);
         s.events.off("question_request", onQuestionRequest);
         s.events.off("question_resolved", onQuestionResolved);
+        s.events.off("completion_request", onCompletionRequest);
+        s.events.off("completion_resolved", onCompletionResolved);
+        s.events.off("completed_changed", onCompletedChanged);
         try { controller.close(); } catch { /* already closed */ }
       };
 

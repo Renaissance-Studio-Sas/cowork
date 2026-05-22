@@ -82,6 +82,7 @@ export type {
   RuntimeSession,
   PendingPermission,
   PendingQuestion,
+  PendingCompletion,
   SessionSummary,
 } from "./sessions/types";
 
@@ -90,6 +91,7 @@ import type {
   RuntimeSession,
   PendingPermission,
   PendingQuestion,
+  PendingCompletion,
   SessionSummary,
 } from "./sessions/types";
 
@@ -121,6 +123,12 @@ const registry: Map<string, RuntimeSession> =
 for (const s of registry.values()) {
   if (!s.pendingQuestions) {
     (s as RuntimeSession).pendingQuestions = new Map();
+  }
+  if (!s.pendingCompletions) {
+    (s as RuntimeSession).pendingCompletions = new Map();
+  }
+  if (typeof s.completed !== "boolean") {
+    (s as RuntimeSession).completed = false;
   }
 }
 
@@ -231,7 +239,11 @@ function runWatchdog() {
     // awaiting the user — no events flow, so lastActivity goes stale even
     // though nothing is wrong. Don't let the watchdog kill it out from under
     // a pending card; the user may take minutes to answer.
-    if (s.pendingPermissions.size > 0 || (s.pendingQuestions?.size ?? 0) > 0) continue;
+    if (
+      s.pendingPermissions.size > 0
+      || (s.pendingQuestions?.size ?? 0) > 0
+      || (s.pendingCompletions?.size ?? 0) > 0
+    ) continue;
     const sinceActivity = now - s.lastActivity.getTime();
     if (s.state === "running" && sinceActivity > STALE_THRESHOLD_MS) {
       console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(sinceActivity / 1000)}s — auto-stopping`);
@@ -354,6 +366,48 @@ export function resolvePermission(
   return true;
 }
 
+// Park an agent's "I think we're done" suggestion on a live session. The
+// promise returned to the tool handler unblocks when the user clicks
+// Approve / Dismiss in the UI. Returns the requestId so the caller can plumb
+// it through the event payload. The tool is opt-in for the agent — manual
+// completion via the UI does not go through this path.
+export function addPendingCompletion(
+  id: string,
+  reason: string | undefined,
+): { requestId: string; promise: Promise<boolean> } | null {
+  const s = registry.get(id);
+  if (!s) return null;
+  if (!s.pendingCompletions) s.pendingCompletions = new Map();
+  const requestId = randomUUID();
+  const promise = new Promise<boolean>((resolve) => {
+    s.pendingCompletions.set(requestId, {
+      reason,
+      resolve,
+      requestedAt: new Date(),
+    });
+    s.events.emit("completion_request", { requestId, reason: reason ?? null });
+  });
+  return { requestId, promise };
+}
+
+// Resolve a pending completion suggestion. Called by /api/sessions/[id]/complete
+// when the user approves or dismisses the agent's request. Returns false if
+// the session or request can't be found (already resolved, stale id, etc.).
+export function resolveCompletionSuggestion(
+  id: string,
+  requestId: string,
+  approved: boolean,
+): boolean {
+  const s = registry.get(id);
+  if (!s) return false;
+  const pending = s.pendingCompletions?.get(requestId);
+  if (!pending) return false;
+  pending.resolve(approved);
+  s.pendingCompletions.delete(requestId);
+  s.events.emit("completion_resolved", { requestId, approved });
+  return true;
+}
+
 // Resolve a pending AskUserQuestion. Called by /api/sessions/[id]/question
 // when the user submits their selections in the UI. Returns false if the
 // session or pending question can't be found (already answered, or the
@@ -378,10 +432,12 @@ export function getSession(id: string): RuntimeSession | undefined {
   const s = registry.get(id);
   // The session registry is preserved across Next.js HMR via globalThis,
   // so sessions created before a field was added to RuntimeSession can be
-  // missing that field after a hot reload. Backfill pendingQuestions
-  // lazily so call sites (stream route, resolveQuestion) can iterate it
-  // without crashing. Cheap one-time-per-stale-session no-op.
+  // missing that field after a hot reload. Backfill the post-launch fields
+  // lazily so call sites (stream route, resolveQuestion, etc.) can iterate
+  // them without crashing. Cheap one-time-per-stale-session no-op.
   if (s && !s.pendingQuestions) s.pendingQuestions = new Map();
+  if (s && !s.pendingCompletions) s.pendingCompletions = new Map();
+  if (s && typeof s.completed !== "boolean") s.completed = false;
   return s;
 }
 
@@ -445,7 +501,8 @@ export function listLiveSessions(): SessionSummary[] {
   return [...registry.values()].map((s) => {
     // Session is unread only if it completed in the background (after user last viewed it)
     // Running sessions are never marked unread — user sees them update in real-time
-    const unread = s.completedAt !== null && (!s.seenAt || s.completedAt > s.seenAt);
+    // Sessions marked complete are never unread — completion explicitly clears the badge
+    const unread = !s.completed && s.completedAt !== null && (!s.seenAt || s.completedAt > s.seenAt);
     return {
       id: s.id,
       projectSlug: s.projectSlug,
@@ -456,6 +513,7 @@ export function listLiveSessions(): SessionSummary[] {
       lastActivity: s.lastActivity.toISOString(),
       isLive: true,
       unread,
+      completed: !!s.completed,
       runtime: s.runtime,
       model: s.model,
     };
@@ -472,7 +530,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; runtime?: SessionRuntime; model?: string | null } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; runtime?: SessionRuntime; model?: string | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -490,10 +548,11 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
         lastActivity = st.mtime.toISOString();
       } catch { /* missing */ }
     }
-    // Session is unread only if it completed after user last viewed it
-    // For legacy sessions without completedAt, use lastActivity as proxy (they're already done)
+    // Session is unread only if it completed after user last viewed it.
+    // For legacy sessions without completedAt, use lastActivity as proxy (they're already done).
+    // Sessions explicitly marked complete are never unread.
     const completedAt = meta.completedAt ?? lastActivity;
-    const unread = !meta.seenAt || (meta.seenAt < completedAt);
+    const unread = meta.completed === true ? false : (!meta.seenAt || meta.seenAt < completedAt);
     // Use persisted finalState if available (idle = done, error = error),
     // otherwise fall back to "idle" (assume completed) for historical sessions
     const state: SessionState = meta.finalState ?? "idle";
@@ -507,6 +566,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       lastActivity,
       isLive: false,
       unread,
+      completed: meta.completed === true,
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
     });
@@ -638,6 +698,7 @@ export async function restoreSession(
     seenAt?: string;
     lastActivity?: string;
     completedAt?: string;
+    completed?: boolean;
     runtime?: SessionRuntime;
   } = {};
   try {
@@ -664,6 +725,7 @@ export async function restoreSession(
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
   const pendingQuestions = new Map<string, PendingQuestion>();
+  const pendingCompletions = new Map<string, PendingCompletion>();
 
   // Don't create file streams yet — they'll be created on resume
   const sink = createWriteStream("/dev/null");
@@ -692,6 +754,8 @@ export async function restoreSession(
     state: "stopped",
     pendingPermissions,
     pendingQuestions,
+    pendingCompletions,
+    completed: meta.completed === true,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
@@ -847,13 +911,14 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
   const pendingQuestions = new Map<string, PendingQuestion>();
+  const pendingCompletions = new Map<string, PendingCompletion>();
 
   // First message
   const firstMsg = makeUserMessage(p.firstMessage, id);
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(firstMsg);
 
-  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug);
+  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug, name);
   const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
@@ -896,6 +961,8 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     state: "running",
     pendingPermissions,
     pendingQuestions,
+    pendingCompletions,
+    completed: false,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1096,6 +1163,13 @@ function setState(s: RuntimeSession, state: SessionState) {
   if (shouldPersistState(state)) {
     if (!wasTerminal) {
       s.completedAt = new Date();
+      // If a viewer is currently subscribed to this session's SSE stream
+      // (i.e. the chat is open in a browser), bump seenAt to the same moment
+      // so the "unread" badge never appears for them. Without this, the badge
+      // flickers on for ~2.5s until the next client poll hits /seen.
+      if (s.events.listenerCount("state") > 0) {
+        s.seenAt = s.completedAt;
+      }
     }
     void persistSessionState(s, state);
   }
@@ -1296,6 +1370,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
   const pendingQuestions = new Map<string, PendingQuestion>();
+  const pendingCompletions = new Map<string, PendingCompletion>();
 
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
   input.push(makeUserMessage(p.firstMessage, id));
@@ -1303,7 +1378,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   // Project-level sessions only get project.md context (no task). Comments
   // and other workbench tools scope to project-level (empty taskSlug); the
   // comments tool operates on project-level .comments.json in that case.
-  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, "");
+  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, "", name);
   const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
@@ -1341,6 +1416,8 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     state: "running",
     pendingPermissions,
     pendingQuestions,
+    pendingCompletions,
+    completed: false,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1367,6 +1444,7 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
   const pendingQuestions = new Map<string, PendingQuestion>();
+  const pendingCompletions = new Map<string, PendingCompletion>();
 
   input.push(makeUserMessage(firstMessage, id));
 
@@ -1415,6 +1493,8 @@ export async function startPlanningSession(firstMessage: string): Promise<Runtim
     state: "running",
     pendingPermissions,
     pendingQuestions,
+    pendingCompletions,
+    completed: false,
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
@@ -1447,6 +1527,7 @@ export async function startTaskPlanningSession(
   events.setMaxListeners(0);
   const pendingPermissions = new Map<string, PendingPermission>();
   const pendingQuestions = new Map<string, PendingQuestion>();
+  const pendingCompletions = new Map<string, PendingCompletion>();
 
   input.push(makeUserMessage(firstMessage, id));
 
@@ -1495,6 +1576,8 @@ export async function startTaskPlanningSession(
     state: "running",
     pendingPermissions,
     pendingQuestions,
+    pendingCompletions,
+    completed: false,
     sdkSessionId: null,
     permissionMode: "bypassPermissions",
     model: null,
@@ -1533,6 +1616,13 @@ export async function sendInput(id: string, text: string): Promise<boolean> {
   s.events.emit("event", msg);
   s.input.push(msg);
   s.lastActivity = new Date();
+  // Sending a new message restarts a completed session — clear the sticky
+  // completion flag so the UI flips back to "working" and out of "Completed".
+  if (s.completed) {
+    s.completed = false;
+    void updateMeta(s, (meta) => { meta.completed = false; });
+    s.events.emit("completed_changed", { completed: false });
+  }
   setState(s, "running");
   return true;
 }
@@ -1615,6 +1705,11 @@ export async function sendInputWithFiles(
   s.events.emit("event", msg);
   s.input.push(msg);
   s.lastActivity = new Date();
+  if (s.completed) {
+    s.completed = false;
+    void updateMeta(s, (meta) => { meta.completed = false; });
+    s.events.emit("completed_changed", { completed: false });
+  }
   setState(s, "running");
   return true;
 }
@@ -1712,7 +1807,14 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     // Push the message to the input channel
     s.input.push(msg);
     s.lastActivity = new Date();
-    s.completedAt = null; // Clear completion — session is running again
+    s.completedAt = null; // Clear unread-tracking timestamp — session is running again
+    // Clear the sticky "Completed" mark too — resuming means the user wants
+    // more work done, so the session should not appear completed anymore.
+    if (s.completed) {
+      s.completed = false;
+      void updateMeta(s, (meta) => { meta.completed = false; });
+      s.events.emit("completed_changed", { completed: false });
+    }
     // Clear the interrupt latch — a fresh turn is starting, so the new
     // pumpEvents loop should track "running" normally again.
     s.interrupted = false;
@@ -1811,6 +1913,64 @@ export async function markSessionSeen(
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
     meta.seenAt = now.toISOString();
+    const tmpPath = metaPath + ".tmp";
+    await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
+    await fs.rename(tmpPath, metaPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Mark a session as completed (or un-complete it). Sticky across reloads via
+// meta.json. The flag is orthogonal to runtime state — a session can be live
+// and completed, in which case the UI offers Reopen; sending another message
+// auto-unmarks (see sendInput / sendInputWithFiles / resumeSession).
+export async function markSessionCompleted(
+  projectSlug: string,
+  taskSlug: string,
+  sessionId: string,
+  value: boolean,
+): Promise<boolean> {
+  // Marking complete also clears the "unread" badge: a completed session
+  // shouldn't still nag the user. Unread is derived from completedAt > seenAt,
+  // so bumping seenAt to now drops it. We only do this when value=true; on
+  // reopen we leave seenAt alone (it's accurate either way).
+  const now = new Date();
+
+  // Live session: route through updateMeta so this serializes with the
+  // setState / persistSdkSessionId writers (concurrent writes corrupt meta.json).
+  const liveSession = registry.get(sessionId);
+  if (liveSession) {
+    liveSession.completed = value;
+    if (value) liveSession.seenAt = now;
+    await updateMeta(liveSession, (meta) => {
+      meta.completed = value;
+      if (value) meta.seenAt = now.toISOString();
+    });
+    liveSession.events.emit("completed_changed", { completed: value });
+    return true;
+  }
+
+  // Dead session (not in registry): no other writer can race, direct write is fine.
+  const project = await getProject(projectSlug);
+  if (!project) return false;
+
+  let sessionDir: string;
+  if (!taskSlug) {
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
+  } else {
+    const task = project.tasks.find((t) => t.slug === taskSlug);
+    if (!task) return false;
+    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
+  }
+
+  const metaPath = path.join(sessionDir, "meta.json");
+  try {
+    const raw = await fs.readFile(metaPath, "utf8");
+    const meta = JSON.parse(raw);
+    meta.completed = value;
+    if (value) meta.seenAt = now.toISOString();
     const tmpPath = metaPath + ".tmp";
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
     await fs.rename(tmpPath, metaPath);

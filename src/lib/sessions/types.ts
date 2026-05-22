@@ -55,6 +55,15 @@ export interface RuntimeSession {
   // /api/sessions/[id]/question with the user's selected answers, and its
   // return is what the agent sees as the tool_result.
   pendingQuestions: Map<string, PendingQuestion>;
+  // Completion suggestions the agent has parked via the suggest_session_complete
+  // tool. Keyed by a request id we generate at park time. Resolved by
+  // /api/sessions/[id]/complete with { requestId, approved }. The tool handler
+  // unblocks with the user's decision.
+  pendingCompletions: Map<string, PendingCompletion>;
+  // Whether the human (or agent + human approval) has marked this session
+  // complete. Sticky across reloads via meta.json. Cleared automatically when
+  // a new user message is sent (the session is being revived).
+  completed: boolean;
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
@@ -85,6 +94,13 @@ export interface PendingQuestion {
   requestedAt: Date;
 }
 
+// Agent's request to mark the session complete, awaiting user approval.
+export interface PendingCompletion {
+  reason?: string;               // optional one-line summary from the agent
+  resolve: (approved: boolean) => void;
+  requestedAt: Date;
+}
+
 // Listing-friendly snapshot of a session. Returned by listLiveSessions /
 // listAllSessions. UI-side mirror lives in src/lib/types.ts as
 // SessionSummaryDTO.
@@ -98,6 +114,7 @@ export interface SessionSummary {
   lastActivity: string;          // ISO
   isLive: boolean;
   unread: boolean;               // completed session not yet viewed
+  completed: boolean;            // sticky "marked complete" flag (manual or agent-suggested + approved)
   runtime: SessionRuntime;
   model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")
 }

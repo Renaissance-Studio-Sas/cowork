@@ -8,7 +8,7 @@ import { z } from "zod";
 import { existsSync } from "fs";
 import path from "path";
 import { execSync } from "child_process";
-import { renameLiveSession, getSessionQuery, debugSessionRegistry } from "../sessions";
+import { renameLiveSession, getSessionQuery, debugSessionRegistry, addPendingCompletion } from "../sessions";
 import {
   getChromeSocketDir,
   listChromeSocketFiles,
@@ -33,14 +33,7 @@ export function buildSessionTools(
   return [
     defineTool(
       "set_session_title",
-      `Set a short, descriptive title for this session that summarizes what was accomplished.
-Call this ONCE at the START of your work, in your first response to the user's request.
-The title should be 3-6 words that capture the main outcome, like:
-- "Added dark mode toggle"
-- "Fixed login validation bug"
-- "Refactored auth middleware"
-- "Created user settings page"
-Do NOT include filler words like "Implemented", "Updated", "Changed" unless necessary for clarity.`,
+      `Set the title shown for this session in the cowork sidebar.`,
       { title: z.string().min(1).max(60).describe("Short descriptive title (3-6 words)") },
       async ({ title }) => {
         const ok = await renameLiveSession(sessionId, title);
@@ -51,6 +44,39 @@ Do NOT include filler words like "Implemented", "Updated", "Changed" unless nece
           };
         }
         return { content: [{ type: "text", text: `Session title set to: "${title}"` }] };
+      },
+    ),
+
+    defineTool(
+      "suggest_session_complete",
+      `Suggest that this session is complete and the work is done. The UI surfaces
+an Approve / Dismiss card to the human — the tool waits for their decision and
+returns either "approved" (session is now marked complete in the workspace) or
+"dismissed" (continue working). Call this when you're confident the task is
+finished; the human stays in control of the final mark. If the human later
+sends another message, the completion is cleared automatically.`,
+      {
+        reason: z.string().max(200).optional().describe(
+          "Optional one-line summary of what was accomplished (shown to the human in the approval card).",
+        ),
+      },
+      async ({ reason }) => {
+        const parked = addPendingCompletion(sessionId, reason);
+        if (!parked) {
+          return {
+            content: [{ type: "text", text: "Failed to park completion suggestion (session not found)." }],
+            isError: true,
+          };
+        }
+        const approved = await parked.promise;
+        return {
+          content: [{
+            type: "text",
+            text: approved
+              ? "Session marked complete by the human. Stop here unless they send more work."
+              : "Human dismissed the completion suggestion — keep working.",
+          }],
+        };
       },
     ),
 

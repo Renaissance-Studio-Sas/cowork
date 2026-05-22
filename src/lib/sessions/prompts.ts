@@ -20,6 +20,7 @@ import { getProject, PROJECTS_DIR, WORKSPACE_ROOT } from "../fs";
 export async function buildContextSystemPrompt(
   projectSlug: string,
   taskSlug: string,
+  currentTitle?: string,
 ): Promise<{ type: "preset"; preset: "claude_code"; append: string }> {
   // Resolve the task folder relative to the workspace root. We need the
   // actual folder name (`wip-…` or `done-…`), not just the slug, because
@@ -70,6 +71,19 @@ export async function buildContextSystemPrompt(
       )
     : "";
 
+  const titleBlock = currentTitle
+    ? `## Session title
+
+This session is currently titled "${currentTitle}" — that's an auto-generated
+placeholder derived from the first message. In your first response, call
+\`set_session_title\` with a 3-6 word summary of what you're actually working
+on (e.g. "Added dark mode toggle", "Fixed login validation bug"). Skip filler
+words like "Implemented", "Updated", "Changed". If the existing title already
+captures the work accurately, leave it alone.
+
+`
+    : "";
+
   const append = `
 You are working in the **cowork agent workbench** on ${where}.
 
@@ -83,8 +97,7 @@ When you write output files for this task, put them under the task's
 \`files/\` directory using the path above. When you read or modify
 project.md / task.md, use the paths shown in the sections below.
 
-${projectMdBlock}${taskMdBlock}
-## Inline Media in Chat
+${projectMdBlock}${taskMdBlock}${titleBlock}## Inline Media in Chat
 
 You can display images and videos inline in your chat responses using markdown syntax:
 

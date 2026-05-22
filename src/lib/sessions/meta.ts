@@ -83,5 +83,8 @@ export async function persistSessionState(s: RuntimeSession, state: SessionState
     if (s.completedAt) {
       meta.completedAt = s.completedAt.toISOString();
     }
+    if (s.seenAt) {
+      meta.seenAt = s.seenAt.toISOString();
+    }
   });
 }

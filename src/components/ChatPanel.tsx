@@ -169,7 +169,7 @@ export function ChatPanel({ projectSlug, taskSlug, filePath, width = 380, onClos
         projectSlug={projectSlug}
         taskSlug={taskSlug}
         session={activeSession}
-        sessionCount={taskSessions.length}
+        sessionCount={taskSessions.filter((s) => !s.completed).length}
         onClose={onClose}
         onOpenFull={() => activeSession && onOpenFull(activeSession.id)}
         onToggleSelector={() => setShowSelector((v) => !v)}

@@ -30,6 +30,7 @@ export interface SessionSummaryDTO {
   lastActivity: string;
   isLive: boolean;
   unread: boolean; // true if session completed but hasn't been viewed by user
+  completed: boolean; // sticky "marked complete" flag (manual or agent-suggested + approved)
   runtime: SessionRuntime;
   model: string | null; // actual model id captured from the SDK init event (e.g. "claude-opus-4-7", "gemini-3.5-flash")
 }

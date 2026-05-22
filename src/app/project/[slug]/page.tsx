@@ -7,6 +7,7 @@ import type { ProjectDTO, SessionSummaryDTO, TaskDTO, SessionRuntime } from "@/l
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { StatusChip } from "@/components/StatusChip";
+import { WorkingIndicator } from "@/components/WorkingIndicator";
 import { handleComposerEnter } from "@/lib/composer";
 import { taskRoute, projectSessionRoute, projectFileRoute, projectDirRoute } from "@/lib/routes";
 
@@ -31,17 +32,24 @@ function iconForFile(p: string): string {
 const STATE_LABEL: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "needs your reply",
   running: "working",
-  idle: "done",
-  stopped: "done",
+  idle: "pending",
+  stopped: "pending",
   error: "error",
 };
 const STATE_COLOR: Record<SessionSummaryDTO["state"], string> = {
   awaiting_input: "var(--warn)",
   running: "var(--accent)",
-  idle: "var(--ok)",
-  stopped: "var(--ok)", // same as idle/done
+  idle: "var(--muted)",
+  stopped: "var(--muted)",
   error: "#dc2626",
 };
+
+function sessionLabel(s: SessionSummaryDTO): string {
+  return s.completed ? "completed" : STATE_LABEL[s.state];
+}
+function sessionColor(s: SessionSummaryDTO): string {
+  return s.completed ? "var(--ok)" : STATE_COLOR[s.state];
+}
 
 export default function ProjectPage() {
   const params = useParams();
@@ -350,17 +358,16 @@ export default function ProjectPage() {
                 <div className="space-y-1.5">
                   {projectSessions.map((s) => {
                     const isRenaming = renamingSession === s.id;
+                    const label = sessionLabel(s);
+                    const color = sessionColor(s);
                     if (isRenaming) {
                       return (
                         <div
                           key={s.id}
-                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-2.5 ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                          className={`block w-full text-left rounded-xl border bg-[var(--panel)] px-4 py-2.5 ${s.unread ? "border-[var(--accent)] border-l-4" : s.completed ? "border-[var(--ok)]" : "border-[var(--border)]"}`}
                         >
                           <div className="flex items-center gap-2">
-                            <span
-                              className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${s.state === "awaiting_input" ? "pulse" : ""}`}
-                              style={{ background: STATE_COLOR[s.state] }}
-                            />
+                            <SessionStateIcon session={s} />
                             <input
                               autoFocus
                               value={sessionRenameValue}
@@ -378,8 +385,8 @@ export default function ProjectPage() {
                             <span className="text-[11.5px] text-[var(--muted)] shrink-0">
                               {formatRelative(s.lastActivity)}
                             </span>
-                            <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
-                              · {STATE_LABEL[s.state]}
+                            <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color }}>
+                              · {label}
                             </span>
                           </div>
                         </div>
@@ -390,25 +397,29 @@ export default function ProjectPage() {
                         key={s.id}
                         href={projectSessionRoute(slug, s.id)}
                         onContextMenu={(ev) => openSessionContextMenu(ev, s)}
-                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-2.5 transition ${s.unread ? "border-[var(--accent)] border-l-4" : "border-[var(--border)]"}`}
+                        className={`block w-full text-left rounded-xl border bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-2.5 transition ${s.unread ? "border-[var(--accent)] border-l-4" : s.completed ? "border-[var(--ok)]" : "border-[var(--border)]"}`}
                       >
                         <div className="flex items-center gap-2">
-                          <span
-                            className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${s.state === "awaiting_input" ? "pulse" : ""}`}
-                            style={{ background: STATE_COLOR[s.state] }}
-                          />
-                          <span className={`text-[13.5px] truncate flex-1 ${s.unread ? "font-semibold" : ""}`}>{s.title || "(no message)"}</span>
-                          {s.unread && (
+                          <SessionStateIcon session={s} />
+                          <span className={`text-[13.5px] truncate flex-1 ${s.completed ? "text-[var(--muted)]" : s.unread ? "font-semibold" : ""}`}>{s.title || "(no message)"}</span>
+                          {s.unread && !s.completed && (
                             <span className="shrink-0 text-[10px] bg-[var(--accent)] text-[var(--accent-text)] font-medium rounded-md px-1.5 py-0.5">
                               NEW
+                            </span>
+                          )}
+                          {s.completed && (
+                            <span className="shrink-0 text-[10px] bg-[var(--ok-soft)] text-[var(--ok)] font-medium rounded-md px-1.5 py-0.5">
+                              ✓ COMPLETED
                             </span>
                           )}
                           <span className="text-[11.5px] text-[var(--muted)] shrink-0">
                             {formatRelative(s.lastActivity)}
                           </span>
-                          <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color: STATE_COLOR[s.state] }}>
-                            · {STATE_LABEL[s.state]}
-                          </span>
+                          {!s.completed && (
+                            <span className="text-[11.5px] whitespace-nowrap shrink-0" style={{ color }}>
+                              · {label}
+                            </span>
+                          )}
                         </div>
                       </Link>
                     );
@@ -460,6 +471,27 @@ export default function ProjectPage() {
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
     </>
+  );
+}
+
+function SessionStateIcon({ session }: { session: SessionSummaryDTO }) {
+  if (session.completed) {
+    return (
+      <span className="text-[var(--ok)] shrink-0 inline-flex" title="Completed">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
+      </span>
+    );
+  }
+  if (session.state === "running") {
+    return <WorkingIndicator size={12} />;
+  }
+  return (
+    <span
+      className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${session.state === "awaiting_input" ? "pulse" : ""}`}
+      style={{ background: STATE_COLOR[session.state] }}
+    />
   );
 }
 

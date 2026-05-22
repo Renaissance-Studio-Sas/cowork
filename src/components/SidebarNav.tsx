@@ -7,6 +7,7 @@ import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { StatusChip } from "./StatusChip";
+import { WorkingIndicator } from "./WorkingIndicator";
 import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
@@ -70,7 +71,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const taskCounts = (project: string, task: string) => {
     const list = sessions.filter((s) => s.projectSlug === project && s.taskSlug === task);
     return {
-      total: list.length,
+      total: list.filter((s) => !s.completed).length,
       awaiting: list.filter((s) => s.state === "awaiting_input").length,
       running: list.filter((s) => s.state === "running").length,
       unread: list.filter((s) => s.unread).length,
@@ -82,8 +83,11 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
     return sessions.some((s) => s.projectSlug === projectSlug && s.unread);
   };
 
-  // Get the 10 most recent sessions sorted by lastActivity
-  const recentSessions = [...sessions]
+  // Get the 10 most recent active sessions sorted by lastActivity.
+  // Completed sessions are deliberately excluded — once the user (or agent +
+  // approval) marks a session done, it falls out of the top-of-mind list.
+  const activeSessions = [...sessions]
+    .filter((s) => !s.completed)
     .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
     .slice(0, 10);
 
@@ -240,8 +244,8 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 pb-4">
-        {/* Recent Sessions */}
-        {recentSessions.length > 0 && (
+        {/* Active Sessions */}
+        {activeSessions.length > 0 && (
           <div className="mb-3">
             <div className="flex items-center gap-1 px-1 py-1.5">
               <button
@@ -257,12 +261,12 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                 ><path d="M9 6l6 6-6 6" /></svg>
               </button>
               <span className="text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
-                Recent Sessions
+                Active Sessions
               </span>
             </div>
             {!recentCollapsed && (
               <div className="space-y-0.5">
-                {recentSessions.map((s) => (
+                {activeSessions.map((s) => (
                   <RecentSessionRow key={s.id} session={s} selected={pathname.includes(`/session/${s.id}`)} />
                 ))}
               </div>
@@ -514,7 +518,7 @@ function RecentSessionRow({ session, selected }: { session: SessionSummaryDTO; s
   const stateIcon = () => {
     switch (session.state) {
       case "running":
-        return <span className="text-[var(--accent)]" title="Running">●</span>;
+        return <WorkingIndicator size={11} title="Working" />;
       case "awaiting_input":
         return <span className="pulse text-[var(--warn)]" title="Awaiting input">●</span>;
       case "error":

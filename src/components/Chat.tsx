@@ -9,9 +9,10 @@ import remarkGfm from "remark-gfm";
 // contain XML-like tags (e.g. <quote>, <file>) that React then warns about
 // as unknown custom elements. skipHtml strips them cleanly.
 import type { SessionSummaryDTO } from "@/lib/types";
-import { taskSessionRoute, projectSessionRoute } from "@/lib/routes";
+import { taskSessionRoute, projectSessionRoute, taskRoute, projectRoute } from "@/lib/routes";
 import { TodoList, extractTodosFromMessages } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
+import { WorkingIndicator } from "./WorkingIndicator";
 
 interface UploadedFile {
   name: string;
@@ -122,6 +123,19 @@ export function Chat({ session, onChange, onBack }: Props) {
     Map<string, { questions: PendingQuestionItem[] }>
   >(new Map());
 
+  // `suggest_session_complete` requests the agent has parked, awaiting an
+  // Approve / Dismiss from the user. Keyed by requestId.
+  const [pendingCompletions, setPendingCompletions] = useState<
+    Map<string, { reason: string | null }>
+  >(new Map());
+
+  // Sticky completion mark — drives the header badge and the Mark complete /
+  // Reopen toggle. Bootstraps from the DTO (which the listing API populates
+  // from meta.json) and stays in sync via `completed_changed` SSE events so
+  // the badge flips immediately when the user toggles it or the agent's
+  // suggestion is approved.
+  const [completed, setCompletedState] = useState<boolean>(session.completed);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -171,6 +185,8 @@ export function Chat({ session, onChange, onBack }: Props) {
     setHistoryMeta(null);
     setPendingPermissions(new Map());
     setPendingQuestions(new Map());
+    setPendingCompletions(new Map());
+    setCompletedState(session.completed);
     isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
@@ -307,6 +323,34 @@ export function Chat({ session, onChange, onBack }: Props) {
           next.delete(questionId);
           return next;
         });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("completion_request", (ev) => {
+      try {
+        const { requestId, reason } = JSON.parse((ev as MessageEvent).data);
+        setPendingCompletions((prev) => {
+          const next = new Map(prev);
+          next.set(requestId, { reason: reason ?? null });
+          return next;
+        });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("completion_resolved", (ev) => {
+      try {
+        const { requestId } = JSON.parse((ev as MessageEvent).data);
+        setPendingCompletions((prev) => {
+          if (!prev.has(requestId)) return prev;
+          const next = new Map(prev);
+          next.delete(requestId);
+          return next;
+        });
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("completed_changed", (ev) => {
+      try {
+        const { completed: c } = JSON.parse((ev as MessageEvent).data);
+        setCompletedState(!!c);
+        onChangeRef.current();
       } catch { /* ignore */ }
     });
     es.onerror = () => {
@@ -519,17 +563,19 @@ export function Chat({ session, onChange, onBack }: Props) {
 
   const isWorking = state === "running";
   const isAwaiting = state === "awaiting_input";
-  const isDone = state === "idle" || state === "stopped"; // stopped sessions seamlessly resume, treat as done
+  const isPaused = state === "idle" || state === "stopped"; // paused, not necessarily complete
   const stateLabel =
+    completed ? "completed" :
     isAwaiting ? "needs your reply" :
     isWorking ? "working" :
     state === "error" ? "error" :
-    isDone ? "done" : "idle";
+    isPaused ? "pending" : "idle";
   const stateColor =
+    completed ? "var(--ok)" :
     isAwaiting ? "var(--warn)" :
     isWorking ? "var(--accent)" :
     state === "error" ? "#e87a7a" :
-    isDone ? "var(--ok)" :
+    isPaused ? "var(--muted)" :
     "var(--muted)";
 
   return (
@@ -563,13 +609,21 @@ export function Chat({ session, onChange, onBack }: Props) {
             <span>{session.projectSlug}{session.taskSlug ? ` · ${session.taskSlug}` : ""}</span>
             <span>·</span>
             <span
-              className={`inline-flex items-center gap-1 ${isAwaiting || isWorking ? "pulse" : ""}`}
+              className={`inline-flex items-center gap-1 ${isAwaiting ? "pulse" : ""}`}
               style={{ color: stateColor }}
             >
-              <span
-                className={`inline-block w-1.5 h-1.5 rounded-full`}
-                style={{ background: stateColor }}
-              />
+              {isWorking ? (
+                <WorkingIndicator size={10} title="Working" />
+              ) : completed ? (
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              ) : (
+                <span
+                  className="inline-block w-1.5 h-1.5 rounded-full"
+                  style={{ background: stateColor }}
+                />
+              )}
               {stateLabel}
               {isWorking && <span className="dots" aria-hidden />}
             </span>
@@ -594,6 +648,14 @@ export function Chat({ session, onChange, onBack }: Props) {
             )}
           </div>
         </div>
+        {/* Mark complete / Reopen button — always available so the human can
+            flip the flag without waiting for the agent to suggest it. */}
+        {!isRenaming && (
+          <CompleteToggleButton
+            session={session}
+            completed={completed}
+          />
+        )}
         {/* Session menu for stopped sessions */}
         {canManageSession && !isRenaming && (
           <div className="relative">
@@ -659,7 +721,7 @@ export function Chat({ session, onChange, onBack }: Props) {
           )}
           {isWorking && !streamingText && (
             <div className="flex items-center gap-2 text-[13px] text-[var(--accent)] pl-1">
-              <span className="inline-block w-2 h-2 rounded-full bg-[var(--accent)] pulse" />
+              <WorkingIndicator size={14} />
               <span>Working<span className="dots" aria-hidden /></span>
             </div>
           )}
@@ -731,6 +793,21 @@ export function Chat({ session, onChange, onBack }: Props) {
                 sessionId={session.id}
                 questionId={questionId}
                 questions={p.questions}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {pendingCompletions.size > 0 && (
+        <div className="border-t border-[var(--border)] px-6 py-3 bg-[var(--bg-2)]">
+          <div className="max-w-[760px] mx-auto space-y-2">
+            {Array.from(pendingCompletions.entries()).map(([requestId, p]) => (
+              <CompletionSuggestionCard
+                key={requestId}
+                session={session}
+                requestId={requestId}
+                reason={p.reason}
               />
             ))}
           </div>
@@ -1090,6 +1167,152 @@ function ContinueComposer({ session }: { session: SessionSummaryDTO; messages: S
           title="Resume session (↵)"
         >↑</button>
       </div>
+    </div>
+  );
+}
+
+// Header button — toggles the session's sticky completion flag. When the
+// session is already complete it offers Reopen (which only clears the flag;
+// sending a new message in the composer is what actually resumes work).
+function CompleteToggleButton({
+  session,
+  completed,
+}: {
+  session: SessionSummaryDTO;
+  completed: boolean;
+}) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const toggle = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const nextCompleted = !completed;
+      await fetch(`/api/sessions/${encodeURIComponent(session.id)}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectSlug: session.projectSlug,
+          taskSlug: session.taskSlug,
+          completed: nextCompleted,
+        }),
+      });
+      // The SSE `completed_changed` event will flip the local state.
+      // After marking complete, drop the user back at the task/project view —
+      // the session is closed, so the session page is no longer the right
+      // place to be. Reopen stays on the session page so the user can keep
+      // working.
+      if (nextCompleted) {
+        const base = session.taskSlug
+          ? taskRoute(session.projectSlug, session.taskSlug)
+          : projectRoute(session.projectSlug);
+        router.push(base);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button
+      onClick={toggle}
+      disabled={busy}
+      className={`text-[12px] px-3 py-1.5 rounded-lg border transition disabled:opacity-50 ${
+        completed
+          ? "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
+          : "border-[var(--ok)] text-[var(--ok)] hover:bg-[var(--ok-soft)]"
+      }`}
+      title={completed ? "Reopen this session" : "Mark this session complete"}
+    >
+      {completed ? "↺ Reopen" : "✓ Mark complete"}
+    </button>
+  );
+}
+
+// Approve/Dismiss card for an agent's `suggest_session_complete` request.
+// Approve marks the session complete and unblocks the agent's tool call
+// with "approved". Dismiss leaves the flag alone and tells the agent to keep
+// working.
+function CompletionSuggestionCard({
+  session,
+  requestId,
+  reason,
+}: {
+  session: SessionSummaryDTO;
+  requestId: string;
+  reason: string | null;
+}) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const decide = async (approved: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectSlug: session.projectSlug,
+          taskSlug: session.taskSlug,
+          completed: approved,
+          requestId,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        setError(j.error ?? "failed");
+        return;
+      }
+      // SSE completion_resolved clears the card; completed_changed flips the badge.
+      // On approval, navigate to the base view — the session is wrapped up.
+      // Dismiss keeps the user on the session so they can keep iterating.
+      if (approved) {
+        const base = session.taskSlug
+          ? taskRoute(session.projectSlug, session.taskSlug)
+          : projectRoute(session.projectSlug);
+        router.push(base);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-[var(--ok)] bg-[var(--panel)] p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[12px] font-semibold text-[var(--ok)] flex items-center gap-1.5">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+            Agent suggests this session is complete
+          </div>
+          {reason && (
+            <div className="text-[12.5px] text-[var(--text-soft)] mt-1 truncate">{reason}</div>
+          )}
+        </div>
+        <div className="flex gap-2 shrink-0">
+          <button
+            onClick={() => decide(false)}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md border border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)] disabled:opacity-40 transition"
+          >
+            Dismiss
+          </button>
+          <button
+            onClick={() => decide(true)}
+            disabled={busy}
+            className="text-[12px] px-3 py-1.5 rounded-md bg-[var(--ok)] text-white disabled:opacity-40 hover:brightness-110 transition"
+          >
+            {busy ? "…" : "Approve & mark complete"}
+          </button>
+        </div>
+      </div>
+      {error && <div className="text-[12px] text-[#dc2626] mt-2">{error}</div>}
     </div>
   );
 }
