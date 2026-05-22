@@ -16,8 +16,6 @@ import {
   readChromeLocalState,
   listChromeProfiles,
   openChromeReconnectPage,
-  expectedProfileBySession,
-  boundProfileBySession,
   CLAUDE_BIN_PATH,
 } from "../chrome-bridge";
 import { buildStaticWorkbenchMcps } from "../claude-chrome-tools";
@@ -139,19 +137,25 @@ exactly one extension-enabled profile open and you don't care which.`,
     defineTool(
       "chrome_open_profile",
       `Open a new Chrome window in a specific profile, pointed at the Claude
-reconnect URL. The extension in that profile auto-handshakes silently — there
-is no Connect button and the user does not need to click anything. The
-launched tab will flash open and close on its own within ~2-3 seconds; that
-flash IS the success path.
+reconnect URL. Wakes up the target profile's extension service worker if
+it's been dormant. The launched tab flashes open + closes on its own
+within ~2-3 seconds; that flash IS the success path.
 
-Implementation note: this invokes the Chrome binary directly with
---profile-directory + --new-window so the profile flag is respected even
-when Chrome is already running (macOS \`open -a\` silently routes the URL
-to whatever window is focused).
+This does NOT bind the MCP bridge to the requested profile — the bridge's
+choice of which extension instance to route to is decided separately. The
+canonical flow is:
 
-After calling this, wait briefly then call chrome_connect to wire the
-freshly-established bridge into this session's MCP map. Use chrome_status
-to verify the socket appeared.`,
+  1. chrome_connect                  (wire MCP into the session)
+  2. list_connected_browsers         (see all signed-in extension instances)
+  3. select_browser(deviceId)        (pin the bridge to one)
+
+Use chrome_open_profile only as a fallback when list_connected_browsers
+doesn't return the target — i.e., the profile's Chrome window is closed
+and its extension has gone dormant. Otherwise skip it.
+
+Implementation: invokes the Chrome binary directly with --profile-directory
++ --new-window so the profile flag is respected even when Chrome is
+already running.`,
       {
         profile_id: z.string().describe('The Chrome profile ID (e.g., "Default" or "Profile 1"). Use chrome_list_profiles to see available IDs.'),
       },
@@ -182,22 +186,10 @@ to verify the socket appeared.`,
           };
         }
 
-        // Record this session's expected + bound profile. The underlying
-        // native-messaging socket is shared across sessions on the same OS
-        // user — see docs/chrome-mcp-per-session.md — but this map gives
-        // chrome_status a reliable per-session attribution.
-        expectedProfileBySession.set(sessionId, { id: profile_id, email: profile.email });
-        boundProfileBySession.set(sessionId, {
-          id: profile_id,
-          name: profile.name,
-          email: profile.email,
-          boundAt: new Date(),
-        });
-
         return {
           content: [{
             type: "text",
-            text: `Opened a new Chrome window in profile "${profile.name}" (${profile.email}). The extension auto-handshakes silently — the launched tab will close on its own within a few seconds; that is success, not failure. Wait ~3s, then call chrome_status to confirm the socket appeared, then chrome_connect.`,
+            text: `Opened a Chrome window in profile "${profile.name}" (${profile.email}). The extension auto-handshakes silently — the launched tab closes on its own within a few seconds. To actually bind the bridge to this profile's extension, call list_connected_browsers and then select_browser(deviceId) — do not assume this open succeeded in routing.`,
           }],
         };
       },
@@ -205,14 +197,16 @@ to verify the socket appeared.`,
 
     defineTool(
       "chrome_status",
-      `Check Chrome MCP state. Reports, in order:
-1. Connection: connected / not connected, and to WHICH Chrome profile (email).
-2. Bridge plumbing: native-messaging socket present, native-host PID count.
-3. Chrome window state: which profiles are currently open in Chrome.
-4. Per-session MCP status (claude-in-chrome wired into this session?).
+      `Report bridge plumbing state — socket files, native-host processes,
+which Chrome profiles have windows open, and whether the MCP is wired into
+this session.
 
-Use this before any browser tool call to confirm the right account is in
-control. If "Connection: not connected", call chrome_open_profile.`,
+This does NOT report which Chrome extension instance the bridge is
+currently routing to. That state lives inside the running
+claude-in-chrome-mcp process and is not queryable from outside. To see the
+truth, call list_connected_browsers (returns deviceId + name for every
+connected extension) and then select_browser(deviceId) to pin the bridge
+to a specific one.`,
       {},
       async () => {
         const socketDir = getChromeSocketDir();
@@ -220,68 +214,32 @@ control. If "Connection: not connected", call chrome_open_profile.`,
         const socketExists = socketFiles.length > 0;
         const nativeHostPids = findNativeHostPids();
         const localState = readChromeLocalState();
-        const expected = expectedProfileBySession.get(sessionId) ?? null;
         const profiles = listChromeProfiles();
         const profileById = new Map(profiles.map((p) => [p.id, p]));
 
         const lines: string[] = [];
 
-        const currentBound = boundProfileBySession.get(sessionId) ?? null;
-        const connected = socketExists && nativeHostPids.length > 0;
-        const multiSocket = nativeHostPids.length > 1;
-        if (connected && currentBound) {
-          lines.push(`Connection: ✅ CONNECTED`);
-          lines.push(`  Profile: "${currentBound.name}" — ${currentBound.email} (id: ${currentBound.id})`);
-          if (multiSocket) {
-            lines.push(
-              `  ⚠ ${nativeHostPids.length} native-host sockets are live — the MCP CLI may have picked a different one`,
-              `    than the bound profile. If browser tools target the wrong account, call chrome_force_reset`,
-              `    then chrome_open_profile("${currentBound.id}") again.`,
-            );
-          }
-        } else if (connected) {
-          const guess = localState.lastUsed ? profileById.get(localState.lastUsed) : null;
-          lines.push(`Connection: ✅ connected, but profile unknown to this session`);
-          if (guess) {
-            lines.push(`  Likely: "${guess.name}" — ${guess.email} (id: ${localState.lastUsed}, Chrome's last-focused)`);
-          }
-          lines.push(`  → To attribute reliably, call chrome_open_profile(profile_id).`);
+        if (socketExists && nativeHostPids.length > 0) {
+          lines.push(`Bridge plumbing: ✅ socket present, native-host running`);
         } else {
-          lines.push(`Connection: ❌ NOT CONNECTED — call chrome_open_profile(profile_id) to bind one.`);
+          lines.push(`Bridge plumbing: ❌ no socket / no native-host`);
+          lines.push(`  Open a Chrome window in a profile with the Claude extension, or call chrome_open_profile(profile_id).`);
         }
-
-        lines.push(``, `Bridge:`);
         lines.push(`  socket dir: ${existsSync(socketDir) ? "present" : "missing"} (${socketDir})`);
         lines.push(`  .sock files: ${socketFiles.length > 0 ? `${socketFiles.length} (${socketFiles.join(", ")})` : "none"}`);
-        lines.push(
-          `  native-host PIDs: ${nativeHostPids.length > 0 ? nativeHostPids.join(", ") : "none"}`
-            + (multiSocket ? "  ⚠ multiple — chrome_force_reset recommended" : ""),
-        );
+        lines.push(`  native-host PIDs: ${nativeHostPids.length > 0 ? nativeHostPids.join(", ") : "none"}`);
 
         const fmtProfile = (id: string) => {
           const p = profileById.get(id);
           return p ? `"${p.name}" — ${p.email} (id: ${id})` : id;
         };
 
-        lines.push(``, `Chrome windows:`);
+        lines.push(``, `Chrome windows (from Chrome's Local State, not the bridge):`);
         if (localState.lastUsed) {
           lines.push(`  last-focused: ${fmtProfile(localState.lastUsed)}`);
         }
         if (localState.lastActive.length > 0) {
           lines.push(`  currently open: ${localState.lastActive.map(fmtProfile).join(", ")}`);
-        }
-        if (expected) {
-          lines.push(`  this session previously asked for: ${fmtProfile(expected.id)}`);
-        }
-
-        lines.push(``, `Global Session Bindings:`);
-        if (boundProfileBySession.size === 0) {
-          lines.push(`  No sessions have bound profiles yet.`);
-        } else {
-          for (const [sid, bp] of boundProfileBySession.entries()) {
-            const isThis = sid === sessionId ? " (this session)" : "";
-            lines.push(`  Session "${sid}"${isThis}: "${bp.name}" — ${bp.email} (id: ${bp.id}) [bound at ${bp.boundAt.toISOString()}]`);
-          }
         }
 
         lines.push(``, `Session MCP:`);
@@ -308,6 +266,12 @@ control. If "Connection: not connected", call chrome_open_profile.`,
         } catch (e) {
           lines.push(`  error querying MCP status: ${e instanceof Error ? e.message : String(e)}`);
         }
+
+        lines.push(
+          ``,
+          `To know which Chrome extension instance the bridge is talking to,`,
+          `call list_connected_browsers. To pin it, call select_browser(deviceId).`,
+        );
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       },
@@ -342,9 +306,6 @@ then chrome_connect.`,
           }
         } catch { /* ignore */ }
 
-        boundProfileBySession.clear();
-        expectedProfileBySession.clear();
-
         return {
           content: [{
             type: "text",
@@ -352,9 +313,8 @@ then chrome_connect.`,
               `Chrome bridge nuked:`,
               `  Killed ${killed.length} native-host process(es): ${killed.join(", ") || "none"}`,
               `  Removed ${socketsRemoved} .sock file(s)`,
-              `  All session bindings cleared`,
               ``,
-              `Next: chrome_open_profile(profile_id), then chrome_connect.`,
+              `Next: chrome_connect, then list_connected_browsers + select_browser(deviceId).`,
             ].join("\n"),
           }],
         };
@@ -465,8 +425,6 @@ Use this to release the Chrome connection, for example before switching to a dif
 
         try {
           const result = await q.setMcpServers(buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug));
-          expectedProfileBySession.delete(sessionId);
-          boundProfileBySession.delete(sessionId);
 
           if (result.removed.includes("claude-in-chrome")) {
             return { content: [{ type: "text", text: "Chrome MCP disconnected." }] };

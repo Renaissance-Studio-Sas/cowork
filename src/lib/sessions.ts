@@ -70,7 +70,6 @@ import {
   canOverwriteWithStopped,
   stateAfterResult,
 } from "./session-state-machine";
-import { clearChromeBindingsForSession } from "./chrome-bridge";
 
 // Re-export SessionState for consumers who import from sessions.ts
 export type { SessionState } from "./session-state-machine";
@@ -1180,14 +1179,6 @@ function setState(s: RuntimeSession, state: SessionState) {
       }
     }
     void persistSessionState(s, state);
-  }
-
-  // Drop chrome bridge entries on terminal transitions so chrome_force_reset
-  // and chrome_open_profile's "other sessions active?" checks reflect only
-  // sessions that are actually using Chrome. "idle" stays bound — the
-  // session can resume and the binding survives.
-  if (state === "stopped" || state === "error") {
-    clearChromeBindingsForSession(s.id);
   }
 }
 

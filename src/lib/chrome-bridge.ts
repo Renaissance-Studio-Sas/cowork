@@ -103,38 +103,12 @@ export function findNativeHostPids(): number[] {
   }
 }
 
-// Per-session "expected" Chrome profile — set by chrome_open_profile so we
-// can later tell the user which profile they asked for, even though we can't
-// directly inspect which profile owns the native-messaging socket. Survives
-// session lifecycle because it's keyed by sessionId in this module's scope.
-// See docs/chrome-mcp-per-session.md for the broader limitation.
-export const expectedProfileBySession = new Map<string, { id: string; email: string }>();
-
-export interface BoundProfile {
-  id: string;
-  name: string;
-  email: string;
-  boundAt: Date;
-}
-
-// Maps sessionId -> BoundProfile. Set by chrome_open_profile, read by
-// chrome_status, cleared by chrome_disconnect / chrome_force_reset and when
-// sessions reach a terminal state (see clearChromeBindingsForSession). We
-// can't read the profile from the socket or native-host process itself, so
-// this map is the source of truth for which profile each session believes
-// it is bound to. The Chrome native-messaging socket itself is per-user
-// (not per-profile), so concurrent sessions still share the underlying
-// bridge — see docs/chrome-mcp-per-session.md.
-export const boundProfileBySession = new Map<string, BoundProfile>();
-
-// Drop a session's entries from both tracking maps. Called by sessions.ts
-// when a session transitions to "stopped" or "error" so dead sessions don't
-// leave stale bindings that fool chrome_force_reset's "any other sessions
-// active?" check.
-export function clearChromeBindingsForSession(sessionId: string): void {
-  boundProfileBySession.delete(sessionId);
-  expectedProfileBySession.delete(sessionId);
-}
+// NOTE: there is no per-session "bound profile" tracker here, on purpose.
+// The actual bridge routing (which extension instance the SDK is currently
+// talking to) lives inside the running claude-in-chrome-mcp process and
+// can only be queried via list_connected_browsers / set via select_browser.
+// Any cache cowork keeps would lie the moment select_browser is called or
+// the bridge is restarted. See docs/chrome-mcp-per-session.md.
 
 export function getChromeUserDataDir(): string | null {
   const home = os.homedir();
