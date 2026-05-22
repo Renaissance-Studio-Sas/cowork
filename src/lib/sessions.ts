@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
-import { createWriteStream, readFileSync, writeFileSync, type WriteStream } from "node:fs";
+import { createWriteStream, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -460,9 +460,9 @@ export function getSessionQuery(id: string): AgentQuery | null {
 // which is structurally compatible with what the rest of sessions.ts
 // expects (pumpEvents, sendInput, interrupt, the SSE route).
 //
-// Centralising the dispatch here means the 4 query call sites (startSession,
-// startProjectSession, startPlanningSession, resumeSession) only need to add
-// `runtime` to their options blob.
+// Centralising the dispatch here means the query call sites (startSession,
+// startProjectSession, resumeSession) only need to add `runtime` to their
+// options blob.
 //
 // The Claude SDK's options shape today doubles as our AgentQueryOptions —
 // they're structurally compatible. The cast on `opts` lets the callers keep
@@ -1052,10 +1052,6 @@ async function pumpEvents(s: RuntimeSession) {
         const sid = (msg as { session_id?: string }).session_id;
         if (sid && sid !== s.sdkSessionId) {
           s.sdkSessionId = sid;
-          // Persist to meta.json so the new id survives restarts. (For
-          // session.projectSlug = "__planning__" persistSdkSessionId is a
-          // no-op; after adoptSessionToProject the slug becomes real and the
-          // next init's id is persisted automatically.)
           void persistSdkSessionId(s);
         }
         const initModel = (msg as { model?: string }).model;
@@ -1203,138 +1199,6 @@ export function relocateSessionsForTask(
   }
 }
 
-// Promote an ephemeral planning session into the project that was just
-// created from its proposal. We write the conversation history that's been
-// accumulating in memory out to `projects/<project>/sessions/<id>/`, redirect
-// the session's log streams there for any further events, and re-key the
-// in-memory entry so the project's sessions list picks it up.
-export async function adoptSessionToProject(id: string, projectSlug: string): Promise<boolean> {
-  const s = registry.get(id);
-  if (!s) return false;
-  const project = await getProject(projectSlug);
-  if (!project) return false;
-
-  const newCwd = path.join(PROJECTS_DIR, project.folderName);
-  const sessionDir = path.join(newCwd, "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
-
-  // meta.json — preserve the session's generated name
-  await fs.writeFile(path.join(sessionDir, "meta.json"), JSON.stringify({
-    id,
-    name: s.title,
-    project: projectSlug,
-    task: "",
-    cwd: newCwd,
-    startedAt: s.startedAt.toISOString(),
-    originatedFrom: "planning",
-    runtime: s.runtime,
-  }, null, 2));
-
-  // events.jsonl — dump whatever's already streamed
-  await fs.writeFile(
-    path.join(sessionDir, "events.jsonl"),
-    s.history.map((m) => JSON.stringify(m)).join("\n") + (s.history.length ? "\n" : ""),
-  );
-
-  // input.jsonl — extract user-typed messages from history
-  const userLines = s.history
-    .filter((m): m is SDKMessage & { type: "user" } => m.type === "user")
-    .map((m) => {
-      const content = (m as { message?: { content?: unknown } }).message?.content;
-      let text = "";
-      if (typeof content === "string") text = content;
-      else if (Array.isArray(content)) {
-        text = (content as Array<{ type?: string; text?: string }>)
-          .filter((p) => p.type === "text" && typeof p.text === "string")
-          .map((p) => p.text as string)
-          .join("");
-      }
-      return JSON.stringify({ at: new Date().toISOString(), text });
-    });
-  await fs.writeFile(
-    path.join(sessionDir, "input.jsonl"),
-    userLines.join("\n") + (userLines.length ? "\n" : ""),
-  );
-
-  // Close the old (/dev/null) sinks and reopen real ones so any further
-  // events from the still-running query land in the right files.
-  try { s.log.end(); } catch { /* already closed */ }
-  try { s.inputLog.end(); } catch { /* already closed */ }
-  s.log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
-  s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
-
-  // Re-key the registry entry into the new project
-  s.projectSlug = projectSlug;
-  s.taskSlug = "";
-  s.cwd = newCwd;
-  return true;
-}
-
-// Same idea as adoptSessionToProject but for a single new task — promote a
-// task-planning chat into `projects/<project>/<task>/sessions/<id>/` so the
-// conversation that produced the task is preserved alongside it.
-export async function adoptSessionToTask(
-  id: string,
-  projectSlug: string,
-  taskSlug: string,
-): Promise<boolean> {
-  const s = registry.get(id);
-  if (!s) return false;
-  const project = await getProject(projectSlug);
-  if (!project) return false;
-  const task = project.tasks.find((t) => t.slug === taskSlug);
-  if (!task) return false;
-
-  const newCwd = path.join(PROJECTS_DIR, project.folderName, task.folderName);
-  const sessionDir = path.join(newCwd, "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
-
-  await fs.writeFile(path.join(sessionDir, "meta.json"), JSON.stringify({
-    id,
-    name: s.title,
-    project: projectSlug,
-    task: taskSlug,
-    cwd: newCwd,
-    startedAt: s.startedAt.toISOString(),
-    originatedFrom: "planning",
-    runtime: s.runtime,
-  }, null, 2));
-
-  await fs.writeFile(
-    path.join(sessionDir, "events.jsonl"),
-    s.history.map((m) => JSON.stringify(m)).join("\n") + (s.history.length ? "\n" : ""),
-  );
-
-  const userLines = s.history
-    .filter((m): m is SDKMessage & { type: "user" } => m.type === "user")
-    .map((m) => {
-      const content = (m as { message?: { content?: unknown } }).message?.content;
-      let text = "";
-      if (typeof content === "string") text = content;
-      else if (Array.isArray(content)) {
-        text = (content as Array<{ type?: string; text?: string }>)
-          .filter((p) => p.type === "text" && typeof p.text === "string")
-          .map((p) => p.text as string)
-          .join("");
-      }
-      return JSON.stringify({ at: new Date().toISOString(), text });
-    });
-  await fs.writeFile(
-    path.join(sessionDir, "input.jsonl"),
-    userLines.join("\n") + (userLines.length ? "\n" : ""),
-  );
-
-  try { s.log.end(); } catch { /* already closed */ }
-  try { s.inputLog.end(); } catch { /* already closed */ }
-  s.log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
-  s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
-
-  s.projectSlug = projectSlug;
-  s.taskSlug = taskSlug;
-  s.cwd = newCwd;
-  return true;
-}
-
 export function relocateSessionsForProject(oldProject: string, newProject: string): void {
   for (const s of registry.values()) {
     if (s.projectSlug === oldProject) s.projectSlug = newProject;
@@ -1344,7 +1208,14 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
 // Project-level session — cwd is the project folder, sessions persist to
 // `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
 // sessions but at one level up.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime }): Promise<RuntimeSession> {
+//
+// `planning` opts the session into the create-project / create-task chat
+// flow: instead of the standard project-context system prompt + static
+// workbench tools, the agent gets the planning system prompt and the
+// `propose_plan` / `propose_task` MCP tool that the Chat UI watches for.
+// Everything else (persistence, sidebar listing, resume) behaves exactly
+// like a normal session.
+export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task" }): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
@@ -1390,7 +1261,29 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   // Project-level sessions only get project.md context (no task). Comments
   // and other workbench tools scope to project-level (empty taskSlug); the
   // comments tool operates on project-level .comments.json in that case.
-  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, "", name);
+  //
+  // Planning mode swaps the project-context prompt for the claude_code preset
+  // with the planning instructions appended, and merges the planning MCP
+  // (propose_plan / propose_task) into the static workbench MCPs so the chat
+  // UI can render the proposal as an inline card.
+  const planningAppend = p.planning === "task"
+    ? buildTaskPlanningSystemPrompt(
+        project.slug,
+        project.folderName,
+        project.description,
+        project.tasks.map((t) => t.slug),
+      )
+    : p.planning === "project"
+      ? PLANNING_SYSTEM_PROMPT
+      : null;
+  const systemPrompt = planningAppend
+    ? { type: "preset" as const, preset: "claude_code" as const, append: planningAppend }
+    : await buildContextSystemPrompt(p.projectSlug, "", name);
+  const planningMcps = p.planning === "task"
+    ? { "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildTaskPlanningTools()) }
+    : p.planning === "project"
+      ? { "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildPlanningTools()) }
+      : {};
   const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
@@ -1399,7 +1292,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       toolAliases: STATIC_TOOL_ALIASES,
-      mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, ""),
+      mcpServers: { ...buildStaticWorkbenchMcps(id, p.projectSlug, ""), ...planningMcps },
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
       runtimeStateDir: sessionDir,
       systemPrompt,
@@ -1439,167 +1332,6 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   };
   registerSession(session);
   session.log.write(JSON.stringify(firstUserEcho) + "\n");
-  session.events.emit("event", firstUserEcho);
-  void pumpEvents(session);
-  return session;
-}
-
-// Ephemeral, in-memory only — used by the "New Project" chat modal.
-// Doesn't persist to disk and doesn't show up in the workspace.
-export async function startPlanningSession(firstMessage: string): Promise<RuntimeSession> {
-  const id = `plan-${randomUUID().slice(0, 8)}`;
-  const name = generateSessionLabel(firstMessage);
-  // Planning sessions run at the workspace root so the agent can read shared
-  // resources (CLAUDE.md, skills/, scripts/, etc.) and walk `projects/` to
-  // discover what already exists before proposing a new project.
-  const cwd = WORKSPACE_ROOT;
-  const input = new InputChannel();
-  const events = new EventEmitter();
-  events.setMaxListeners(0);
-  const pendingPermissions = new Map<string, PendingPermission>();
-  const pendingQuestions = new Map<string, PendingQuestion>();
-  const pendingCompletions = new Map<string, PendingCompletion>();
-
-  input.push(makeUserMessage(firstMessage, id));
-
-  // Planning sessions are always Claude — see RuntimeSession construction below.
-  const q = createAgentQuery("claude", {
-    prompt: input,
-    options: {
-      cwd,
-      permissionMode: "bypassPermissions",
-      // Use Claude Code's preset so the agent retains Read / Glob / Bash for
-      // discovering existing projects, with our planning prompt appended.
-      systemPrompt: { type: "preset", preset: "claude_code", append: PLANNING_SYSTEM_PROMPT },
-      settingSources: ["project", "user"],
-      canUseTool: buildCanUseTool(pendingPermissions, events),
-      toolAliases: STATIC_TOOL_ALIASES,
-      mcpServers: {
-        "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildPlanningTools()),
-        // toolAliases above redirects AskUserQuestion here, so the MCP
-        // backing it has to be registered even for planning sessions.
-        "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(id)),
-      },
-      // Don't specify model — use SDK default (latest Claude)
-    },
-  });
-
-  const now = new Date();
-  // Discard logs — these sessions are throwaway.
-  const sink: WriteStream = createWriteStream("/dev/null");
-  const firstUserEcho = makeUserMessage(firstMessage, id);
-  const session: RuntimeSession = {
-    id,
-    projectSlug: "__planning__",
-    taskSlug: "__planning__",
-    cwd,
-    title: name,
-    startedAt: now,
-    lastActivity: now,
-    seenAt: null, // Planning sessions don't track seen state
-    completedAt: null, // Planning sessions don't track completion
-    q,
-    input,
-    events,
-    log: sink,
-    inputLog: createWriteStream("/dev/null"),
-    history: [firstUserEcho],
-    state: "running",
-    pendingPermissions,
-    pendingQuestions,
-    pendingCompletions,
-    completed: false,
-    sdkSessionId: null,
-    permissionMode: "bypassPermissions",
-    model: null,
-    effort: null,
-    // Planning sessions are always Claude — they predate the runtime selector
-    // and run before any project has a configured runtime preference.
-    runtime: "claude",
-  };
-  registerSession(session);
-  session.events.emit("event", firstUserEcho);
-  void pumpEvents(session);
-  return session;
-}
-
-// Ephemeral, in-memory only — used by the "New Task" chat modal. Scoped to
-// a specific project so the agent has its description and existing task list
-// up front. Adopted onto the new task's sessions/ folder once the user
-// accepts the proposal (see adoptSessionToTask).
-export async function startTaskPlanningSession(
-  projectSlug: string,
-  firstMessage: string,
-): Promise<RuntimeSession> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error(`unknown project ${projectSlug}`);
-
-  const id = `plan-task-${randomUUID().slice(0, 8)}`;
-  const name = generateSessionLabel(firstMessage);
-  const cwd = WORKSPACE_ROOT;
-  const input = new InputChannel();
-  const events = new EventEmitter();
-  events.setMaxListeners(0);
-  const pendingPermissions = new Map<string, PendingPermission>();
-  const pendingQuestions = new Map<string, PendingQuestion>();
-  const pendingCompletions = new Map<string, PendingCompletion>();
-
-  input.push(makeUserMessage(firstMessage, id));
-
-  const append = buildTaskPlanningSystemPrompt(
-    project.slug,
-    project.folderName,
-    project.description,
-    project.tasks.map((t) => t.slug),
-  );
-
-  const q = createAgentQuery("claude", {
-    prompt: input,
-    options: {
-      cwd,
-      permissionMode: "bypassPermissions",
-      systemPrompt: { type: "preset", preset: "claude_code", append },
-      settingSources: ["project", "user"],
-      canUseTool: buildCanUseTool(pendingPermissions, events),
-      toolAliases: STATIC_TOOL_ALIASES,
-      mcpServers: {
-        "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildTaskPlanningTools()),
-        "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(id)),
-      },
-    },
-  });
-
-  const now = new Date();
-  const sink: WriteStream = createWriteStream("/dev/null");
-  const firstUserEcho = makeUserMessage(firstMessage, id);
-  const session: RuntimeSession = {
-    id,
-    projectSlug: "__planning__",
-    taskSlug: "__planning__",
-    cwd,
-    title: name,
-    startedAt: now,
-    lastActivity: now,
-    seenAt: null,
-    completedAt: null,
-    q,
-    input,
-    events,
-    log: sink,
-    inputLog: createWriteStream("/dev/null"),
-    history: [firstUserEcho],
-    state: "running",
-    pendingPermissions,
-    pendingQuestions,
-    pendingCompletions,
-    completed: false,
-    sdkSessionId: null,
-    permissionMode: "bypassPermissions",
-    model: null,
-    effort: null,
-    runtime: "claude",
-  };
-  registerSession(session);
   session.events.emit("event", firstUserEcho);
   void pumpEvents(session);
   return session;

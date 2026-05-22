@@ -28,9 +28,6 @@ export async function updateMeta(
   s: RuntimeSession,
   mutate: (meta: Record<string, unknown>) => void,
 ): Promise<void> {
-  // Skip for planning sessions (they write to /dev/null)
-  if (s.projectSlug === "__planning__") return;
-
   const prev = metaWriteQueue.get(s.id) ?? Promise.resolve();
   const next = prev.then(async () => {
     try {

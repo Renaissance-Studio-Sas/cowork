@@ -220,6 +220,18 @@ export async function createTask(projectSlug: string, slug: string, description 
   return (await getTask(projectSlug, clean))!;
 }
 
+// Overwrite project.md's body, preserving frontmatter. Used by the
+// New-Project planning flow when the user accepts the plan: the project
+// was created up-front as a stub, and accepting fills in the real
+// description.
+export async function setProjectDescription(slug: string, description: string): Promise<void> {
+  const project = await getProject(slug);
+  if (!project) throw new Error(`unknown project ${slug}`);
+  const mdPath = path.join(PROJECTS_DIR, project.folderName, "files", "project.md");
+  const { fm } = await readMarkdown(mdPath);
+  await writeMarkdown(mdPath, description, fm);
+}
+
 export async function setProjectStatus(slug: string, status: Status): Promise<void> {
   const project = await getProject(slug);
   if (!project) throw new Error(`unknown project ${slug}`);
