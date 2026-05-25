@@ -29,7 +29,10 @@ export function buildSessionTools(
   return [
     defineTool(
       "set_session_title",
-      `Set the title shown for this session in the cowork sidebar.`,
+      `Override the session title shown in the cowork sidebar. The workbench
+auto-titles each session from turn 1, so you usually do nothing — call this
+only when you want a different title than the auto-generated one (e.g. the
+focus of the session shifted, or the auto-title misses the point).`,
       { title: z.string().min(1).max(60).describe("Short descriptive title (3-6 words)") },
       async ({ title }) => {
         const ok = await renameLiveSession(sessionId, title);
@@ -41,6 +44,7 @@ export function buildSessionTools(
         }
         return { content: [{ type: "text", text: `Session title set to: "${title}"` }] };
       },
+      { alwaysLoad: true },
     ),
 
     defineTool(
@@ -74,6 +78,7 @@ sends another message, the completion is cleared automatically.`,
           }],
         };
       },
+      { alwaysLoad: true },
     ),
 
     defineTool(

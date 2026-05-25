@@ -74,12 +74,10 @@ export async function buildContextSystemPrompt(
   const titleBlock = currentTitle
     ? `## Session title
 
-This session is currently titled "${currentTitle}" — that's an auto-generated
-placeholder derived from the first message. In your first response, call
-\`set_session_title\` with a 3-6 word summary of what you're actually working
-on (e.g. "Added dark mode toggle", "Fixed login validation bug"). Skip filler
-words like "Implemented", "Updated", "Changed". If the existing title already
-captures the work accurately, leave it alone.
+This session is currently titled "${currentTitle}" — a placeholder derived
+from your first message. The workbench will auto-generate a better title
+after your first turn ends; you don't need to do anything. If the auto-title
+turns out wrong later, call \`set_session_title\` to override it.
 
 `
     : "";

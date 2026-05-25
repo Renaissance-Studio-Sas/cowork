@@ -33,6 +33,7 @@ export function workbenchToolsAsClaudeMcp(
         // public type); cast at the boundary.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         async (args: Record<string, unknown>) => (await t.handler(args)) as any,
+        t.alwaysLoad ? { alwaysLoad: true } : undefined,
       ),
     ),
   });

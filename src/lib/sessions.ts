@@ -985,6 +985,8 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     model: p.model ?? null,
     effort: p.effort ?? null,
     runtime,
+    firstMessage: p.firstMessage,
+    autoTitleAttempted: false,
   };
   registerSession(session);
 
@@ -1094,6 +1096,15 @@ async function pumpEvents(s: RuntimeSession) {
           const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
           setState(s, stateAfterResult(isQuestion));
         }
+        // First completed turn → auto-title. The model can't reliably call
+        // set_session_title on turn 1 in the 1M-context Opus runtime (deferred
+        // tools take a ToolSearch round-trip), so the workbench summarizes
+        // turn 1 itself via a sub-query. Skipped if the title has already
+        // been overridden (model or human) during the turn.
+        if (!s.autoTitleAttempted) {
+          s.autoTitleAttempted = true;
+          void autoTitleFromFirstTurn(s);
+        }
       } else if (msg.type === "assistant" || msg.type === "user") {
         // Buffered in-flight messages arriving after an interrupt must not
         // resurrect "running" over the user's stop.
@@ -1139,6 +1150,73 @@ async function pumpEvents(s: RuntimeSession) {
       // (state=idle, streams closed, dead SDK) would silently disappear.
       s.input.close();
     }
+  }
+}
+
+// Summarize the user's first message + the assistant's first text reply into
+// a 3-6 word sidebar title, then apply it via renameLiveSession. Runs as a
+// detached sub-query using the session's own runtime + model, so it inherits
+// the same auth (no extra API key needed). Best-effort: any failure leaves
+// the placeholder title in place. The model can still override later with
+// set_session_title.
+async function autoTitleFromFirstTurn(s: RuntimeSession): Promise<void> {
+  const firstMessage = s.firstMessage;
+  if (!firstMessage) return;
+
+  // Skip if the title was already overridden during turn 1 (model called
+  // set_session_title, or human renamed via the UI). generateSessionLabel
+  // is the placeholder we'd have set at session creation.
+  const placeholder = generateSessionLabel(firstMessage);
+  if (s.title.trim() !== placeholder.trim()) return;
+
+  const firstReply = lastAssistantText(s.history).trim().slice(0, 1500);
+  const prompt = [
+    "Summarize this Claude Code session as a 3-6 word title for a sidebar.",
+    "Output ONLY the title — no quotes, no surrounding punctuation, no",
+    'prefix like "Title:". Capitalize like a sentence. Skip filler verbs',
+    'like "Implemented", "Updated", "Changed".',
+    "",
+    "User's first message:",
+    firstMessage.slice(0, 800),
+    "",
+    "Assistant's first reply (excerpt):",
+    firstReply || "(no text reply)",
+  ].join("\n");
+
+  try {
+    const sub = createAgentQuery(s.runtime, {
+      prompt,
+      options: {
+        cwd: s.cwd,
+        // No workbench tools, no skills, no project settings — just the model.
+        settingSources: [],
+        ...(s.model ? { model: s.model } : {}),
+      },
+    });
+    let text = "";
+    for await (const msg of sub) {
+      if (msg.type === "assistant") {
+        const parts = (msg as { message?: { content?: unknown } }).message?.content;
+        if (Array.isArray(parts)) {
+          for (const part of parts as Array<{ type?: string; text?: string }>) {
+            if (part.type === "text" && typeof part.text === "string") text += part.text;
+          }
+        }
+      } else if (msg.type === "result") {
+        break;
+      }
+    }
+    const title = text
+      .trim()
+      .split("\n")[0]
+      .replace(/^["'`*\s]+|["'`*\s.!?]+$/g, "")
+      .slice(0, 60)
+      .trim();
+    if (title.length >= 3 && title !== placeholder) {
+      await renameLiveSession(s.id, title);
+    }
+  } catch (e) {
+    console.warn(`[session ${s.id}] auto-title failed:`, e instanceof Error ? e.message : e);
   }
 }
 
@@ -1336,6 +1414,8 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     model: p.model ?? null,
     effort: p.effort ?? null,
     runtime,
+    firstMessage: p.firstMessage,
+    autoTitleAttempted: false,
   };
   registerSession(session);
   session.log.write(JSON.stringify(firstUserEcho) + "\n");

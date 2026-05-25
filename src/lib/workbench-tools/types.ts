@@ -52,6 +52,13 @@ export interface WorkbenchTool {
   schema: ToolSchema;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   handler: (args: any) => Promise<ToolCallResult>;
+  // When true, the Claude SDK includes this tool's schema in the prompt at
+  // turn 1 (defer_loading: false) instead of hiding it behind ToolSearch.
+  // Use sparingly — alwaysLoad tools take prompt slots — but it's the only
+  // way for a tool to be callable on the very first response. Required for
+  // tools the system prompt instructs the model to call before doing the
+  // user's work (e.g. set_session_title, ask_user_question).
+  alwaysLoad?: boolean;
 }
 
 // Helper that infers the handler's args type from the schema at the call
@@ -65,7 +72,14 @@ export function defineTool<S extends ToolSchema>(
   description: string,
   schema: S,
   handler: (args: z.infer<z.ZodObject<S>>) => Promise<ToolCallResult>,
+  opts?: { alwaysLoad?: boolean },
 ): WorkbenchTool {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return { name, description, schema, handler: handler as (args: any) => Promise<ToolCallResult> };
+  return {
+    name,
+    description,
+    schema,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    handler: handler as (args: any) => Promise<ToolCallResult>,
+    alwaysLoad: opts?.alwaysLoad,
+  };
 }

@@ -107,6 +107,7 @@ This tool is wired to the built-in AskUserQuestion via toolAliases — calling e
 
         return { content: [{ type: "text", text: lines.join("\n\n") }] };
       },
+      { alwaysLoad: true },
     ),
   ];
 }

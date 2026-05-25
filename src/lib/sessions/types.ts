@@ -75,6 +75,12 @@ export interface RuntimeSession {
   model: string | null;
   effort: EffortLevel | null;    // thinking effort, null = SDK default ('high')
   runtime: SessionRuntime;       // claude (default) | gemini
+  // Verbatim text of the user's first message — kept so auto-titling can
+  // summarize it after turn 1 without re-parsing history[0].
+  firstMessage?: string;
+  // Flips true the first time a `result` event fires for this session, so
+  // the auto-titler runs at most once. Resume does not reset it.
+  autoTitleAttempted?: boolean;
 }
 
 export interface PendingPermission {
