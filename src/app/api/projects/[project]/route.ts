@@ -14,7 +14,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ project: stri
   const { project } = await ctx.params;
   const body = await req.json();
   try {
-    if (body.status && (body.status === "wip" || body.status === "done")) {
+    if (body.status && (body.status === "active" || body.status === "archived")) {
       await setProjectStatus(project, body.status);
     }
     if (typeof body.slug === "string" && body.slug !== project) {

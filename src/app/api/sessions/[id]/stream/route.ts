@@ -52,6 +52,13 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       // Send history metadata so client can implement "load more"
       sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: total - initialHistory.length });
       for (const msg of initialHistory) sendEvent("message", msg);
+      // If a turn is mid-stream, replay the text that streamed before this
+      // client connected so the in-progress bubble matches the live one.
+      // Must come AFTER the message replay — those messages clear the
+      // client's streamingText buffer as they render.
+      if (s.streamingText) {
+        sendEvent("stream_snapshot", { text: s.streamingText });
+      }
 
       // Replay any in-flight permission requests so a late-joining client
       // sees the pending approval card immediately (e.g. user navigates to

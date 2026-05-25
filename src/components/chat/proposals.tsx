@@ -11,13 +11,15 @@ import { sluggifyName } from "./utils";
 
 interface ProposedTaskInput {
   task_slug?: string;
-  task_description?: string;
+  task_overview?: string;
+  task_details?: string;
 }
 
 interface ProposedPlanInput {
   project_slug?: string;
-  project_description?: string;
-  tasks?: Array<{ slug?: string; description?: string }>;
+  project_overview?: string;
+  project_details?: string;
+  tasks?: Array<{ slug?: string; overview?: string; details?: string }>;
 }
 
 export function ProposalCard({
@@ -40,6 +42,7 @@ export function ProposalCard({
         initial={input as ProposedTaskInput}
         isLatest={isLatest}
         projectSlug={session.projectSlug}
+        sessionId={session.id}
         onCreated={(slug) => {
           onCreated();
           router.push(taskRoute(session.projectSlug, slug));
@@ -53,6 +56,7 @@ export function ProposalCard({
         initial={input as ProposedPlanInput}
         isLatest={isLatest}
         stubSlug={session.projectSlug}
+        sessionId={session.id}
         onCreated={(slug) => {
           onCreated();
           router.push(projectRoute(slug));
@@ -67,15 +71,18 @@ function TaskProposalCard({
   initial,
   isLatest,
   projectSlug,
+  sessionId,
   onCreated,
 }: {
   initial: ProposedTaskInput;
   isLatest: boolean;
   projectSlug: string;
+  sessionId: string;
   onCreated: (slug: string) => void;
 }) {
   const [slug, setSlug] = useState(initial.task_slug ?? "Untitled");
-  const [description, setDescription] = useState(initial.task_description ?? "");
+  const [overview, setOverview] = useState(initial.task_overview ?? "");
+  const [details, setDetails] = useState(initial.task_details ?? "");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -88,7 +95,7 @@ function TaskProposalCard({
       const r = await fetch(`/api/projects/${encodeURIComponent(projectSlug)}/tasks/from-plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug: cleanSlug, description }),
+        body: JSON.stringify({ slug: cleanSlug, overview, details, session_id: sessionId }),
       });
       const j = await r.json();
       if (!r.ok) { setError(j.error ?? "failed to create"); return; }
@@ -117,10 +124,19 @@ function TaskProposalCard({
           />
         </div>
         <div>
-          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">task.md</div>
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Overview (one line)</div>
+          <input
+            value={overview}
+            onChange={(e) => setOverview(e.target.value)}
+            disabled={!isLatest}
+            className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13.5px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
+          />
+        </div>
+        <div>
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Details (markdown)</div>
           <textarea
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
+            value={details}
+            onChange={(e) => setDetails(e.target.value)}
             disabled={!isLatest}
             rows={8}
             className="w-full resize-y bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] font-mono leading-relaxed disabled:opacity-60"
@@ -145,26 +161,33 @@ function PlanProposalCard({
   initial,
   isLatest,
   stubSlug,
+  sessionId,
   onCreated,
 }: {
   initial: ProposedPlanInput;
   isLatest: boolean;
   stubSlug: string;
+  sessionId: string;
   onCreated: (slug: string) => void;
 }) {
   const [projectSlug, setProjectSlug] = useState(initial.project_slug ?? stubSlug);
-  const [projectDescription, setProjectDescription] = useState(initial.project_description ?? "");
-  const [tasks, setTasks] = useState<Array<{ slug: string; description: string }>>(
-    (initial.tasks ?? []).map((t) => ({ slug: t.slug ?? "", description: t.description ?? "" })),
+  const [projectOverview, setProjectOverview] = useState(initial.project_overview ?? "");
+  const [projectDetails, setProjectDetails] = useState(initial.project_details ?? "");
+  const [tasks, setTasks] = useState<Array<{ slug: string; overview: string; details: string }>>(
+    (initial.tasks ?? []).map((t) => ({
+      slug: t.slug ?? "",
+      overview: t.overview ?? "",
+      details: t.details ?? "",
+    })),
   );
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const updateTask = (i: number, patch: Partial<{ slug: string; description: string }>) => {
+  const updateTask = (i: number, patch: Partial<{ slug: string; overview: string; details: string }>) => {
     setTasks((prev) => prev.map((t, j) => (i === j ? { ...t, ...patch } : t)));
   };
   const removeTask = (i: number) => setTasks((prev) => prev.filter((_, j) => j !== i));
-  const addTask = () => setTasks((prev) => [...prev, { slug: "new-task", description: "" }]);
+  const addTask = () => setTasks((prev) => [...prev, { slug: "new-task", overview: "", details: "" }]);
 
   const create = async () => {
     if (!projectSlug.trim() || creating) return;
@@ -178,10 +201,12 @@ function PlanProposalCard({
         body: JSON.stringify({
           current_slug: stubSlug,
           slug: cleanSlug,
-          description: projectDescription,
+          overview: projectOverview,
+          details: projectDetails,
           tasks: tasks
             .filter((t) => t.slug.trim())
-            .map((t) => ({ slug: sluggifyName(t.slug), description: t.description })),
+            .map((t) => ({ slug: sluggifyName(t.slug), overview: t.overview, details: t.details })),
+          session_id: sessionId,
         }),
       });
       const j = await r.json();
@@ -211,13 +236,22 @@ function PlanProposalCard({
           />
         </div>
         <div>
-          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Description</div>
-          <textarea
-            value={projectDescription}
-            onChange={(e) => setProjectDescription(e.target.value)}
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Overview (one line)</div>
+          <input
+            value={projectOverview}
+            onChange={(e) => setProjectOverview(e.target.value)}
             disabled={!isLatest}
-            rows={2}
-            className="w-full resize-none bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
+            className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
+          />
+        </div>
+        <div>
+          <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Details (markdown)</div>
+          <textarea
+            value={projectDetails}
+            onChange={(e) => setProjectDetails(e.target.value)}
+            disabled={!isLatest}
+            rows={4}
+            className="w-full resize-y bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] font-mono leading-relaxed disabled:opacity-60"
           />
         </div>
         <div>
@@ -233,11 +267,11 @@ function PlanProposalCard({
                   placeholder="slug"
                 />
                 <input
-                  value={t.description}
-                  onChange={(e) => updateTask(i, { description: e.target.value })}
+                  value={t.overview}
+                  onChange={(e) => updateTask(i, { overview: e.target.value })}
                   disabled={!isLatest}
                   className="flex-1 bg-transparent border-b border-transparent focus:border-[var(--accent)] outline-none text-[12.5px] py-0.5 disabled:opacity-60"
-                  placeholder="description"
+                  placeholder="overview"
                 />
                 {isLatest && (
                   <button

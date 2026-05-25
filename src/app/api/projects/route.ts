@@ -8,6 +8,9 @@ export async function POST(req: Request) {
   if (!body.slug || typeof body.slug !== "string") {
     return NextResponse.json({ error: "slug required" }, { status: 400 });
   }
-  const project = await createProject(body.slug, body.description ?? "");
+  const project = await createProject(body.slug, {
+    overview: body.overview ?? "",
+    details: body.details ?? "",
+  });
   return NextResponse.json(project);
 }

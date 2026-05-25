@@ -44,6 +44,15 @@ export interface RuntimeSession {
   log: WriteStream;              // events.jsonl
   inputLog: WriteStream;         // input.jsonl
   history: SDKMessage[];         // in-memory replay buffer for new SSE clients
+  // Accumulated text from `text_delta` stream_event chunks of the CURRENT
+  // in-flight assistant turn. Per-token deltas aren't persisted to history
+  // (they'd bloat events.jsonl ~30× per turn), so without this buffer a
+  // client that joins mid-stream sees only the deltas that arrive after it
+  // connects. Cleared whenever a non-stream assistant/result/user message
+  // ends the current text block, and on resume when a fresh turn begins —
+  // mirrors the client-side reset in Chat.tsx so server and live UI stay
+  // in sync.
+  streamingText: string;
   state: SessionState;
   // Set true by interrupt()/forceStop() so the running pumpEvents loop knows a
   // stop is in flight. The SDK keeps delivering buffered in-flight events after

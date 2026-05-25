@@ -173,6 +173,16 @@ export function Chat({ session, onChange, onBack }: Props) {
       } catch { /* ignore */ }
     });
 
+    // Server seeds us with the text that streamed before we connected so a
+    // mid-stream join shows the full in-progress bubble, not just the
+    // post-join tail. Subsequent text_delta events keep appending normally.
+    es.addEventListener("stream_snapshot", (ev) => {
+      try {
+        const { text } = JSON.parse((ev as MessageEvent).data);
+        if (typeof text === "string") setStreamingText(text);
+      } catch { /* ignore */ }
+    });
+
     es.addEventListener("message", (ev) => {
       try {
         if (!connected) {

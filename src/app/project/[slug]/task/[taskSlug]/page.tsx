@@ -6,8 +6,8 @@ import Link from "next/link";
 import type { SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
-import { StatusChip } from "@/components/StatusChip";
 import { WorkingIndicator } from "@/components/WorkingIndicator";
+import { Markdown } from "@/components/chat/Markdown";
 import { handleComposerEnter } from "@/lib/composer";
 import { taskSessionRoute, taskFileRoute, taskDirRoute, projectRoute, saveTaskPath } from "@/lib/routes";
 import { FileDropZone, type FileAttachment } from "@/components/FileDropZone";
@@ -20,7 +20,6 @@ interface Entry {
 }
 
 function iconForFile(p: string): string {
-  if (p === "task.md") return "📋";
   const ext = p.split(".").pop()?.toLowerCase() ?? "";
   if (["md", "markdown", "txt"].includes(ext)) return "📄";
   if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "🖼";
@@ -105,6 +104,7 @@ export default function TaskPage() {
   const [renamingSession, setRenamingSession] = useState<string | null>(null);
   const [sessionRenameValue, setSessionRenameValue] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
 
   const refreshFiles = useCallback(async () => {
     if (!projectSlug || !taskSlug) return;
@@ -171,15 +171,12 @@ export default function TaskPage() {
     }));
     const isRoot = !dirPath;
     const folders = folderEntries.sort((a, b) => a.name.localeCompare(b.name));
+    // task.json is the brief — rendered at the top of the page as a
+    // styled overview/details block, so we hide it from the artifact list.
     const filesAtLevel = out
-      .filter((e) => !(isRoot && e.name === "task.md"))
+      .filter((e) => !(isRoot && e.name === "task.json"))
       .sort((a, b) => a.name.localeCompare(b.name));
-    const taskMd = isRoot ? out.find((e) => e.name === "task.md") : null;
-    return [
-      ...(taskMd ? [taskMd] : []),
-      ...folders,
-      ...filesAtLevel,
-    ];
+    return [...folders, ...filesAtLevel];
   }, [files, dirPath]);
 
   const breadcrumb = useMemo(() => {
@@ -212,12 +209,12 @@ export default function TaskPage() {
     } finally { setStarting(false); }
   };
 
-  const markDone = async () => {
+  const toggleArchived = async () => {
     if (!task) return;
     await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: task.status === "wip" ? "done" : "wip" }),
+      body: JSON.stringify({ status: task.status === "active" ? "archived" : "active" }),
     });
     refresh();
   };
@@ -275,7 +272,7 @@ export default function TaskPage() {
 
   const openContextMenu = (e: React.MouseEvent, entry: Entry) => {
     e.preventDefault();
-    if (entry.type === "file" && entry.path === "task.md") return;
+    if (entry.type === "file" && entry.path === "task.json") return;
     const items: MenuItem[] = [
       { label: "Rename", onClick: () => startRename(entry) },
       { label: "Delete", danger: true, onClick: () => deleteEntry(entry) },
@@ -346,14 +343,35 @@ export default function TaskPage() {
     refresh();
   };
 
+  const markAllSessionsAsCompleted = async () => {
+    const openSessions = taskSessions.filter((s) => !s.completed);
+    if (openSessions.length === 0) return;
+    await Promise.all(
+      openSessions.map((s) =>
+        fetch(`/api/sessions/${s.id}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectSlug, taskSlug, completed: true }),
+        })
+      )
+    );
+    refresh();
+  };
+
   const openSessionsHeaderContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     const unreadCount = taskSessions.filter((s) => s.unread).length;
+    const openCount = taskSessions.filter((s) => !s.completed).length;
     const items: MenuItem[] = [
       {
         label: unreadCount > 0 ? `Mark all as read (${unreadCount})` : "Mark all as read",
         onClick: markAllSessionsAsRead,
         disabled: unreadCount === 0,
+      },
+      {
+        label: openCount > 0 ? `Mark all as completed (${openCount})` : "Mark all as completed",
+        onClick: markAllSessionsAsCompleted,
+        disabled: openCount === 0,
       },
     ];
     setMenu({ x: e.clientX, y: e.clientY, items });
@@ -370,24 +388,50 @@ export default function TaskPage() {
   return (
     <>
       <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
-        <StatusChip status={task.status} size="md" />
         <div className="flex-1 min-w-0">
           <div className="text-[14px] truncate">
             <Link href={projectRoute(projectSlug)} className="text-[var(--muted)] hover:text-[var(--text)]">{projectSlug}</Link>
             <span className="text-[var(--muted)] mx-1.5">·</span>
-            <span className={task.status === "done" ? "text-[var(--muted)] line-through" : ""}>{task.slug}</span>
+            <span className={task.status === "archived" ? "text-[var(--muted)] line-through" : ""}>{task.slug}</span>
           </div>
         </div>
         <button
-          onClick={markDone}
+          onClick={toggleArchived}
           className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
         >
-          {task.status === "wip" ? "✓ Mark done" : "↺ Reopen"}
+          {task.status === "active" ? "🗄 Archive" : "↺ Unarchive"}
         </button>
       </header>
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-[760px] mx-auto px-6 py-6 space-y-6">
+          {/* Brief: overview always visible, details folded by default */}
+          {!dirPath && (task.overview || task.details) && (
+            <div className="space-y-2">
+              {task.overview && (
+                <div className="text-[15px] leading-relaxed text-[var(--text)]">
+                  {task.overview}
+                </div>
+              )}
+              {task.details && (
+                <>
+                  <button
+                    onClick={() => setShowDetails((s) => !s)}
+                    className="text-[11.5px] text-[var(--muted)] hover:text-[var(--text)] inline-flex items-center gap-1"
+                  >
+                    <span>{showDetails ? "▾" : "▸"}</span>
+                    <span>{showDetails ? "Hide details" : "Show details"}</span>
+                  </button>
+                  {showDetails && (
+                    <div className="text-[var(--text-soft)] pt-1">
+                      <Markdown text={task.details} />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           <FileDropZone onFiles={handleFileDrop} disabled={uploading}>
             <div className="flex items-center gap-1.5 mb-2 px-1 text-[12px] uppercase tracking-wider text-[var(--muted)] font-medium">
               {breadcrumb.map((b, i) => (
@@ -410,7 +454,6 @@ export default function TaskPage() {
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {entries.map((e) => {
-                  const isTaskMd = e.type === "file" && e.path === "task.md";
                   const href = e.type === "folder"
                     ? taskDirRoute(projectSlug, taskSlug, e.path)
                     : taskFileRoute(projectSlug, taskSlug, e.path);
@@ -454,7 +497,7 @@ export default function TaskPage() {
                       <span className="text-[18px] shrink-0">
                         {e.type === "folder" ? "📁" : iconForFile(e.path)}
                       </span>
-                      <span className={`text-[13.5px] truncate flex-1 ${isTaskMd ? "font-medium" : ""}`}>
+                      <span className="text-[13.5px] truncate flex-1">
                         {e.name}
                         {e.type === "folder" && (
                           <span className="text-[var(--muted)] ml-1.5 text-[11.5px]">{e.count} item{e.count === 1 ? "" : "s"}</span>

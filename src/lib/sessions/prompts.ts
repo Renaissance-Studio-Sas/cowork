@@ -4,27 +4,34 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, PROJECTS_DIR, WORKSPACE_ROOT } from "../fs";
+import {
+  getProject,
+  PROJECT_BRIEF_FILENAME,
+  PROJECTS_DIR,
+  TASK_BRIEF_FILENAME,
+  WORKSPACE_ROOT,
+  type Brief,
+} from "../fs";
 
 // Build the per-session system prompt. Always returns a prompt (never
 // undefined) so the agent always knows what project/task it's working on
-// and where files live. Includes project.md and task.md verbatim when
-// they exist; otherwise notes the file is empty and points the agent at
-// the location to write to.
+// and where files live. Includes the project.json and task.json briefs
+// verbatim when they exist; otherwise notes the file is empty and points
+// the agent at the location to write to.
 //
 // The agent's working directory is the cowork workspace root (set by the
 // caller — see sessions.ts). That's where CLAUDE.md / GEMINI.md live, and
-// where `projects/<wip-project>/<wip-task>/` is reachable. We tell the
-// agent the EXPLICIT relative path to the task folder so file operations
-// go to the right place.
+// where `projects/<project>/<task>/` is reachable. We tell the agent the
+// EXPLICIT relative path to the task folder so file operations go to the
+// right place.
 export async function buildContextSystemPrompt(
   projectSlug: string,
   taskSlug: string,
   currentTitle?: string,
 ): Promise<{ type: "preset"; preset: "claude_code"; append: string }> {
   // Resolve the task folder relative to the workspace root. We need the
-  // actual folder name (`wip-…` or `done-…`), not just the slug, because
-  // the agent will reference it in file ops.
+  // actual folder name (which carries " [Archived]" when archived), not
+  // just the slug, because the agent will reference it in file ops.
   const project = await getProject(projectSlug).catch(() => null);
   let taskFolderRel: string | null = null;
   let projectFolderRel: string | null = null;
@@ -36,15 +43,15 @@ export async function buildContextSystemPrompt(
     }
   }
 
-  // Read project.md and task.md if they exist. Missing files are not an
-  // error — the agent gets a "not yet written" placeholder so it knows
-  // the file is supposed to be there and that writing to it is a normal
-  // first step on a new project/task.
-  const projectMd = projectFolderRel
-    ? await readIfExists(path.join(WORKSPACE_ROOT, projectFolderRel, "files", "project.md"))
+  // Read the project.json and task.json briefs if they exist. Missing
+  // files are not an error — the agent gets a "not yet written"
+  // placeholder so it knows the file is supposed to be there and that
+  // writing to it is a normal first step on a new project/task.
+  const projectBrief = projectFolderRel
+    ? await readBriefIfExists(path.join(WORKSPACE_ROOT, projectFolderRel, "files", PROJECT_BRIEF_FILENAME))
     : null;
-  const taskMd = taskFolderRel
-    ? await readIfExists(path.join(WORKSPACE_ROOT, taskFolderRel, "files", "task.md"))
+  const taskBrief = taskFolderRel
+    ? await readBriefIfExists(path.join(WORKSPACE_ROOT, taskFolderRel, "files", TASK_BRIEF_FILENAME))
     : null;
 
   const where = taskFolderRel
@@ -55,19 +62,19 @@ export async function buildContextSystemPrompt(
     ? `Task folder (relative to workspace root): \`${taskFolderRel}/\`\nProject folder: \`${projectFolderRel}/\``
     : `Project folder: \`${projectFolderRel ?? "(unknown)"}/\``;
 
-  const projectMdBlock = projectFolderRel
-    ? formatMdSection(
+  const projectBriefBlock = projectFolderRel
+    ? formatBriefSection(
         "Project context",
-        path.join(projectFolderRel, "files", "project.md"),
-        projectMd,
+        path.join(projectFolderRel, "files", PROJECT_BRIEF_FILENAME),
+        projectBrief,
       )
     : "";
 
-  const taskMdBlock = taskFolderRel
-    ? formatMdSection(
+  const taskBriefBlock = taskFolderRel
+    ? formatBriefSection(
         "Task context",
-        path.join(taskFolderRel, "files", "task.md"),
-        taskMd,
+        path.join(taskFolderRel, "files", TASK_BRIEF_FILENAME),
+        taskBrief,
       )
     : "";
 
@@ -92,10 +99,12 @@ haven't already.
 ${pathLine}
 
 When you write output files for this task, put them under the task's
-\`files/\` directory using the path above. When you read or modify
-project.md / task.md, use the paths shown in the sections below.
+\`files/\` directory using the path above. When you read or modify the
+project/task brief, edit the JSON file shown in the section below — it
+has the shape \`{ "overview": "...", "details": "...", "createdAt": "..." }\`
+where \`overview\` is a one-line summary and \`details\` is markdown.
 
-${projectMdBlock}${taskMdBlock}${titleBlock}## Inline Media in Chat
+${projectBriefBlock}${taskBriefBlock}${titleBlock}## Inline Media in Chat
 
 You can display images and videos inline in your chat responses using markdown syntax:
 
@@ -119,23 +128,32 @@ Replace PROJECT and TASK with the current project/task slugs (URL-encoded). File
   return { type: "preset", preset: "claude_code", append };
 }
 
-async function readIfExists(p: string): Promise<string | null> {
+async function readBriefIfExists(p: string): Promise<Brief | null> {
   try {
-    const content = await fs.readFile(p, "utf8");
-    return content.trim() ? content.trim() : "";
+    const raw = await fs.readFile(p, "utf8");
+    const parsed = JSON.parse(raw) as Partial<Brief>;
+    return {
+      overview: typeof parsed.overview === "string" ? parsed.overview : "",
+      details: typeof parsed.details === "string" ? parsed.details : "",
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+    };
   } catch {
     return null;
   }
 }
 
-function formatMdSection(label: string, relPath: string, content: string | null): string {
-  if (content === null) {
+function formatBriefSection(label: string, relPath: string, brief: Brief | null): string {
+  if (brief === null) {
     return `## ${label} (\`${relPath}\`)\n\n_File not yet written. Create it if you have something to record there._\n\n`;
   }
-  if (content === "") {
-    return `## ${label} (\`${relPath}\`)\n\n_File exists but is empty._\n\n`;
+  const overview = brief.overview.trim();
+  const details = brief.details.trim();
+  if (!overview && !details) {
+    return `## ${label} (\`${relPath}\`)\n\n_File exists but overview and details are empty._\n\n`;
   }
-  return `## ${label} (\`${relPath}\`)\n\n${content}\n\n`;
+  const overviewLine = overview ? `**Overview:** ${overview}\n\n` : "";
+  const detailsBlock = details ? `${details}\n\n` : "";
+  return `## ${label} (\`${relPath}\`)\n\n${overviewLine}${detailsBlock}`;
 }
 
 // Generate a short label from the first message by extracting key words.

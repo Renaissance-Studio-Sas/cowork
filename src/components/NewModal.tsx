@@ -88,7 +88,8 @@ function QuickProjectModal({
   onSwitchToChat: () => void;
 }) {
   const [name, setName] = useState("");
-  const [desc, setDesc] = useState("");
+  const [overview, setOverview] = useState("");
+  const [details, setDetails] = useState("");
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
@@ -99,7 +100,7 @@ function QuickProjectModal({
       await fetch(`/api/projects`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, description: desc || name }),
+        body: JSON.stringify({ slug, overview: overview || name, details }),
       });
       onCreated(slug);
     } finally {
@@ -134,12 +135,20 @@ function QuickProjectModal({
           className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>
-      <Field label="Description (optional)">
-        <textarea
-          value={desc}
-          onChange={(e) => setDesc(e.target.value)}
-          rows={3}
+      <Field label="Overview (one line, optional)">
+        <input
+          value={overview}
+          onChange={(e) => setOverview(e.target.value)}
           placeholder="What is this project about?"
+          className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
+        />
+      </Field>
+      <Field label="Details (markdown, optional)">
+        <textarea
+          value={details}
+          onChange={(e) => setDetails(e.target.value)}
+          rows={3}
+          placeholder="Goals, constraints, context…"
           className="w-full resize-none bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>
@@ -209,7 +218,8 @@ function QuickTaskModal({
   onSwitchToChat: () => void;
 }) {
   const [name, setName] = useState("");
-  const [desc, setDesc] = useState("");
+  const [overview, setOverview] = useState("");
+  const [details, setDetails] = useState("");
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
@@ -220,7 +230,7 @@ function QuickTaskModal({
       await fetch(`/api/projects/${projectSlug}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, description: desc || name }),
+        body: JSON.stringify({ slug, overview: overview || name, details }),
       });
       onCreated(slug);
     } finally {
@@ -255,12 +265,20 @@ function QuickTaskModal({
           className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>
-      <Field label="Brief (optional)">
+      <Field label="Overview (one line, optional)">
+        <input
+          value={overview}
+          onChange={(e) => setOverview(e.target.value)}
+          placeholder="What should be done?"
+          className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
+        />
+      </Field>
+      <Field label="Details (markdown, optional)">
         <textarea
-          value={desc}
-          onChange={(e) => setDesc(e.target.value)}
+          value={details}
+          onChange={(e) => setDetails(e.target.value)}
           rows={4}
-          placeholder="What should be done? Goals, constraints, context…"
+          placeholder="Goals, constraints, context…"
           className="w-full resize-none bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>

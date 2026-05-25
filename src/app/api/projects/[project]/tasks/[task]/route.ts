@@ -16,7 +16,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ project: stri
   const body = await req.json();
 
   try {
-    if (body.status && (body.status === "wip" || body.status === "done")) {
+    if (body.status && (body.status === "active" || body.status === "archived")) {
       await setTaskStatus(project, task, body.status);
     }
 

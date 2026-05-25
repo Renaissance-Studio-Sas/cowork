@@ -3,11 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import type { ProjectDTO, SessionSummaryDTO, TaskDTO, SessionRuntime, EffortLevel } from "@/lib/types";
+import type { SessionSummaryDTO, TaskDTO, SessionRuntime, EffortLevel } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
-import { StatusChip } from "@/components/StatusChip";
 import { WorkingIndicator } from "@/components/WorkingIndicator";
+import { Markdown } from "@/components/chat/Markdown";
 import { handleComposerEnter } from "@/lib/composer";
 import { taskRoute, projectSessionRoute, projectFileRoute, projectDirRoute } from "@/lib/routes";
 
@@ -19,7 +19,6 @@ interface Entry {
 }
 
 function iconForFile(p: string): string {
-  if (p === "project.md") return "📋";
   const ext = p.split(".").pop()?.toLowerCase() ?? "";
   if (["md", "markdown", "txt"].includes(ext)) return "📄";
   if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "🖼";
@@ -90,6 +89,7 @@ export default function ProjectPage() {
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [renamingSession, setRenamingSession] = useState<string | null>(null);
   const [sessionRenameValue, setSessionRenameValue] = useState("");
+  const [showDetails, setShowDetails] = useState(false);
 
   const refreshFiles = useCallback(async () => {
     if (!slug) return;
@@ -137,15 +137,12 @@ export default function ProjectPage() {
     }));
     const isRoot = !dirPath;
     const folders = folderEntries.sort((a, b) => a.name.localeCompare(b.name));
+    // project.json is the brief — rendered at the top of the page as a
+    // styled overview/details block, so we hide it from the artifact list.
     const filesAtLevel = out
-      .filter((e) => !(isRoot && e.name === "project.md"))
+      .filter((e) => !(isRoot && e.name === "project.json"))
       .sort((a, b) => a.name.localeCompare(b.name));
-    const pinned = isRoot ? out.find((e) => e.name === "project.md") : null;
-    return [
-      ...(pinned ? [pinned] : []),
-      ...folders,
-      ...filesAtLevel,
-    ];
+    return [...folders, ...filesAtLevel];
   }, [files, dirPath]);
 
   const breadcrumb = useMemo(() => {
@@ -178,12 +175,12 @@ export default function ProjectPage() {
     } finally { setStarting(false); }
   };
 
-  const markDone = async () => {
+  const toggleArchived = async () => {
     if (!project) return;
     await fetch(`/api/projects/${slug}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: project.status === "wip" ? "done" : "wip" }),
+      body: JSON.stringify({ status: project.status === "active" ? "archived" : "active" }),
     });
     refresh();
   };
@@ -252,29 +249,55 @@ export default function ProjectPage() {
     );
   }
 
-  const wipTasks = project.tasks.filter((t) => t.status === "wip");
-  const doneTasks = project.tasks.filter((t) => t.status === "done");
+  const activeTasks = project.tasks.filter((t) => t.status === "active");
+  const archivedTasks = project.tasks.filter((t) => t.status === "archived");
 
   return (
     <>
       <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
-        <StatusChip status={project.status} size="md" />
         <div className="flex-1 min-w-0">
           <div className="text-[14px] truncate">
-            <span className={project.status === "done" ? "text-[var(--muted)] line-through" : ""}>{project.slug}</span>
+            <span className={project.status === "archived" ? "text-[var(--muted)] line-through" : ""}>{project.slug}</span>
           </div>
           <div className="text-[11.5px] text-[var(--muted)]">project · {project.tasks.length} task{project.tasks.length === 1 ? "" : "s"}</div>
         </div>
         <button
-          onClick={markDone}
+          onClick={toggleArchived}
           className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
         >
-          {project.status === "wip" ? "✓ Mark done" : "↺ Reopen"}
+          {project.status === "active" ? "🗄 Archive" : "↺ Unarchive"}
         </button>
       </header>
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-[760px] mx-auto px-6 py-6 space-y-6">
+          {/* Brief: overview always visible, details folded by default */}
+          {!dirPath && (project.overview || project.details) && (
+            <div className="space-y-2">
+              {project.overview && (
+                <div className="text-[15px] leading-relaxed text-[var(--text)]">
+                  {project.overview}
+                </div>
+              )}
+              {project.details && (
+                <>
+                  <button
+                    onClick={() => setShowDetails((s) => !s)}
+                    className="text-[11.5px] text-[var(--muted)] hover:text-[var(--text)] inline-flex items-center gap-1"
+                  >
+                    <span>{showDetails ? "▾" : "▸"}</span>
+                    <span>{showDetails ? "Hide details" : "Show details"}</span>
+                  </button>
+                  {showDetails && (
+                    <div className="text-[var(--text-soft)] pt-1">
+                      <Markdown text={project.details} />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           {/* Artifacts */}
           {(entries.length > 0 || dirPath) && (
             <div>
@@ -297,7 +320,6 @@ export default function ProjectPage() {
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                   {entries.map((e) => {
-                    const isPinned = e.type === "file" && e.path === "project.md";
                     const href = e.type === "folder"
                       ? projectDirRoute(slug, e.path)
                       : projectFileRoute(slug, e.path);
@@ -313,7 +335,7 @@ export default function ProjectPage() {
                         <span className="text-[18px] shrink-0">
                           {e.type === "folder" ? "📁" : iconForFile(e.path)}
                         </span>
-                        <span className={`text-[13.5px] truncate flex-1 ${isPinned ? "font-medium" : ""}`}>
+                        <span className="text-[13.5px] truncate flex-1">
                           {e.name}
                           {e.type === "folder" && (
                             <span className="text-[var(--muted)] ml-1.5 text-[11.5px]">{e.count} item{e.count === 1 ? "" : "s"}</span>
@@ -343,15 +365,14 @@ export default function ProjectPage() {
                 <div className="text-[13px] text-[var(--muted)] italic px-1">No tasks yet.</div>
               ) : (
                 <div className="space-y-1.5">
-                  {[...wipTasks, ...doneTasks].map((t: TaskDTO) => (
+                  {[...activeTasks, ...archivedTasks].map((t: TaskDTO) => (
                     <Link
                       key={t.slug}
                       href={taskRoute(slug, t.slug)}
                       className="block w-full text-left rounded-xl border border-[var(--border)] bg-[var(--panel)] hover:bg-[var(--panel-2)] px-4 py-3 transition"
                     >
                       <div className="flex items-center gap-2">
-                        <StatusChip status={t.status} />
-                        <span className={`text-[13.5px] truncate flex-1 ${t.status === "done" ? "text-[var(--muted)] line-through" : ""}`}>{t.slug}</span>
+                        <span className={`text-[13.5px] truncate flex-1 ${t.status === "archived" ? "text-[var(--muted)] line-through" : ""}`}>{t.slug}</span>
                       </div>
                     </Link>
                   ))}

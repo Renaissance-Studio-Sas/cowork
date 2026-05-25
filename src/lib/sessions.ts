@@ -132,6 +132,9 @@ for (const s of registry.values()) {
   if (typeof s.completed !== "boolean") {
     (s as RuntimeSession).completed = false;
   }
+  if (typeof s.streamingText !== "string") {
+    (s as RuntimeSession).streamingText = "";
+  }
 }
 
 // Fires "added" with the new RuntimeSession when a session is added to the
@@ -759,6 +762,7 @@ export async function restoreSession(
     log: sink,
     inputLog: sink,
     history,
+    streamingText: "",
     // A restored session has closed streams and a placeholder query, so the
     // runtime state must be "stopped" regardless of what meta.json says —
     // sendInput dispatches by state, and only "stopped"/"error" routes through
@@ -975,6 +979,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     log,
     inputLog,
     history: [],
+    streamingText: "",
     state: "running",
     pendingPermissions,
     pendingQuestions,
@@ -1046,6 +1051,19 @@ async function pumpEvents(s: RuntimeSession) {
       if (!isStreamEvent) {
         s.log.write(JSON.stringify(msg) + "\n");
         s.history.push(msg);
+      }
+      // Track per-token text so a client that joins mid-stream can be
+      // seeded with the text that streamed before it connected. Mirrors
+      // Chat.tsx exactly: append on text_delta, clear on any non-stream
+      // assistant/result/user message (which marks the end of the current
+      // text block — the canonical text now lives in history).
+      if (isStreamEvent) {
+        const delta = (msg as { event?: { delta?: { type?: string; text?: string } } }).event?.delta;
+        if (delta?.type === "text_delta" && typeof delta.text === "string") {
+          s.streamingText += delta.text;
+        }
+      } else if (msg.type === "assistant" || msg.type === "result" || msg.type === "user") {
+        s.streamingText = "";
       }
       s.lastActivity = new Date();
       s.events.emit("event", msg);
@@ -1290,6 +1308,45 @@ export function relocateSessionsForProject(oldProject: string, newProject: strin
   }
 }
 
+// Move a project-level session into a task's sessions folder. Used by the
+// "New task" planning flow: when the user accepts the proposed task, the
+// session that produced the plan moves from `projects/<p>/sessions/<id>/` to
+// `projects/<p>/<task>/sessions/<id>/` so it lives with the task it created.
+// Open log fd's survive the directory rename on POSIX, so streams keep
+// writing to the moved location without needing to be reopened.
+export async function moveSessionToTask(
+  sessionId: string,
+  newTaskSlug: string,
+): Promise<boolean> {
+  const s = registry.get(sessionId);
+  if (!s) return false;
+  if (s.taskSlug === newTaskSlug) return true;
+
+  const project = await getProject(s.projectSlug);
+  if (!project) return false;
+  const newTask = project.tasks.find((t) => t.slug === newTaskSlug);
+  if (!newTask) return false;
+
+  const oldDir = s.taskSlug
+    ? path.join(PROJECTS_DIR, project.folderName, project.tasks.find((t) => t.slug === s.taskSlug)?.folderName ?? "", "sessions", sessionId)
+    : path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
+  const newDir = path.join(PROJECTS_DIR, project.folderName, newTask.folderName, "sessions", sessionId);
+
+  try {
+    await fs.mkdir(path.dirname(newDir), { recursive: true });
+    await fs.rename(oldDir, newDir);
+  } catch (err) {
+    console.warn(`[moveSessionToTask] failed to move ${oldDir} → ${newDir}:`, (err as Error).message);
+    return false;
+  }
+
+  s.taskSlug = newTaskSlug;
+  await updateMeta(s, (meta) => {
+    meta.task = newTaskSlug;
+  });
+  return true;
+}
+
 // Project-level session — cwd is the project folder, sessions persist to
 // `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
 // sessions but at one level up.
@@ -1355,7 +1412,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     ? buildTaskPlanningSystemPrompt(
         project.slug,
         project.folderName,
-        project.description,
+        project.overview,
         project.tasks.map((t) => t.slug),
       )
     : p.planning === "project"
@@ -1404,6 +1461,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     log,
     inputLog,
     history: [firstUserEcho],
+    streamingText: "",
     state: "running",
     pendingPermissions,
     pendingQuestions,
@@ -1549,17 +1607,45 @@ export async function sendInputWithFiles(
   return true;
 }
 
-// Resume a stopped session by creating a new SDK query with the resume option
-async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boolean> {
-  // Need the SDK session ID to resume
-  if (!s.sdkSessionId) {
-    // No SDK session ID — we can't resume via SDK, emit error
-    s.events.emit("event", {
-      type: "system",
-      subtype: "error",
-      message: "Cannot resume: session has no SDK session ID. Please start a new session.",
-    } as unknown as SDKMessage);
+// Path to the SDK transcript jsonl for a given session ID at WORKSPACE_ROOT
+// (the cwd every session uses). Mirrors the Claude SDK's encoding scheme:
+// `~/.claude/projects/<cwd-with-slashes-replaced-by-dashes>/<sid>.jsonl`.
+function sdkTranscriptPath(sdkSessionId: string): string {
+  const encoded = WORKSPACE_ROOT.replaceAll("/", "-");
+  return path.join(os.homedir(), ".claude", "projects", encoded, `${sdkSessionId}.jsonl`);
+}
+
+async function sdkTranscriptExists(sdkSessionId: string): Promise<boolean> {
+  try {
+    await fs.access(sdkTranscriptPath(sdkSessionId));
+    return true;
+  } catch {
     return false;
+  }
+}
+
+// Resume a stopped session. Re-uses the SDK's `resume` mechanism when the
+// prior transcript is still on disk; otherwise starts a fresh SDK conversation
+// while keeping the visible event history intact.
+async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boolean> {
+  // Decide whether the SDK can actually pick up where the prior turn left off.
+  // Both pieces must hold: we kept the session_id in meta.json, AND its on-disk
+  // transcript is still where the SDK expects it. If the transcript is gone
+  // (legacy fallout: the pre-WORKSPACE_ROOT-cwd refactor stored transcripts
+  // under task-folder-encoded dirs, and the buggy relocate in fs.ts moved them
+  // to mangled paths that got cleaned up later), passing `resume:` to the SDK
+  // silently no-ops — the user's send button does nothing and no agent turn
+  // runs. Fall through to a fresh SDK conversation: the user-visible history
+  // (events.jsonl) is preserved, only the agent's SDK memory of those turns
+  // is lost. Same path covers sessions that never got an sdkSessionId at all
+  // (older sessions before tracking, or sessions that crashed before init).
+  const canResume = !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
+  const lostTranscript = !!s.sdkSessionId && !canResume;
+  if (lostTranscript) {
+    s.sdkSessionId = null;
+    void updateMeta(s, (meta) => {
+      meta.sdkSessionId = null;
+    });
   }
 
   // Interrupt any existing query to stop the old pumpEvents loop.
@@ -1607,11 +1693,29 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     // Create a new input channel
     s.input = new InputChannel();
 
+    // If the prior SDK transcript was missing, tell the user. Persist to history
+    // + events.jsonl so the notice survives reload, not just live SSE.
+    if (lostTranscript) {
+      const notice = {
+        type: "system",
+        subtype: "info",
+        message:
+          "Couldn't resume the prior agent context — its SDK transcript is missing on disk. " +
+          "Starting a fresh agent session. The conversation above is preserved but the agent " +
+          "doesn't remember it.",
+      } as unknown as SDKMessage;
+      s.history.push(notice);
+      s.log.write(JSON.stringify(notice) + "\n");
+      s.events.emit("event", notice);
+    }
+
     const systemPrompt = await buildContextSystemPrompt(s.projectSlug, s.taskSlug);
 
-    // Create new query with resume option. Re-use the session's existing
-    // pendingPermissions map + events emitter so a permission request emitted
-    // mid-resume reaches the same SSE subscribers.
+    // Create new query, re-using the session's existing pendingPermissions
+    // map + events emitter so a permission request emitted mid-resume reaches
+    // the same SSE subscribers. `resume:` is only passed when canResume held
+    // — otherwise the call starts a fresh SDK conversation (see the comment
+    // at the top of this function for why).
     s.q = createAgentQuery(s.runtime, {
       prompt: s.input,
       options: {
@@ -1619,7 +1723,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         // sessions resumed from disk, force-override since their stored
         // cwd may be the task folder (pre-refactor).
         cwd: WORKSPACE_ROOT,
-        resume: s.sdkSessionId,
+        ...(canResume ? { resume: s.sdkSessionId! } : {}),
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
@@ -1652,8 +1756,12 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
       s.events.emit("completed_changed", { completed: false });
     }
     // Clear the interrupt latch — a fresh turn is starting, so the new
-    // pumpEvents loop should track "running" normally again.
+    // pumpEvents loop should track "running" normally again. Drop any
+    // leftover streamingText from a prior aborted turn (no final assistant
+    // message arrived to reset it) so the new turn's deltas accumulate
+    // from a clean slate.
     s.interrupted = false;
+    s.streamingText = "";
     setState(s, "running");
 
     // Start pumping events from the new query

@@ -20,6 +20,19 @@ import { Resizer } from "./Resizer";
 import { handleComposerEnter } from "@/lib/composer";
 import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute, saveTaskPath } from "@/lib/routes";
 import { useWorkspace } from "@/lib/workspace-context";
+import type { SessionSummaryDTO } from "@/lib/types";
+
+const SESSION_STATE_COLOR: Record<string, string> = {
+  awaiting_input: "var(--warn)",
+  running: "var(--accent)",
+  idle: "var(--warn)",
+  stopped: "var(--warn)",
+  error: "#dc2626",
+};
+
+type CommentTarget =
+  | { kind: "session"; session: SessionSummaryDTO }
+  | { kind: "new" };
 
 const CHAT_PANEL_WIDTH_KEY = "wb-chat-panel-width";
 const DEFAULT_CHAT_WIDTH = 380;
@@ -449,36 +462,48 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
   // user can keep reading/marking the doc while the agent works.
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null);
   const [sendingToAgent, setSendingToAgent] = useState(false);
+
+  // User-picked target for "Send to agent". null = follow the default
+  // (most recent live session, else most recent of any state).
+  // "new" = explicitly start a fresh session even if live ones exist.
+  const [commentTargetSelection, setCommentTargetSelection] = useState<string | "new" | null>(null);
+
+  const taskSessions = useMemo(
+    () => sessions.filter((s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug),
+    [sessions, projectSlug, taskSlug],
+  );
+
+  // Sessions arrive sorted by lastActivity desc from /api/sessions, so the
+  // first live one is the freshest live session, and [0] is the freshest overall.
+  const defaultCommentTarget = useMemo<SessionSummaryDTO | null>(() => {
+    const live = taskSessions.find((s) => s.isLive && s.state !== "stopped" && s.state !== "error");
+    return live ?? taskSessions[0] ?? null;
+  }, [taskSessions]);
+
+  const effectiveCommentTarget = useMemo<CommentTarget>(() => {
+    if (commentTargetSelection === "new") return { kind: "new" };
+    if (commentTargetSelection) {
+      const s = taskSessions.find((x) => x.id === commentTargetSelection);
+      if (s) return { kind: "session", session: s };
+    }
+    if (defaultCommentTarget) return { kind: "session", session: defaultCommentTarget };
+    return { kind: "new" };
+  }, [commentTargetSelection, taskSessions, defaultCommentTarget]);
+
   const sendCommentsToAgent = async () => {
     const live = resolvedComments.filter((c) => !c.obsolete);
-    if (live.length === 0 || sendingToAgent) return;
+    if (live.length === 0 || sendingToAgent || !taskSlug) return;
     setSendingToAgent(true);
     try {
       const message = buildAgentMessage(filePath, live);
-      // Only reuse a session if one is already open in a side panel.
-      // Otherwise, always create a new session.
-      // Check 1: AgentPanel is open with a session
-      let targetSessionId = agentSessionId;
-      // Check 2: ChatPanel is open — use its active live session if any
-      if (!targetSessionId && chatPanelOpen && taskSlug) {
-        const taskSessions = sessions.filter(
-          (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug,
-        );
-        const liveSession = taskSessions.find(
-          (s) => s.isLive && s.state !== "stopped" && s.state !== "error",
-        );
-        if (liveSession) {
-          targetSessionId = liveSession.id;
-        }
-      }
-      if (targetSessionId) {
-        await fetch(`/api/sessions/${targetSessionId}/input`, {
+      if (effectiveCommentTarget.kind === "session") {
+        const targetId = effectiveCommentTarget.session.id;
+        await fetch(`/api/sessions/${targetId}/input`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message }),
         });
-        // Ensure AgentPanel shows this session
-        if (!agentSessionId) setAgentSessionId(targetSessionId);
+        if (!agentSessionId) setAgentSessionId(targetId);
       } else {
         const res = await fetch(
           `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`,
@@ -489,8 +514,13 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
           },
         );
         const created = await res.json();
-        if (created.id) setAgentSessionId(created.id);
-        else alert(created.error ?? "failed to start session");
+        if (created.id) {
+          setAgentSessionId(created.id);
+          // Reset to "auto" so the next send follows the (now newer) default.
+          setCommentTargetSelection(null);
+        } else {
+          alert(created.error ?? "failed to start session");
+        }
       }
     } finally {
       setSendingToAgent(false);
@@ -650,6 +680,9 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
             onEdit={editComment}
             onSendToAgent={sendCommentsToAgent}
             sendingToAgent={sendingToAgent}
+            taskSessions={taskSessions}
+            commentTarget={effectiveCommentTarget}
+            onCommentTargetChange={setCommentTargetSelection}
           />
         )}
 
@@ -764,6 +797,7 @@ function ContextMenu({ x, y, onComment }: { x: number; y: number; onComment: () 
 function CommentPanel({
   comments, activeId, onActiveChange, composerRef, draft, pendingAnchor,
   onDraft, onClearPending, onPost, onDelete, onEdit, onSendToAgent, sendingToAgent,
+  taskSessions, commentTarget, onCommentTargetChange,
 }: {
   comments: ResolvedComment[];
   activeId: number | null;
@@ -778,6 +812,9 @@ function CommentPanel({
   onEdit: (id: number, body: string) => void;
   onSendToAgent: () => void;
   sendingToAgent: boolean;
+  taskSessions: SessionSummaryDTO[];
+  commentTarget: CommentTarget;
+  onCommentTargetChange: (id: string | "new" | null) => void;
 }) {
   const live = comments.filter((c) => !c.obsolete);
   const obsolete = comments.filter((c) => c.obsolete);
@@ -787,14 +824,14 @@ function CommentPanel({
       <div className="px-4 py-3 border-b border-[var(--border)] flex items-center gap-2">
         <div className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold flex-1">Comments</div>
         {live.length > 0 && (
-          <button
-            onClick={onSendToAgent}
-            disabled={sendingToAgent}
-            className="text-[11.5px] bg-[var(--accent)] text-[var(--accent-text)] font-medium rounded-md px-2.5 py-1 hover:brightness-110 disabled:opacity-50"
-            title="Append the open comments to a live agent session, or start a new one"
-          >
-            {sendingToAgent ? "Sending…" : `→ Send to agent (${live.length})`}
-          </button>
+          <SendToAgentButton
+            count={live.length}
+            sending={sendingToAgent}
+            target={commentTarget}
+            sessions={taskSessions}
+            onSend={onSendToAgent}
+            onTargetChange={onCommentTargetChange}
+          />
         )}
       </div>
 
@@ -869,6 +906,126 @@ function CommentPanel({
       </div>
     </aside>
   );
+}
+
+function SendToAgentButton({
+  count, sending, target, sessions, onSend, onTargetChange,
+}: {
+  count: number;
+  sending: boolean;
+  target: CommentTarget;
+  sessions: SessionSummaryDTO[];
+  onSend: () => void;
+  onTargetChange: (id: string | "new" | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [open]);
+
+  const label = sending
+    ? "Sending…"
+    : target.kind === "new"
+      ? `→ New session (${count})`
+      : `→ ${truncateMiddle(target.session.title || "(no title)", 22)} (${count})`;
+
+  const tooltip = target.kind === "new"
+    ? "Start a new session and send the open comments to it"
+    : `Send the open comments to "${target.session.title || "(no title)"}"`;
+
+  return (
+    <div ref={wrapRef} className="relative flex">
+      <button
+        onClick={onSend}
+        disabled={sending}
+        className="text-[11.5px] bg-[var(--accent)] text-[var(--accent-text)] font-medium rounded-l-md px-2.5 py-1 hover:brightness-110 disabled:opacity-50 max-w-[220px] truncate"
+        title={tooltip}
+      >
+        {label}
+      </button>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        disabled={sending}
+        className="text-[11.5px] bg-[var(--accent)] text-[var(--accent-text)] rounded-r-md px-1.5 py-1 border-l border-[color-mix(in_srgb,var(--accent-text)_25%,transparent)] hover:brightness-110 disabled:opacity-50"
+        title="Pick a different session"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        ▾
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute top-full right-0 mt-1 z-20 bg-[var(--panel)] border border-[var(--border)] rounded-lg shadow-lg py-1 min-w-[260px] max-h-[340px] overflow-y-auto"
+        >
+          {sessions.length === 0 && (
+            <div className="px-3 py-2 text-[11.5px] text-[var(--muted)] italic">
+              No sessions yet for this task.
+            </div>
+          )}
+          {sessions.map((s) => {
+            const color = SESSION_STATE_COLOR[s.state] ?? "var(--muted)";
+            const isActive = target.kind === "session" && target.session.id === s.id;
+            const isPulsing = !s.completed && s.state !== "error";
+            return (
+              <button
+                key={s.id}
+                role="menuitemradio"
+                aria-checked={isActive}
+                onClick={() => { onTargetChange(s.id); setOpen(false); }}
+                className={`w-full text-left px-3 py-1.5 flex items-center gap-2 hover:bg-[var(--panel-2)] ${isActive ? "bg-[var(--panel-2)]" : ""}`}
+              >
+                <span
+                  className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${isPulsing ? "pulse" : ""}`}
+                  style={{ background: color }}
+                />
+                <span className="text-[12.5px] truncate flex-1">{s.title || "(no title)"}</span>
+                <span className="text-[10.5px] text-[var(--muted)] shrink-0">
+                  {formatRelativeShort(s.lastActivity)}
+                </span>
+              </button>
+            );
+          })}
+          <div className="border-t border-[var(--border)] mt-1 pt-1">
+            <button
+              role="menuitemradio"
+              aria-checked={target.kind === "new"}
+              onClick={() => { onTargetChange("new"); setOpen(false); }}
+              className={`w-full text-left px-3 py-1.5 text-[12.5px] text-[var(--accent)] hover:bg-[var(--panel-2)] ${target.kind === "new" ? "bg-[var(--panel-2)]" : ""}`}
+            >
+              + New session
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function truncateMiddle(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const keep = Math.max(1, Math.floor((max - 1) / 2));
+  return `${s.slice(0, keep)}…${s.slice(s.length - keep)}`;
+}
+
+function formatRelativeShort(iso: string): string {
+  const d = new Date(iso);
+  const diffSec = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diffSec < 60) return "now";
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+  if (diffSec < 86400 * 7) return `${Math.floor(diffSec / 86400)}d`;
+  return d.toLocaleDateString();
 }
 
 function CommentCard({

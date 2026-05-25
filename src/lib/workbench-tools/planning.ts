@@ -13,10 +13,12 @@ export function buildPlanningTools(): WorkbenchTool[] {
       "Propose a project plan to the user. Call this once you have enough information about the project. The user will see your proposal as an editable card and can accept or revise it.",
       {
         project_slug: z.string().describe("Human-readable project name with proper case and spaces, e.g. 'House Sale', 'Buy in Paris', 'Tax 2025'. NOT kebab-case. The folder name is the display name."),
-        project_description: z.string().describe("1-2 sentences describing the project"),
+        project_overview: z.string().describe("Concise one-sentence summary of what this project is (~20 words, never more than one paragraph). Shown verbatim at the top of the project view, so it must read like a tweet, not a paragraph. Push goals, criteria, context, and constraints into project_details instead."),
+        project_details: z.string().describe("Longer markdown body with goals, criteria, constraints, context, and any decisions surfaced in this chat. This is where verbose content belongs — the overview should stay short by pushing detail here. May be empty if there's truly nothing beyond the overview."),
         tasks: z.array(z.object({
           slug: z.string().describe("Human-readable task name with proper case and spaces, e.g. 'Collect Receipts', 'Draft Email to School'. NOT kebab-case."),
-          description: z.string().describe("one-line description of what this task is about"),
+          overview: z.string().describe("Concise one-sentence summary of the task (~20 words, never more than one paragraph). Push detail into the details field."),
+          details: z.string().describe("Longer markdown body for the task brief — goals, inputs/outputs, constraints. Where verbose content belongs. May be empty for simple tasks."),
         })).min(1).max(8).describe("2-5 initial tasks to populate the project"),
       },
       async ({ project_slug, tasks }) => {
@@ -33,8 +35,8 @@ export function buildPlanningTools(): WorkbenchTool[] {
 
 // Counterpart for the "New task" chat modal. The agent proposes a single
 // task scoped to an existing project; the browser watches for the tool_use
-// and renders an editable card. Accepting the card creates the task and
-// writes `task_description` verbatim into `task.md`.
+// and renders an editable card. Accepting the card writes the overview +
+// details into `task.json` (the structured task brief).
 export function buildTaskPlanningTools(): WorkbenchTool[] {
   return [
     defineTool(
@@ -42,7 +44,8 @@ export function buildTaskPlanningTools(): WorkbenchTool[] {
       "Propose a single task to the user. Call this once you have enough context. The user will see your proposal as an editable card and can accept or revise it.",
       {
         task_slug: z.string().describe("Human-readable task name with proper case and spaces, e.g. 'Draft Email to School', 'Collect Receipts'. NOT kebab-case. The folder name is the display name."),
-        task_description: z.string().describe("The brief that will be written verbatim into task.md. Markdown is fine — use it to capture goals, constraints, inputs/outputs, and any decisions made in this chat. Aim for something a future agent can pick up cold without needing the conversation."),
+        task_overview: z.string().describe("Concise one-sentence summary of the task (~20 words, never more than one paragraph). Shown verbatim at the top of the task view, so it must read like a tweet, not a paragraph. Push goals, criteria, context, and constraints into task_details instead."),
+        task_details: z.string().describe("Longer markdown body for the task brief — goals, inputs/outputs, constraints, and any decisions surfaced in this chat. This is where verbose content belongs — the overview stays short by pushing detail here. Aim for something a future agent can pick up cold without needing the conversation. May be empty for simple tasks."),
       },
       async ({ task_slug }) => {
         return {
@@ -66,46 +69,47 @@ The workspace structure and conventions are documented in the repo's CLAUDE.md �
 
 Before proposing anything:
 - Run \`ls projects/\` to see existing projects.
-- For any that look related to what the user wants, read \`cat projects/<project-folder>/files/project.md\` and skim \`ls projects/<project-folder>/\` to understand them.
+- For any that look related to what the user wants, read \`cat projects/<project-folder>/files/project.json\` and skim \`ls projects/<project-folder>/\` to understand them. The brief is JSON: \`{ "overview": "...", "details": "...", "createdAt": "..." }\`.
 - Avoid name collisions and avoid creating a new project for something that fits naturally under an existing one (in which case, tell the user and suggest they add tasks there instead).
 
 Your job:
 1. Ask the user (one short question at a time) what the project is about and what kind of work it involves.
 2. Once you have enough context — usually after 1-3 questions — call the \`propose_plan\` tool with:
    - project_slug: human-readable project name (e.g. "House Sale", "Imagine R Reimbursement")
-   - project_description: 1-2 sentences for the project description
-   - tasks: 2-5 initial tasks, each with a human-readable name and one-line description
+   - project_overview: a concise one-sentence summary (~20 words max). It must read like a tweet, not a paragraph. Push everything else into details.
+   - project_details: longer markdown body (can be empty)
+   - tasks: 2-5 initial tasks, each with human-readable name + a short one-sentence overview + details
 3. After proposing, wait. If the user revises, propose again with the changes.
 
 Keep your messages short and conversational. Don't bullet-list options — ask focused questions. The user is moving fast; be brief.
 `;
 
 // System prompt for the "New task" chat. The project context (slug,
-// description, existing task slugs) is interpolated in so the agent can
+// overview, existing task slugs) is interpolated in so the agent can
 // fit the new task naturally and avoid duplicates without having to walk
 // the filesystem first.
 export function buildTaskPlanningSystemPrompt(
   projectSlug: string,
   projectFolder: string,
-  projectDescription: string,
+  projectOverview: string,
   existingTaskSlugs: string[],
 ): string {
   const existing = existingTaskSlugs.length
     ? existingTaskSlugs.map((s) => `  - ${s}`).join("\n")
     : "  _(none yet)_";
-  const desc = projectDescription.trim() || "_(project.md is empty)_";
+  const desc = projectOverview.trim() || "_(project.json overview is empty)_";
   return `You are helping the user define a new task in the project "${projectSlug}" within their personal task management system "Coworking Space".
 
-A task is a coherent piece of work an AI agent can later pick up and execute. The goal of this chat is to produce a clean \`task.md\` brief — written so a future agent can start cold without re-asking the user.
+A task is a coherent piece of work an AI agent can later pick up and execute. The goal of this chat is to produce a clean \`task.json\` brief — written so a future agent can start cold without re-asking the user. The brief has shape \`{ "overview": "one line", "details": "markdown body", "createdAt": "..." }\`.
 
 **Project context**
 - Slug: \`${projectSlug}\`
-- Folder: \`projects/${projectFolder}/\` (read \`files/project.md\` for the full description)
-- Description: ${desc}
+- Folder: \`projects/${projectFolder}/\` (read \`files/project.json\` for the full brief)
+- Overview: ${desc}
 - Existing tasks:
 ${existing}
 
-The workspace structure and conventions are documented in the repo's CLAUDE.md — read it if you haven't already. Read related task.md files in this project if it helps you pick a name that fits.
+The workspace structure and conventions are documented in the repo's CLAUDE.md — read it if you haven't already. Read related task.json files in this project if it helps you pick a name that fits.
 
 **Naming convention**: task names are **human-readable, with proper case and spaces** — they are the literal folder names. Use "Draft Email to School" not "draft-email-to-school". Capitalize like a title (articles/prepositions lowercase mid-name). Keep names short (2-4 words). Avoid collisions with existing tasks above.
 
@@ -113,7 +117,8 @@ Your job:
 1. Ask the user (one short question at a time) what the task is about and what "done" looks like.
 2. Once you have enough context — usually after 1-3 questions — call the \`propose_task\` tool with:
    - \`task_slug\`: human-readable task name
-   - \`task_description\`: the full brief that will be written verbatim into task.md. Use markdown. Include goals, inputs, outputs, constraints, and any decisions surfaced in this chat. This is the artifact — make it good.
+   - \`task_overview\`: a concise one-sentence summary (~20 words max). It must read like a tweet, not a paragraph. Push everything else into details.
+   - \`task_details\`: longer markdown body — goals, inputs, outputs, constraints, decisions. May be empty for simple tasks. This is the artifact — make it good.
 3. After proposing, wait. If the user revises, propose again with the changes.
 
 Keep your messages short and conversational. The user is moving fast; be brief.

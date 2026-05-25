@@ -6,7 +6,6 @@ import { useEffect, useState } from "react";
 import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { isPending, useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
-import { StatusChip } from "./StatusChip";
 import { WorkingIndicator } from "./WorkingIndicator";
 import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
 
@@ -71,10 +70,9 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   };
 
   const visibleProjects = [...projects].sort((a, b) => {
-    if (a.status !== b.status) return a.status === "wip" ? -1 : 1;
+    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
-  const wipProjects = visibleProjects.filter((p) => p.status === "wip");
 
   const taskCounts = (project: string, task: string) => {
     const list = sessions.filter((s) => s.projectSlug === project && s.taskSlug === task);
@@ -173,6 +171,23 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
     refresh();
   };
 
+  const markAllTaskSessionsAsCompleted = async (projectSlug: string, taskSlug: string) => {
+    const openSessions = sessions.filter(
+      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && !s.completed
+    );
+    if (openSessions.length === 0) return;
+    await Promise.all(
+      openSessions.map((s) =>
+        fetch(`/api/sessions/${s.id}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectSlug, taskSlug, completed: true }),
+        })
+      )
+    );
+    refresh();
+  };
+
   const moveTaskTo = async (fromProject: string, taskSlug: string, toProject: string) => {
     const r = await fetch(`/api/projects/${fromProject}/tasks/${taskSlug}`, {
       method: "PATCH",
@@ -186,15 +201,22 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
 
   const openTaskMenu = (e: React.MouseEvent, projectSlug: string, taskSlug: string) => {
     e.preventDefault();
-    const unreadCount = sessions.filter(
-      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug && s.unread
-    ).length;
+    const taskSessions = sessions.filter(
+      (s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug
+    );
+    const unreadCount = taskSessions.filter((s) => s.unread).length;
+    const openCount = taskSessions.filter((s) => !s.completed).length;
     const items: MenuItem[] = [
       { label: "Rename  ↵", onClick: () => startRenameTask(projectSlug, taskSlug) },
       {
         label: unreadCount > 0 ? `Mark all as read (${unreadCount})` : "Mark all as read",
         onClick: () => markAllTaskSessionsAsRead(projectSlug, taskSlug),
         disabled: unreadCount === 0,
+      },
+      {
+        label: openCount > 0 ? `Mark all as completed (${openCount})` : "Mark all as completed",
+        onClick: () => markAllTaskSessionsAsCompleted(projectSlug, taskSlug),
+        disabled: openCount === 0,
       },
       { label: "Delete", danger: true, onClick: () => deleteTask(projectSlug, taskSlug) },
     ];
@@ -317,13 +339,13 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
 
         {!projectsCollapsed && visibleProjects.map((p) => {
           const visibleTasks = [...p.tasks].sort((a, b) => {
-            if (a.status !== b.status) return a.status === "wip" ? -1 : 1;
+            if (a.status !== b.status) return a.status === "active" ? -1 : 1;
             return a.slug.localeCompare(b.slug);
           });
           const isCollapsed = !!collapsed[p.slug];
-          const label = p.slug.replace(/-/g, " ");
+          const label = p.slug;
           const isDragOver = dragOver === p.slug;
-          const projectDone = p.status === "done";
+          const projectArchived = p.status === "archived";
           const isProjectSelected = selected.project === p.slug && !selected.task;
           const pCounts = projectCounts(p.slug);
 
@@ -360,7 +382,6 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                     aria-hidden
                   ><path d="M9 6l6 6-6 6" /></svg>
                 </button>
-                <StatusChip status={p.status} />
                 {renaming?.kind === "project" && renaming.project === p.slug ? (
                   <input
                     autoFocus
@@ -378,7 +399,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
                 ) : (
                   <Link
                     href={projectRoute(p.slug)}
-                    className={`flex-1 text-left text-[12px] uppercase tracking-wider truncate transition px-1 ${projectDone ? "text-[var(--muted)] line-through font-semibold" : projectHasUnread(p.slug) ? "text-[var(--text)] font-bold" : "text-[var(--text-soft)] hover:text-[var(--text)] font-semibold"}`}
+                    className={`flex-1 text-left text-[12px] uppercase tracking-wider truncate transition px-1 ${projectArchived ? "text-[var(--muted)] line-through font-semibold" : projectHasUnread(p.slug) ? "text-[var(--text)] font-bold" : "text-[var(--text-soft)] hover:text-[var(--text)] font-semibold"}`}
                     title={`Open project ${label}`}
                   >
                     {label}
@@ -404,7 +425,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
               </div>
 
               {!isCollapsed && (
-                <div className="space-y-0.5 mt-0.5">
+                <div className="space-y-0.5 mt-0.5 ml-5 pl-2 border-l border-[var(--border)]">
                   {visibleTasks.length === 0 && (
                     <div className="text-[11.5px] text-[var(--muted)] px-3 py-1.5 italic">no tasks</div>
                   )}
@@ -450,7 +471,7 @@ function TaskRow({
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const router = useRouter();
-  const tooltip = (task.description || "").split("\n")[0].replace(/^#+\s*/, "");
+  const tooltip = task.overview || "";
 
   const handleClick = (e: React.MouseEvent) => {
     if (renaming !== null) return; // Let input handle clicks
@@ -501,8 +522,7 @@ function TaskRow({
         />
       ) : (
         <div className="flex items-center gap-2" title={tooltip || undefined}>
-          <StatusChip status={task.status} />
-          <span className={`text-[13.5px] truncate flex-1 ${task.status === "done" ? "text-[var(--muted)] line-through" : counts.unread > 0 ? "font-semibold" : ""}`}>{task.slug}</span>
+          <span className={`text-[13.5px] truncate flex-1 ${task.status === "archived" ? "text-[var(--muted)] line-through" : counts.unread > 0 ? "font-semibold" : ""}`}>{task.slug}</span>
           {counts.unread > 0 && (
             <span className="text-[9px] bg-[var(--accent)] text-[var(--accent-text)] font-semibold rounded px-1 py-0.5" title={`${counts.unread} unread`}>
               {counts.unread}

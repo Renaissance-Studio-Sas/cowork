@@ -194,8 +194,8 @@ export function QuestionCard({
   };
 
   return (
-    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-4 space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-4 flex flex-col max-h-[60vh]">
+      <div className="flex items-center justify-between shrink-0 pb-3 border-b border-[var(--border)]">
         <div className="text-[12px] font-semibold text-[var(--accent)]">
           {questions.length === 1 ? "Agent is asking" : `Agent is asking ${questions.length} questions`}
         </div>
@@ -218,6 +218,7 @@ export function QuestionCard({
         </div>
       </div>
 
+      <div className="flex-1 min-h-0 overflow-y-auto -mx-4 px-4 py-3 space-y-4">
       {questions.map((q, qi) => (
         <div key={qi} className="space-y-2">
           <div className="flex items-center gap-2">
@@ -277,8 +278,9 @@ export function QuestionCard({
           </div>
         </div>
       ))}
+      </div>
 
-      {error && <div className="text-[12px] text-[#dc2626]">{error}</div>}
+      {error && <div className="text-[12px] text-[#dc2626] shrink-0 pt-2">{error}</div>}
     </div>
   );
 }

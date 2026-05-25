@@ -8,29 +8,29 @@ This directory is a [cowork](https://github.com/Renaissance-Studio-Sas/cowork) w
 <workspace-root>/                # WORKSPACE_ROOT in cowork's .env
 ├── CLAUDE.md                    # This file — high-level repo context, conventions, links
 ├── projects/                    # All cowork projects live here
-│   ├── wip-<project>/           # Active project (folder prefix encodes status)
+│   ├── <project>/               # Active project (bare folder name)
 │   │   ├── files/
-│   │   │   └── project.md       # Project description + labels
-│   │   ├── wip-<task>/          # Active task within the project
+│   │   │   └── project.json     # Project brief — { overview, details, createdAt }
+│   │   ├── <task>/              # Active task within the project
 │   │   │   ├── files/
-│   │   │   │   ├── task.md      # Task description + status
+│   │   │   │   ├── task.json    # Task brief — { overview, details, createdAt }
 │   │   │   │   └── ...          # Artifacts (PDFs, HTML, data, scripts)
 │   │   │   └── sessions/        # Agent conversation history (auto-created)
-│   │   └── done-<task>/         # Completed task
-│   └── done-<project>/          # Archived project
+│   │   └── <task> [Archived]/   # Archived task — " [Archived]" suffix
+│   └── <project> [Archived]/    # Archived project
 └── <anything else>              # skills/, scripts/, src/, etc. — agents can read these too
 ```
 
 **Key conventions:**
 
-- **Status by folder prefix.** `wip-` for in-progress, `done-` for completed. Cowork's UI flips this by renaming the folder.
+- **Archived state by folder suffix.** Bare folder name = active; trailing `" [Archived]"` = archived. Cowork's UI toggles this by renaming the folder.
 - **Folder name = display name.** Cowork preserves case, spaces, and most punctuation. Use "House Sale" not "house-sale".
-- **`task.md` lives inside `files/`** alongside other artifacts — it's just another file the agent reads and writes.
+- **`task.json` is the task brief.** Lives inside `files/`. Shape: `{ "overview": "one-line summary", "details": "markdown body", "createdAt": "ISO timestamp" }`. Same convention for `project.json`. The UI renders `overview` at the top of the task/project view and `details` (markdown) below it; the JSON itself is hidden from the artifact list.
 - **`sessions/` is auto-managed.** Each entry is one agent conversation: `meta.json`, `events.jsonl`, `input.jsonl`. Safe to ignore unless reviewing history.
 
 ## How agents see your workspace
 
-When you start an agent on a task, its `cwd` is the task folder (e.g. `projects/wip-Todos/wip-foo/`). Agents are also granted read/write access to the whole **workspace root** via `additionalDirectories`, so they can pull in shared context like `CLAUDE.md`, `skills/`, `scripts/`, or any other file you keep at the top level.
+When you start an agent on a task, its `cwd` is the task folder (e.g. `projects/Todos/foo/`). Agents are also granted read/write access to the whole **workspace root** via `additionalDirectories`, so they can pull in shared context like `CLAUDE.md`, `skills/`, `scripts/`, or any other file you keep at the top level.
 
 This means: anything you document in this file (or any shared folder) is automatically available to every agent on every task. Use it to record conventions, glossaries, people, services, gotchas — anything an agent would want to know.
 
@@ -57,7 +57,7 @@ npm install
 npm run dev
 
 # 3. Open http://localhost:3100 — cowork will bootstrap an empty `projects/`
-#    folder here if one doesn't exist, with a default `wip-todo/` project.
+#    folder here if one doesn't exist, with a default `Inbox/` project.
 ```
 
-Rename `wip-todo/` to whatever fits your work, then create tasks via the UI or by adding folders directly under `projects/`.
+Rename `Inbox/` to whatever fits your work, then create tasks via the UI or by adding folders directly under `projects/`.

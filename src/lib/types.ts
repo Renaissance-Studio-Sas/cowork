@@ -3,9 +3,10 @@
 export interface ProjectDTO {
   slug: string;
   folderName: string;
-  status: "wip" | "done";
-  description: string;
-  labels: string[];
+  status: "active" | "archived";
+  overview: string;
+  details: string;        // markdown
+  createdAt: string;
   tasks: TaskDTO[];
 }
 
@@ -13,9 +14,10 @@ export interface TaskDTO {
   slug: string;
   folderName: string;
   projectSlug: string;
-  status: "wip" | "done";
-  description: string;
-  labels: string[];
+  status: "active" | "archived";
+  overview: string;
+  details: string;        // markdown
+  createdAt: string;
 }
 
 export type SessionRuntime = "claude" | "gemini";

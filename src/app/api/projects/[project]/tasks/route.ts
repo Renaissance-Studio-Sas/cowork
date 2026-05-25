@@ -9,6 +9,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ project: strin
   if (!body.slug || typeof body.slug !== "string") {
     return NextResponse.json({ error: "slug required" }, { status: 400 });
   }
-  const task = await createTask(project, body.slug, body.description ?? "");
+  const task = await createTask(project, body.slug, {
+    overview: body.overview ?? "",
+    details: body.details ?? "",
+  });
   return NextResponse.json(task);
 }

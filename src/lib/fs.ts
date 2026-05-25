@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import matter from "gray-matter";
 import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
 
 // Workspace root: the user's own repo / folder that contains `projects/` plus any
@@ -15,26 +14,38 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
   ? path.resolve(process.env.WORKSPACE_ROOT)
   : path.resolve(process.cwd(), "..", "..");
 
-// Directory holding `wip-<project>/` and `done-<project>/` folders. Lives
-// inside the workspace root so the rest of the repo can host CLAUDE.md and
-// other shared files.
-// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,sessions,task.md}
+// Directory holding project folders. Active projects have a bare folder
+// name (`<slug>/`); archived projects carry a ` [Archived]` suffix
+// (`<slug> [Archived]/`). Same convention nests recursively for tasks.
+// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,sessions,task.json}
 export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, "projects");
 
-export type Status = "wip" | "done";
+export type Status = "active" | "archived";
 
-export interface Frontmatter {
-  labels?: string[];
-  created?: string;
-  [k: string]: unknown;
+// Suffix that marks a project/task folder as archived. Written with a
+// leading space so the bare slug stays readable in `ls` output.
+export const ARCHIVED_SUFFIX = " [Archived]";
+
+// Brief filenames. Projects/tasks each have a JSON brief inside `files/`
+// with shape `{ overview, details, createdAt }`. `overview` is a one-line
+// summary shown at the top of the page; `details` is markdown rendered
+// below it.
+export const PROJECT_BRIEF_FILENAME = "project.json";
+export const TASK_BRIEF_FILENAME = "task.json";
+
+export interface Brief {
+  overview: string;
+  details: string;     // markdown
+  createdAt: string;   // ISO timestamp
 }
 
 export interface Project {
-  slug: string;            // bare slug, without status prefix
-  folderName: string;      // e.g. "wip-inbox"
+  slug: string;            // bare slug, without archived suffix
+  folderName: string;      // e.g. "Buy in Paris" or "Buy in Paris [Archived]"
   status: Status;
-  description: string;     // body of project.md (without frontmatter)
-  labels: string[];
+  overview: string;
+  details: string;
+  createdAt: string;
   tasks: Task[];
 }
 
@@ -43,67 +54,109 @@ export interface Task {
   folderName: string;
   projectSlug: string;
   status: Status;
-  description: string;
-  labels: string[];
+  overview: string;
+  details: string;
+  createdAt: string;
 }
 
-const STATUS_PREFIX_RE = /^(wip|done)-(.+)$/;
+// Legacy prefix pattern. Folders created before the switch to the
+// archived-suffix scheme still use `wip-<slug>` (active) and
+// `done-<slug>` (archived). We parse them so an unmigrated workspace
+// keeps working; a one-shot rename brings them into the new scheme.
+const LEGACY_PREFIX_RE = /^(wip|done)-(.+)$/;
 
-function parsePrefixed(folderName: string): { status: Status; slug: string } | null {
-  const m = folderName.match(STATUS_PREFIX_RE);
-  if (!m) return null;
-  return { status: m[1] as Status, slug: m[2] };
+// Parse a folder name into { status, slug }. Returns null for entries
+// that aren't project/task folders (dotfiles, the bootstrap `files/` /
+// `sessions/` dirs, etc.). Skipping is the caller's responsibility.
+function parseFolderName(folderName: string): { status: Status; slug: string } {
+  if (folderName.endsWith(ARCHIVED_SUFFIX)) {
+    return { status: "archived", slug: folderName.slice(0, -ARCHIVED_SUFFIX.length) };
+  }
+  const legacy = folderName.match(LEGACY_PREFIX_RE);
+  if (legacy) {
+    return { status: legacy[1] === "done" ? "archived" : "active", slug: legacy[2] };
+  }
+  return { status: "active", slug: folderName };
+}
+
+// Build a folder name from a slug + status.
+function folderNameFor(slug: string, status: Status): string {
+  return status === "archived" ? `${slug}${ARCHIVED_SUFFIX}` : slug;
 }
 
 // The folder name *is* the display name. Sanitize only what the filesystem
 // genuinely can't handle (path separators + a few illegal chars) and what
-// would clash with our prefix scheme. Preserve case, spaces, and most
+// would clash with our naming scheme. Preserve case, spaces, and most
 // punctuation so renames keep the user's intent intact.
 function sanitizeName(s: string): string {
   let out = s.normalize("NFC").trim();
   out = out.replace(/[/\\:*?"<>|]+/g, "-");
   out = out.replace(/\s+/g, " ");
   out = out.replace(/^[.-]+|[.-]+$/g, "");
-  // Don't allow names starting with wip- or done- — those would create
-  // ambiguous nested prefixes.
+  // Reject the legacy wip-/done- prefixes — they would round-trip into the
+  // wrong slug after migration. Reject a trailing archived suffix too, so
+  // archive state is only ever set via setProjectStatus/setTaskStatus.
   out = out.replace(/^(wip|done)-+/i, "");
+  while (out.toLowerCase().endsWith(ARCHIVED_SUFFIX.toLowerCase())) {
+    out = out.slice(0, -ARCHIVED_SUFFIX.length).trimEnd();
+  }
   return out.slice(0, 80);
 }
 
-async function readMarkdown(filePath: string): Promise<{ description: string; fm: Frontmatter }> {
+// Folders that exist alongside project/task folders and must never be
+// treated as projects/tasks themselves.
+const RESERVED_FOLDER_NAMES = new Set(["files", "sessions"]);
+
+function isProjectFolder(name: string): boolean {
+  if (name.startsWith(".")) return false;
+  if (RESERVED_FOLDER_NAMES.has(name)) return false;
+  return true;
+}
+
+// Read a brief JSON file. Missing/unparseable files return an empty brief
+// so callers don't have to handle the absence case — a project/task with
+// no brief yet just renders blank fields in the UI.
+async function readBrief(filePath: string): Promise<Brief> {
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    const parsed = matter(raw);
-    return { description: parsed.content.trim(), fm: parsed.data as Frontmatter };
+    const parsed = JSON.parse(raw) as Partial<Brief>;
+    return {
+      overview: typeof parsed.overview === "string" ? parsed.overview : "",
+      details: typeof parsed.details === "string" ? parsed.details : "",
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+    };
   } catch {
-    return { description: "", fm: {} };
+    return { overview: "", details: "", createdAt: "" };
   }
 }
 
-async function writeMarkdown(filePath: string, description: string, fm: Frontmatter): Promise<void> {
-  const body = matter.stringify(description.trim() + "\n", fm);
-  await fs.writeFile(filePath, body, "utf8");
+async function writeBrief(filePath: string, brief: Brief): Promise<void> {
+  await fs.writeFile(filePath, JSON.stringify(brief, null, 2) + "\n", "utf8");
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
 export async function ensureWorkspace(): Promise<void> {
   await fs.mkdir(PROJECTS_DIR, { recursive: true });
-  // Bootstrap a default `wip-todo/` catch-all ONLY when the workspace has no
+  // Bootstrap a default `Inbox/` catch-all ONLY when the workspace has no
   // projects at all (fresh install). Once the user has any project, we never
   // auto-create — they're free to rename, delete, or replace the catch-all.
   let hasAnyProject = false;
   try {
     const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
-    hasAnyProject = entries.some((e) => e.isDirectory() && /^(wip|done)-/.test(e.name));
+    hasAnyProject = entries.some((e) => e.isDirectory() && isProjectFolder(e.name));
   } catch { /* empty or missing — treat as no projects */ }
   if (hasAnyProject) return;
 
-  const todoPath = path.join(PROJECTS_DIR, "wip-todo");
-  await fs.mkdir(path.join(todoPath, "files"), { recursive: true });
-  await writeMarkdown(
-    path.join(todoPath, "files", "project.md"),
-    "Default project. Tasks that don't belong to a larger project go here.",
-    { labels: ["todo"], created: new Date().toISOString().slice(0, 10) },
-  );
+  const inboxPath = path.join(PROJECTS_DIR, "Inbox");
+  await fs.mkdir(path.join(inboxPath, "files"), { recursive: true });
+  await writeBrief(path.join(inboxPath, "files", PROJECT_BRIEF_FILENAME), {
+    overview: "Default project. Tasks that don't belong to a larger project go here.",
+    details: "",
+    createdAt: nowIso(),
+  });
 }
 
 export async function listProjects(): Promise<Project[]> {
@@ -112,28 +165,23 @@ export async function listProjects(): Promise<Project[]> {
   const projects: Project[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    const parsed = parsePrefixed(e.name);
-    if (!parsed) continue;
+    if (!isProjectFolder(e.name)) continue;
+    const parsed = parseFolderName(e.name);
     const projectDir = path.join(PROJECTS_DIR, e.name);
-    // project.md lives inside files/ so it shows up as a regular artifact
-    // (same convention as task.md). Fall back to the legacy root location.
-    let parsed_md = await readMarkdown(path.join(projectDir, "files", "project.md"));
-    if (!parsed_md.description && Object.keys(parsed_md.fm).length === 0) {
-      parsed_md = await readMarkdown(path.join(projectDir, "project.md"));
-    }
-    const { description, fm } = parsed_md;
+    const brief = await readBrief(path.join(projectDir, "files", PROJECT_BRIEF_FILENAME));
     const tasks = await listTasks(e.name);
     projects.push({
       slug: parsed.slug,
       folderName: e.name,
       status: parsed.status,
-      description,
-      labels: Array.isArray(fm.labels) ? fm.labels : [],
+      overview: brief.overview,
+      details: brief.details,
+      createdAt: brief.createdAt,
       tasks,
     });
   }
   projects.sort((a, b) => {
-    if (a.status !== b.status) return a.status === "wip" ? -1 : 1;
+    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
   return projects;
@@ -141,7 +189,7 @@ export async function listProjects(): Promise<Project[]> {
 
 async function listTasks(projectFolder: string): Promise<Task[]> {
   const projectDir = path.join(PROJECTS_DIR, projectFolder);
-  const projectSlug = parsePrefixed(projectFolder)!.slug;
+  const projectSlug = parseFolderName(projectFolder).slug;
   const out: Task[] = [];
   let entries: import("node:fs").Dirent[];
   try {
@@ -151,22 +199,22 @@ async function listTasks(projectFolder: string): Promise<Task[]> {
   }
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    const parsed = parsePrefixed(e.name);
-    if (!parsed) continue;
+    if (!isProjectFolder(e.name)) continue;
+    const parsed = parseFolderName(e.name);
     const taskDir = path.join(projectDir, e.name);
-    // task.md is now inside files/ — it's treated as a regular artifact.
-    const { description, fm } = await readMarkdown(path.join(taskDir, "files", "task.md"));
+    const brief = await readBrief(path.join(taskDir, "files", TASK_BRIEF_FILENAME));
     out.push({
       slug: parsed.slug,
       folderName: e.name,
       projectSlug,
       status: parsed.status,
-      description,
-      labels: Array.isArray(fm.labels) ? fm.labels : [],
+      overview: brief.overview,
+      details: brief.details,
+      createdAt: brief.createdAt,
     });
   }
   out.sort((a, b) => {
-    if (a.status !== b.status) return a.status === "wip" ? -1 : 1;
+    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
   return out;
@@ -190,53 +238,84 @@ export function taskDir(project: Project, task: Task): string {
   return path.join(PROJECTS_DIR, project.folderName, task.folderName);
 }
 
-export async function createProject(slug: string, description = ""): Promise<Project> {
+export async function createProject(slug: string, brief: Partial<Brief> = {}): Promise<Project> {
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
-  const folder = `wip-${clean}`;
+  const folder = folderNameFor(clean, "active");
   const dir = path.join(PROJECTS_DIR, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
   await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
-  await writeMarkdown(path.join(dir, "files", "project.md"), description, {
-    labels: [],
-    created: new Date().toISOString().slice(0, 10),
+  await writeBrief(path.join(dir, "files", PROJECT_BRIEF_FILENAME), {
+    overview: brief.overview ?? "",
+    details: brief.details ?? "",
+    createdAt: brief.createdAt ?? nowIso(),
   });
   return (await getProject(clean))!;
 }
 
-export async function createTask(projectSlug: string, slug: string, description = ""): Promise<Task> {
+export async function createTask(
+  projectSlug: string,
+  slug: string,
+  brief: Partial<Brief> = {},
+): Promise<Task> {
   const project = await getProject(projectSlug);
   if (!project) throw new Error(`unknown project ${projectSlug}`);
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
-  const folder = `wip-${clean}`;
+  const folder = folderNameFor(clean, "active");
   const dir = path.join(PROJECTS_DIR, project.folderName, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
   await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
-  await writeMarkdown(path.join(dir, "files", "task.md"), description, {
-    labels: [],
-    created: new Date().toISOString().slice(0, 10),
+  await writeBrief(path.join(dir, "files", TASK_BRIEF_FILENAME), {
+    overview: brief.overview ?? "",
+    details: brief.details ?? "",
+    createdAt: brief.createdAt ?? nowIso(),
   });
   return (await getTask(projectSlug, clean))!;
 }
 
-// Overwrite project.md's body, preserving frontmatter. Used by the
-// New-Project planning flow when the user accepts the plan: the project
-// was created up-front as a stub, and accepting fills in the real
-// description.
-export async function setProjectDescription(slug: string, description: string): Promise<void> {
+// Overwrite a project's brief (overview + details), preserving createdAt.
+// Used by the New-Project planning flow when the user accepts the plan:
+// the project was created as a stub, and accepting fills in the real brief.
+export async function setProjectBrief(
+  slug: string,
+  patch: { overview?: string; details?: string },
+): Promise<void> {
   const project = await getProject(slug);
   if (!project) throw new Error(`unknown project ${slug}`);
-  const mdPath = path.join(PROJECTS_DIR, project.folderName, "files", "project.md");
-  const { fm } = await readMarkdown(mdPath);
-  await writeMarkdown(mdPath, description, fm);
+  const briefPath = path.join(PROJECTS_DIR, project.folderName, "files", PROJECT_BRIEF_FILENAME);
+  const current = await readBrief(briefPath);
+  await writeBrief(briefPath, {
+    overview: patch.overview ?? current.overview,
+    details: patch.details ?? current.details,
+    createdAt: current.createdAt || nowIso(),
+  });
+}
+
+export async function setTaskBrief(
+  projectSlug: string,
+  taskSlug: string,
+  patch: { overview?: string; details?: string },
+): Promise<void> {
+  const project = await getProject(projectSlug);
+  const task = project?.tasks.find((t) => t.slug === taskSlug);
+  if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
+  const briefPath = path.join(
+    PROJECTS_DIR, project.folderName, task.folderName, "files", TASK_BRIEF_FILENAME,
+  );
+  const current = await readBrief(briefPath);
+  await writeBrief(briefPath, {
+    overview: patch.overview ?? current.overview,
+    details: patch.details ?? current.details,
+    createdAt: current.createdAt || nowIso(),
+  });
 }
 
 export async function setProjectStatus(slug: string, status: Status): Promise<void> {
   const project = await getProject(slug);
   if (!project) throw new Error(`unknown project ${slug}`);
   if (project.status === status) return;
-  const newFolder = `${status}-${slug}`;
+  const newFolder = folderNameFor(slug, status);
   await fs.rename(
     path.join(PROJECTS_DIR, project.folderName),
     path.join(PROJECTS_DIR, newFolder),
@@ -251,7 +330,7 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
   if (clean === slug) return;
   const existing = await getProject(clean);
   if (existing) throw new Error(`project "${clean}" already exists`);
-  const newFolder = `${project.status}-${clean}`;
+  const newFolder = folderNameFor(clean, project.status);
   const oldPath = path.join(PROJECTS_DIR, project.folderName);
   const newPath = path.join(PROJECTS_DIR, newFolder);
   await fs.rename(oldPath, newPath);
@@ -281,7 +360,7 @@ export async function setTaskStatus(projectSlug: string, taskSlug: string, statu
   const task = project ? project.tasks.find((t) => t.slug === taskSlug) : null;
   if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
   if (task.status === status) return;
-  const newFolder = `${status}-${taskSlug}`;
+  const newFolder = folderNameFor(taskSlug, status);
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
   await fs.rename(oldPath, newPath);
@@ -301,7 +380,7 @@ export async function moveTask(projectSlug: string, taskSlug: string, toProjectS
     while (dest.tasks.find((t) => t.slug === `${taskSlug}-${i}`)) i++;
     finalSlug = `${taskSlug}-${i}`;
   }
-  const newFolder = `${task.status}-${finalSlug}`;
+  const newFolder = folderNameFor(finalSlug, task.status);
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, dest.folderName, newFolder);
   await fs.rename(oldPath, newPath);
@@ -319,7 +398,7 @@ export async function renameTask(projectSlug: string, taskSlug: string, newSlug:
   if (clean === taskSlug) return;
   const collision = project.tasks.find((t) => t.slug === clean);
   if (collision) throw new Error(`task "${clean}" already exists`);
-  const newFolder = `${task.status}-${clean}`;
+  const newFolder = folderNameFor(clean, task.status);
   const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
   const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
   await fs.rename(oldPath, newPath);
@@ -426,7 +505,7 @@ export async function renameFile(projectSlug: string, taskSlug: string, from: st
   const project = await getProject(projectSlug);
   const task = project?.tasks.find((t) => t.slug === taskSlug);
   if (!project || !task) throw new Error("not found");
-  if (from === "task.md") throw new Error("task.md cannot be renamed");
+  if (from === TASK_BRIEF_FILENAME) throw new Error(`${TASK_BRIEF_FILENAME} cannot be renamed`);
   if (!to.trim()) throw new Error("destination required");
   const base = path.join(taskDir(project, task), "files");
   const src = ensureSafePath(base, from);
@@ -445,7 +524,7 @@ export async function deleteFile(projectSlug: string, taskSlug: string, rel: str
   const project = await getProject(projectSlug);
   const task = project?.tasks.find((t) => t.slug === taskSlug);
   if (!project || !task) throw new Error("not found");
-  if (rel === "task.md") throw new Error("task.md cannot be deleted");
+  if (rel === TASK_BRIEF_FILENAME) throw new Error(`${TASK_BRIEF_FILENAME} cannot be deleted`);
   const base = path.join(taskDir(project, task), "files");
   const full = ensureSafePath(base, rel);
   await fs.rm(full, { recursive: true, force: true });

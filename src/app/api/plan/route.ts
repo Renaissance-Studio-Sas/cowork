@@ -38,7 +38,7 @@ export async function POST(req: Request) {
 
     // mode=project (default): create stub then start a session inside it.
     const stubSlug = `untitled-${randomUUID().slice(0, 6)}`;
-    const stub = await createProject(stubSlug, "");
+    const stub = await createProject(stubSlug);
     const s = await startProjectSession({
       projectSlug: stub.slug,
       firstMessage: body.message,
