@@ -1,4 +1,5 @@
 import { getSession, restoreSession } from "@/lib/sessions";
+import { extractTodosFromMessages } from "@/lib/todos";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -51,6 +52,11 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       sendEvent("state", { state: s.state });
       // Send history metadata so client can implement "load more"
       sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: total - initialHistory.length });
+      // Derive the todo list from the FULL history (not the truncated initial
+      // window) and send it as a snapshot. The chat transcript is paginated, so
+      // a client deriving todos from only the loaded messages would miss any
+      // TodoWrite/TaskCreate/TaskUpdate calls in older, not-yet-loaded messages.
+      sendEvent("todos", extractTodosFromMessages(s.history));
       for (const msg of initialHistory) sendEvent("message", msg);
       // If a turn is mid-stream, replay the text that streamed before this
       // client connected so the in-progress bubble matches the live one.
@@ -87,6 +93,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       sendEvent("completed_changed", { completed: !!s.completed });
 
       const onEvent = (msg: unknown) => sendEvent("message", msg);
+      const onTodos = (todos: unknown) => sendEvent("todos", todos);
       const onState = (state: string) => sendEvent("state", { state });
       const onFileChanged = (data: { path: string }) => sendEvent("file_changed", data);
       const onPermissionRequest = (data: unknown) => sendEvent("permission_request", data);
@@ -97,6 +104,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       const onCompletionResolved = (data: unknown) => sendEvent("completion_resolved", data);
       const onCompletedChanged = (data: unknown) => sendEvent("completed_changed", data);
       s.events.on("event", onEvent);
+      s.events.on("todos", onTodos);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
       s.events.on("permission_request", onPermissionRequest);
@@ -114,6 +122,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       cleanup = () => {
         clearInterval(heartbeat);
         s.events.off("event", onEvent);
+        s.events.off("todos", onTodos);
         s.events.off("state", onState);
         s.events.off("file_changed", onFileChanged);
         s.events.off("permission_request", onPermissionRequest);

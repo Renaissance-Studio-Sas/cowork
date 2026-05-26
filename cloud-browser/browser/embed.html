@@ -1,0 +1,46 @@
+<!doctype html>
+<!--
+  Minimal noVNC client — just the canvas. Bypasses vnc.html / vnc_lite.html
+  entirely so there's no control bar, settings sidebar, "Send Ctrl-Alt-Del"
+  button, etc. Imports noVNC's RFB module directly from the same webroot.
+
+  Set up for true server-side resize: rfb.resizeSession = true tells noVNC to
+  send an ExtendedDesktopSize request to x11vnc whenever this page's size
+  changes. x11vnc translates that into xrandr calls on Xvfb, the window
+  manager (fluxbox) resizes the maximized chrome window, and the page renders
+  at the new pixel size. Result: dragging the artifact panel actually re-lays
+  out the website rather than CSS-stretching a fixed-resolution bitmap.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live browser</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  #screen { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="screen"></div>
+<script type="module">
+  import RFB from "./core/rfb.js";
+
+  const wsProto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${wsProto}://${location.host}/websockify`;
+
+  const rfb = new RFB(document.getElementById("screen"), url);
+  rfb.scaleViewport = false;     // no client-side scaling — server matches size
+  rfb.resizeSession = true;      // ask the server to resize to our viewport
+  rfb.viewOnly = false;
+  rfb.background = "#000";
+
+  rfb.addEventListener("connect", () => console.log("[embed] connected"));
+  rfb.addEventListener("disconnect", (e) =>
+    console.log("[embed] disconnected", e.detail?.clean ? "clean" : "abrupt"),
+  );
+
+  // RFB.js already listens for window resize and sends new ExtendedDesktopSize
+  // requests when resizeSession is true — nothing extra needed here.
+</script>
+</body>
+</html>

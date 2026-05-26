@@ -1,10 +1,13 @@
 "use client";
 
-export interface TodoItem {
-  content: string;
-  status: "pending" | "in_progress" | "completed";
-  activeForm?: string;
-}
+import type { TodoItem } from "@/lib/todos";
+
+// Re-exported so existing importers (Chat, ChatPanel) can keep pulling the
+// type and the deriver from this component. The implementation now lives in
+// the server-importable `@/lib/todos` so the same logic can run over the full
+// session history on the server.
+export { extractTodosFromMessages } from "@/lib/todos";
+export type { TodoItem } from "@/lib/todos";
 
 interface Props {
   todos: TodoItem[];
@@ -121,38 +124,4 @@ export function TodoList({ todos, compact = false }: Props) {
       </div>
     </div>
   );
-}
-
-/**
- * Extract the latest todos from a message stream by finding the most recent
- * TodoWrite tool call.
- */
-export function extractTodosFromMessages(messages: unknown[]): TodoItem[] {
-  // Walk backwards to find the most recent TodoWrite call
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as {
-      type?: string;
-      message?: { content?: unknown[] };
-    };
-    if (msg.type !== "assistant") continue;
-
-    const content = msg.message?.content;
-    if (!Array.isArray(content)) continue;
-
-    // Check each content block for TodoWrite
-    for (let j = content.length - 1; j >= 0; j--) {
-      const block = content[j] as {
-        type?: string;
-        name?: string;
-        input?: { todos?: TodoItem[] };
-      };
-      if (block.type === "tool_use" && block.name === "TodoWrite") {
-        const todos = block.input?.todos;
-        if (Array.isArray(todos)) {
-          return todos;
-        }
-      }
-    }
-  }
-  return [];
 }

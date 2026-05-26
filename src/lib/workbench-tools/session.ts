@@ -8,7 +8,7 @@ import { z } from "zod";
 import { existsSync } from "fs";
 import path from "path";
 import { execSync } from "child_process";
-import { renameLiveSession, getSessionQuery, debugSessionRegistry, addPendingCompletion } from "../sessions";
+import { renameLiveSession, getSessionQuery, getSession, debugSessionRegistry, addPendingCompletion } from "../sessions";
 import {
   getChromeSocketDir,
   listChromeSocketFiles,
@@ -45,6 +45,34 @@ focus of the session shifted, or the auto-title misses the point).`,
         return { content: [{ type: "text", text: `Session title set to: "${title}"` }] };
       },
       { alwaysLoad: true },
+    ),
+
+    defineTool(
+      "open_artifact",
+      `Open a file artifact in the user's artifact panel — switches the preview
+to the named file so the user sees it right now without clicking. Use after
+saving a file you want the user to look at immediately (a freshly-generated
+report, a live-view page, a screenshot they should review). Quiet no-op if
+the user isn't viewing this session's workspace.`,
+      {
+        path: z
+          .string()
+          .min(1)
+          .describe(
+            `Artifact path relative to the task's files/ directory, e.g. "browser-foo.html" or "reports/summary.md".`,
+          ),
+      },
+      async ({ path: artifactPath }) => {
+        const s = getSession(sessionId);
+        if (!s) {
+          return {
+            content: [{ type: "text", text: `Session ${sessionId} not found.` }],
+            isError: true,
+          };
+        }
+        s.events.emit("open_artifact", { path: artifactPath });
+        return { content: [{ type: "text", text: `Opened "${artifactPath}" in the artifact panel.` }] };
+      },
     ),
 
     defineTool(

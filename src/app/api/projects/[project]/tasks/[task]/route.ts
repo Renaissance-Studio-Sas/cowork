@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { deleteTask, getTask, setTaskStatus, listFiles, renameTask, moveTask } from "@/lib/fs";
+import { deleteTask, getTask, setTaskStatus, listFiles, listFilesMeta, renameTask, moveTask } from "@/lib/fs";
 
 export const runtime = "nodejs";
 
@@ -7,8 +7,11 @@ export async function GET(_req: Request, ctx: { params: Promise<{ project: strin
   const { project, task } = await ctx.params;
   const t = await getTask(project, task);
   if (!t) return NextResponse.json({ error: "not found" }, { status: 404 });
-  const files = await listFiles(project, task);
-  return NextResponse.json({ ...t, files });
+  const [files, filesMeta] = await Promise.all([
+    listFiles(project, task),
+    listFilesMeta(project, task),
+  ]);
+  return NextResponse.json({ ...t, files, filesMeta });
 }
 
 export async function PATCH(req: Request, ctx: { params: Promise<{ project: string; task: string }> }) {

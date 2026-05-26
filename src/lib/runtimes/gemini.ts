@@ -207,6 +207,9 @@ class GeminiAgentQuery implements AgentQuery {
       const turnUuid = randomUUID();
       const promptId = `prompt_${Date.now()}`;
       let accumulated = "";
+      // Track if the stream errored — used to emit resultErrorEvent instead
+      // of resultSuccessEvent when the turn ends with no content.
+      let streamError: string | null = null;
       // Tracks tool_use IDs we've emitted, so subsequent tool_result
       // messages reference the matching id. cli-core uses its own callId;
       // we generate a stable mapping per turn.
@@ -299,6 +302,31 @@ class GeminiAgentQuery implements AgentQuery {
               callIdToToolUseId.set(req.callId, toolUseId);
               turnToolUses.push({ type: "tool_use", id: toolUseId, name: req.name, input: req.args });
               continue;
+            }
+            // Track error events so we can emit resultErrorEvent at the end.
+            if (ev.type === GeminiEventType.Error) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const v = (ev as any).value as { error?: unknown };
+              if (v?.error) {
+                if (v.error instanceof Error) {
+                  streamError = v.error.message;
+                } else if (typeof v.error === "object" && v.error !== null) {
+                  const errObj = v.error as Record<string, unknown>;
+                  if (typeof errObj.message === "string") {
+                    streamError = errObj.message;
+                  } else {
+                    try {
+                      streamError = JSON.stringify(v.error);
+                    } catch {
+                      streamError = "[Error object could not be serialized]";
+                    }
+                  }
+                } else {
+                  streamError = String(v.error);
+                }
+              } else {
+                streamError = "Unknown error";
+              }
             }
             // Other event types (Error, etc.) → translate normally.
             for (const out of translateEvent(ev, this.sessionId, this.model, turnUuid, callIdToToolUseId)) {
@@ -432,7 +460,12 @@ class GeminiAgentQuery implements AgentQuery {
         // server died between a tool call and its response.
         await this.saveHistory();
 
-        yield resultSuccessEvent(this.sessionId, accumulated);
+        // If the stream errored and we got no content, emit an error result.
+        if (streamError && !accumulated) {
+          yield resultErrorEvent(this.sessionId, streamError);
+        } else {
+          yield resultSuccessEvent(this.sessionId, accumulated);
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`[gemini-runtime] sendMessageStream failed:`, errorMsg);
@@ -726,11 +759,31 @@ function translateEvent(
     case GeminiEventType.Error: {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const v = (ev as any).value as { error?: unknown };
-      const message = v?.error ? String(v.error) : "Unknown error";
+      let message = "Unknown error";
+      if (v?.error) {
+        if (v.error instanceof Error) {
+          message = v.error.message;
+        } else if (typeof v.error === "object" && v.error !== null) {
+          // Try to extract message property, otherwise JSON stringify
+          const errObj = v.error as Record<string, unknown>;
+          if (typeof errObj.message === "string") {
+            message = errObj.message;
+          } else {
+            try {
+              message = JSON.stringify(v.error);
+            } catch {
+              message = "[Error object could not be serialized]";
+            }
+          }
+        } else {
+          message = String(v.error);
+        }
+      }
       return [{
         type: "system",
         subtype: "error",
         message,
+        session_id: sessionId,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any];
     }

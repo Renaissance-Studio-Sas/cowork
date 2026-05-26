@@ -1,36 +1,27 @@
 "use client";
 
+import { useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { FileViewer } from "@/components/FileViewer";
 import { taskRoute } from "@/lib/routes";
 
-export default function TaskFilePage() {
+// Legacy deep link — redirect into the unified task workspace with the
+// file expanded as the artifact column.
+export default function TaskFileRedirect() {
   const params = useParams();
   const router = useRouter();
   const projectSlug = decodeURIComponent(params.slug as string);
   const taskSlug = decodeURIComponent(params.taskSlug as string);
   const pathParts = params.path as string[];
   const filePath = pathParts.map(decodeURIComponent).join("/");
+  const dirPath = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
 
-  // Note: FileViewer handles saveTaskPath with sidebar state params
-
-  const handleBack = () => {
-    // Go back to the parent folder or task root
-    const lastSlash = filePath.lastIndexOf("/");
-    if (lastSlash > 0) {
-      const dirPath = filePath.slice(0, lastSlash);
-      router.push(`/project/${encodeURIComponent(projectSlug)}/task/${encodeURIComponent(taskSlug)}?dir=${encodeURIComponent(dirPath)}`);
-    } else {
-      router.push(taskRoute(projectSlug, taskSlug));
-    }
-  };
+  useEffect(() => {
+    router.replace(taskRoute(projectSlug, taskSlug, { artifact: filePath, dir: dirPath || undefined }));
+  }, [router, projectSlug, taskSlug, filePath, dirPath]);
 
   return (
-    <FileViewer
-      projectSlug={projectSlug}
-      taskSlug={taskSlug}
-      filePath={filePath}
-      onBack={handleBack}
-    />
+    <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
+      Loading…
+    </div>
   );
 }

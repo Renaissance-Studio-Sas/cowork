@@ -13,10 +13,10 @@ import type { InputChannel } from "../input-channel";
 import type { SessionState } from "../session-state-machine";
 
 // Which agent runtime drives this session. Claude is the default and is
-// what every session today uses; Gemini runs through gemini-cli-core.
-// Stored in meta.json so resume after a server restart picks the same
-// runtime.
-export type SessionRuntime = "claude" | "gemini";
+// what every session today uses; Gemini runs through gemini-cli-core; remote
+// provisions a container via the cloud-agent-runner controller. Stored in
+// meta.json so resume after a server restart picks the same runtime.
+export type SessionRuntime = "claude" | "gemini" | "remote";
 
 // Thinking effort level. Mirrors the Claude Agent SDK's EffortLevel
 // (see @anthropic-ai/claude-agent-sdk). Passed to query() as `effort` and
@@ -41,12 +41,17 @@ export interface RuntimeSession {
   q: AgentQuery;
   input: InputChannel;
   events: EventEmitter;          // emits 'event' (SDKMessage) and 'state' (SessionState)
-  log: WriteStream;              // events.jsonl
   inputLog: WriteStream;         // input.jsonl
   history: SDKMessage[];         // in-memory replay buffer for new SSE clients
+  // Monotonic per-session event sequence number. Assigned to every persisted
+  // event via cloud-events.appendEvent(id, seq, event) using `seq++`. Starts at
+  // 0 for a new session and is seeded to history.length on restore (history is
+  // rebuilt from the full D1 event log), so D1's seq-keyed idempotent writes
+  // (onConflict: ignore) never collide or silently drop events across restarts.
+  seq: number;
   // Accumulated text from `text_delta` stream_event chunks of the CURRENT
   // in-flight assistant turn. Per-token deltas aren't persisted to history
-  // (they'd bloat events.jsonl ~30× per turn), so without this buffer a
+  // (they'd bloat the event log ~30× per turn), so without this buffer a
   // client that joins mid-stream sees only the deltas that arrive after it
   // connects. Cleared whenever a non-stream assistant/result/user message
   // ends the current text block, and on resume when a fresh turn begins —
@@ -90,6 +95,15 @@ export interface RuntimeSession {
   // Flips true the first time a `result` event fires for this session, so
   // the auto-titler runs at most once. Resume does not reset it.
   autoTitleAttempted?: boolean;
+  // Track retry attempts for 529 (overloaded) errors. Reset on successful
+  // completion or manual user input.
+  retryAttempts?: number;
+  // Serialized snapshot of the last todo list emitted on the `todos` event.
+  // Used to diff so pumpEvents only re-emits when the derived list actually
+  // changes. The list itself is derived from the full `history` (see
+  // @/lib/todos), keeping the task panel correct independent of how much
+  // transcript the chat UI has lazily loaded.
+  lastTodosJson?: string;
 }
 
 export interface PendingPermission {

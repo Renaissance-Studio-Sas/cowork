@@ -1,4 +1,4 @@
-import { subscribeFileChanges } from "@/lib/sessions";
+import { subscribeFileChanges, subscribeOpenArtifact } from "@/lib/sessions";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,8 +25,11 @@ export async function GET(req: Request) {
         safeEnqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
 
-      const unsubscribe = subscribeFileChanges(project, task, (data) => {
+      const unsubscribeFiles = subscribeFileChanges(project, task, (data) => {
         sendEvent("file_changed", data);
+      });
+      const unsubscribeOpen = subscribeOpenArtifact(project, task, (data) => {
+        sendEvent("open_artifact", data);
       });
 
       const heartbeat = setInterval(() => {
@@ -35,7 +38,8 @@ export async function GET(req: Request) {
 
       cleanup = () => {
         clearInterval(heartbeat);
-        unsubscribe();
+        unsubscribeFiles();
+        unsubscribeOpen();
         try { controller.close(); } catch { /* already closed */ }
       };
 

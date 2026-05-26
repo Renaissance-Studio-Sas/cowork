@@ -1,68 +1,24 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Chat } from "@/components/Chat";
-import { useWorkspace } from "@/lib/workspace-context";
 import { projectRoute } from "@/lib/routes";
 
-export default function ProjectSessionPage() {
+// Legacy deep link — redirect into the unified project workspace with the
+// session expanded as the chat column.
+export default function ProjectSessionRedirect() {
   const params = useParams();
   const router = useRouter();
   const projectSlug = decodeURIComponent(params.slug as string);
   const sessionId = decodeURIComponent(params.sessionId as string);
 
-  const { sessions, refresh } = useWorkspace();
-  const [notFoundTimeout, setNotFoundTimeout] = useState(false);
-  const markedSeenRef = useRef(false);
-
-  const session = useMemo(
-    () => sessions.find((s) => s.id === sessionId) ?? null,
-    [sessions, sessionId],
-  );
-
-  // When the page mounts or session isn't found yet, trigger a refresh and wait
-  // a reasonable time before showing "not found"
   useEffect(() => {
-    if (!session) {
-      // Immediately refresh to try to pick up a newly created session
-      refresh();
-      // Only show "not found" after a delay to allow for async session creation
-      const timer = setTimeout(() => setNotFoundTimeout(true), 3000);
-      return () => clearTimeout(timer);
-    } else {
-      setNotFoundTimeout(false);
-    }
-  }, [session, refresh, sessionId]);
-
-  // Mark the session as seen when viewing it
-  useEffect(() => {
-    if (!session || !session.unread || markedSeenRef.current) return;
-    markedSeenRef.current = true;
-    fetch(`/api/sessions/${sessionId}/seen`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectSlug, taskSlug: "" }),
-    }).then(() => refresh());
-  }, [session, sessionId, projectSlug, refresh]);
-
-  const handleBack = () => {
-    router.push(projectRoute(projectSlug));
-  };
-
-  if (!session) {
-    return (
-      <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
-        {notFoundTimeout ? "Session not found" : "Loading..."}
-      </div>
-    );
-  }
+    router.replace(projectRoute(projectSlug, { chat: sessionId }));
+  }, [router, projectSlug, sessionId]);
 
   return (
-    <Chat
-      session={session}
-      onChange={refresh}
-      onBack={handleBack}
-    />
+    <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
+      Loading…
+    </div>
   );
 }

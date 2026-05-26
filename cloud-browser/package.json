@@ -1,0 +1,36 @@
+{
+  "name": "cloud-browser",
+  "version": "0.1.0",
+  "description": "MCP server that gives Claude clients access to fully-controlled, persistent-profile Chromium browsers running in Docker.",
+  "type": "module",
+  "bin": {
+    "cloud-browser": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "docker:build": "docker build -t cloud-browser/chromium:latest browser",
+    "smoke": "tsx scripts/smoke-test.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dockerode": "^4.0.0",
+    "playwright-core": "^1.60.0",
+    "tar-fs": "^3.0.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.34",
+    "@types/node": "^22.0.0",
+    "@types/tar-fs": "^2.0.4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -44,6 +44,12 @@ interface Props {
   taskSlug: string;
   filePath: string;
   onBack: () => void;
+  /**
+   * When true, the file viewer is hosted inside another layout (e.g. the
+   * workspace artifact column). It skips its own page-level header and the
+   * built-in chat side panel — the host renders those.
+   */
+  embedded?: boolean;
 }
 
 interface CommentRow {
@@ -71,7 +77,7 @@ function extOf(p: string): string {
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 const TEXT_EXT = new Set(["md", "markdown", "txt", "json", "csv", "yaml", "yml", "log"]);
 
-export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
+export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded = false }: Props) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -99,23 +105,23 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
     return stored ? parseInt(stored, 10) : DEFAULT_CHAT_WIDTH;
   });
 
-  // Update URL and save task path when sidebar states change
+  // Update URL and save task path when sidebar states change.
+  // Skip in embedded mode — the workspace owns the URL there.
   useEffect(() => {
+    if (embedded) return;
     const params = new URLSearchParams();
     if (panelOpen) params.set("comments", "1");
     if (chatPanelOpen) params.set("chat", "1");
     const search = params.toString();
     const fullPath = search ? `${pathname}?${search}` : pathname;
 
-    // Update URL without navigation (replace state)
     const newUrl = search ? `${pathname}?${search}` : pathname;
     window.history.replaceState(null, "", newUrl);
 
-    // Save to localStorage for task state persistence
     if (taskSlug) {
       saveTaskPath(projectSlug, taskSlug, fullPath);
     }
-  }, [panelOpen, chatPanelOpen, pathname, projectSlug, taskSlug]);
+  }, [panelOpen, chatPanelOpen, pathname, projectSlug, taskSlug, embedded]);
   const contentRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -570,43 +576,63 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
 
   return (
     <>
-      <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
-        <button
-          onClick={onBack}
-          className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"
-        >← Task</button>
-        <div className="flex-1 min-w-0">
-          <div className="text-[14px] truncate font-mono">{filePath}</div>
-          <div className="text-[11.5px] text-[var(--muted)]">
-            {projectSlug} · {taskSlug}
+      {!embedded && (
+        <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
+          <button
+            onClick={onBack}
+            className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"
+          >← Task</button>
+          <div className="flex-1 min-w-0">
+            <div className="text-[14px] truncate font-mono">{filePath}</div>
+            <div className="text-[11.5px] text-[var(--muted)]">
+              {projectSlug} · {taskSlug}
+            </div>
           </div>
-        </div>
-        {supportsComments && (
+          {supportsComments && (
+            <button
+              onClick={() => setPanelOpen((v) => !v)}
+              className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${panelOpen ? "bg-[var(--panel-2)]" : ""}`}
+              title="Comments — select text in the doc first, or write a comment on the whole document"
+            >
+              💬 {liveCount > 0 || obsoleteCount > 0
+                ? `${liveCount}${obsoleteCount > 0 ? ` · ${obsoleteCount} obsolete` : ""}`
+                : "Add"}
+            </button>
+          )}
+          {taskSlug && (
+            <button
+              onClick={() => setChatPanelOpen((v) => !v)}
+              className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${chatPanelOpen ? "bg-[var(--panel-2)]" : ""}`}
+              title="Chat with an agent about this file"
+            >
+              🤖 Chat
+            </button>
+          )}
+          <a
+            href={rawUrl}
+            download
+            className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
+          >Download</a>
+        </header>
+      )}
+      {embedded && supportsComments && (
+        <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-b border-[var(--border)] shrink-0">
           <button
             onClick={() => setPanelOpen((v) => !v)}
-            className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${panelOpen ? "bg-[var(--panel-2)]" : ""}`}
+            className={`text-[11.5px] border border-[var(--border-strong)] rounded-md px-2 py-0.5 hover:bg-[var(--panel-2)] ${panelOpen ? "bg-[var(--panel-2)]" : ""}`}
             title="Comments — select text in the doc first, or write a comment on the whole document"
           >
             💬 {liveCount > 0 || obsoleteCount > 0
               ? `${liveCount}${obsoleteCount > 0 ? ` · ${obsoleteCount} obsolete` : ""}`
               : "Add"}
           </button>
-        )}
-        {taskSlug && (
-          <button
-            onClick={() => setChatPanelOpen((v) => !v)}
-            className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${chatPanelOpen ? "bg-[var(--panel-2)]" : ""}`}
-            title="Chat with an agent about this file"
-          >
-            🤖 Chat
-          </button>
-        )}
-        <a
-          href={rawUrl}
-          download
-          className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
-        >Download</a>
-      </header>
+          <a
+            href={rawUrl}
+            download
+            className="text-[11.5px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-md px-2 py-0.5 hover:bg-[var(--panel-2)]"
+          >Download</a>
+        </div>
+      )}
 
       <div className="flex-1 min-h-0 flex">
         {/* Iframe-style viewers fill the available area without page scroll */}
@@ -686,7 +712,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
           />
         )}
 
-        {agentSessionId && (
+        {!embedded && agentSessionId && (
           <AgentPanel
             sessionId={agentSessionId}
             projectSlug={projectSlug}
@@ -701,7 +727,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack }: Props) {
           />
         )}
 
-        {chatPanelOpen && taskSlug && (
+        {!embedded && chatPanelOpen && taskSlug && (
           <>
             <Resizer
               direction="horizontal"

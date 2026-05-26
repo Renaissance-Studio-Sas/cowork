@@ -165,18 +165,24 @@ export function generateSessionLabel(firstMessage: string): string {
     .replace(/[?!.]+$/, "")
     .trim();
 
-  const words = text.split(/\s+/);
+  const words = text.split(/\s+/).filter(Boolean);
   if (words.length === 0) return "New session";
 
-  // Capitalize first letter
-  words[0] = words[0].charAt(0).toUpperCase() + words[0].slice(1);
-
-  // Take first ~5 words or ~40 chars, whichever is shorter
+  // Take first ~5 words or ~40 chars, whichever is shorter. A leading token
+  // that's too long to fit on its own (e.g. a pasted URL or file path) is
+  // skipped rather than allowed to break the loop and leave the label empty —
+  // otherwise any message starting with a URL collapses to "New session".
   let label = "";
   for (const word of words) {
-    if (label.length + word.length > 40) break;
+    if (label.length + (label ? 1 : 0) + word.length > 40) {
+      if (label) break; // already have words — stop here
+      continue; // first token too long — skip it and keep looking
+    }
     label += (label ? " " : "") + word;
   }
 
-  return label || "New session";
+  if (!label) return "New session";
+
+  // Capitalize the first letter of the chosen label.
+  return label.charAt(0).toUpperCase() + label.slice(1);
 }

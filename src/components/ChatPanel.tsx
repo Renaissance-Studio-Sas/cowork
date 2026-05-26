@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useWorkspace } from "@/lib/workspace-context";
 import { handleComposerEnter } from "@/lib/composer";
 import type { SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
-import { TodoList, extractTodosFromMessages } from "./TodoList";
+import { TodoList, extractTodosFromMessages, type TodoItem } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -523,6 +523,11 @@ function LiveChat({
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
 
+  // Todo list pushed by the server, derived from the FULL session history (the
+  // chat transcript is paginated, so deriving from `messages` alone misses tool
+  // calls in older, not-yet-loaded messages). Falls back to client derivation.
+  const [serverTodos, setServerTodos] = useState<TodoItem[] | null>(null);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -567,6 +572,7 @@ function LiveChat({
 
   useEffect(() => {
     setMessages([]);
+    setServerTodos(null);
     setState(session.state);
     setStreamConnected(false);
     setHistoryMeta(null);
@@ -605,6 +611,14 @@ function LiveChat({
       try {
         const meta = JSON.parse((ev as MessageEvent).data);
         setHistoryMeta(meta);
+      } catch { /* ignore */ }
+    });
+
+    // Server-derived todo list (computed over the full history), independent of
+    // chat pagination.
+    es.addEventListener("todos", (ev) => {
+      try {
+        setServerTodos(JSON.parse((ev as MessageEvent).data) as TodoItem[]);
       } catch { /* ignore */ }
     });
 
@@ -732,7 +746,8 @@ function LiveChat({
   const isLive = streamConnected || session.isLive;
 
   // Extract todos from the message stream
-  const todos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+  const derivedTodos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+  const todos = serverTodos ?? derivedTodos;
 
   // Todo panel visibility (defaults to shown when there are todos)
   const [showTodos, setShowTodos] = useState(true);
@@ -992,13 +1007,14 @@ function NewSessionComposer({
           >
             <option value="claude">Claude</option>
             <option value="gemini">Gemini</option>
+            <option value="remote">Remote (Docker)</option>
           </select>
           <select
             value={effort}
             onChange={(e) => onEffort(e.target.value as EffortLevel | "")}
             className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer"
             title="Thinking effort (Claude only — guides how much the model thinks)"
-            disabled={runtime !== "claude"}
+            disabled={runtime !== "claude" && runtime !== "remote"}
           >
             <option value="">default (high)</option>
             <option value="low">low</option>

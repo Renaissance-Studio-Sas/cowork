@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { isPending, useWorkspace } from "@/lib/workspace-context";
@@ -29,6 +29,8 @@ interface Props {
 
 export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const selectedChatId = searchParams.get("chat") ?? "";
   const { projects, sessions, pendingCount, refresh } = useWorkspace();
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -291,7 +293,7 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
             {!recentCollapsed && (
               <div className="space-y-0.5">
                 {activeSessions.map((s) => (
-                  <RecentSessionRow key={s.id} session={s} selected={pathname.includes(`/session/${s.id}`)} />
+                  <RecentSessionRow key={s.id} session={s} selected={selectedChatId === s.id} />
                 ))}
               </div>
             )}

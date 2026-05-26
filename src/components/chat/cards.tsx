@@ -291,9 +291,12 @@ export function QuestionCard({
 export function CompleteToggleButton({
   session,
   completed,
+  variant = "full",
 }: {
   session: SessionSummaryDTO;
   completed: boolean;
+  /** "full" = labeled pill (header); "icon" = square icon button (composer). */
+  variant?: "full" | "icon";
 }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
@@ -326,6 +329,28 @@ export function CompleteToggleButton({
       setBusy(false);
     }
   };
+  const title = completed
+    ? "Reopen this session (marks it active again)"
+    : "Mark this session complete (closes it and returns to the task)";
+
+  if (variant === "icon") {
+    return (
+      <button
+        onClick={toggle}
+        disabled={busy}
+        className={`rounded-lg border w-9 h-9 flex items-center justify-center text-[15px] transition disabled:opacity-50 shrink-0 ${
+          completed
+            ? "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
+            : "border-[var(--ok)] text-[var(--ok)] hover:bg-[var(--ok-soft)]"
+        }`}
+        title={title}
+        aria-label={completed ? "Reopen session" : "Mark session complete"}
+      >
+        {completed ? "↺" : "✓"}
+      </button>
+    );
+  }
+
   return (
     <button
       onClick={toggle}
@@ -335,7 +360,7 @@ export function CompleteToggleButton({
           ? "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
           : "border-[var(--ok)] text-[var(--ok)] hover:bg-[var(--ok-soft)]"
       }`}
-      title={completed ? "Reopen this session" : "Mark this session complete"}
+      title={title}
     >
       {completed ? "↺ Reopen" : "✓ Mark complete"}
     </button>

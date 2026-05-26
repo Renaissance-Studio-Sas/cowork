@@ -1,33 +1,26 @@
 "use client";
 
+import { useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { FileViewer } from "@/components/FileViewer";
 import { projectRoute } from "@/lib/routes";
 
-export default function ProjectFilePage() {
+// Legacy deep link — redirect into the unified project workspace with the
+// file expanded as the artifact column.
+export default function ProjectFileRedirect() {
   const params = useParams();
   const router = useRouter();
   const projectSlug = decodeURIComponent(params.slug as string);
   const pathParts = params.path as string[];
   const filePath = pathParts.map(decodeURIComponent).join("/");
+  const dirPath = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
 
-  const handleBack = () => {
-    // Go back to the parent folder or project root
-    const lastSlash = filePath.lastIndexOf("/");
-    if (lastSlash > 0) {
-      const dirPath = filePath.slice(0, lastSlash);
-      router.push(`/project/${encodeURIComponent(projectSlug)}?dir=${encodeURIComponent(dirPath)}`);
-    } else {
-      router.push(projectRoute(projectSlug));
-    }
-  };
+  useEffect(() => {
+    router.replace(projectRoute(projectSlug, { artifact: filePath, dir: dirPath || undefined }));
+  }, [router, projectSlug, filePath, dirPath]);
 
   return (
-    <FileViewer
-      projectSlug={projectSlug}
-      taskSlug=""
-      filePath={filePath}
-      onBack={handleBack}
-    />
+    <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
+      Loading…
+    </div>
   );
 }

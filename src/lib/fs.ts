@@ -84,6 +84,32 @@ function folderNameFor(slug: string, status: Status): string {
   return status === "archived" ? `${slug}${ARCHIVED_SUFFIX}` : slug;
 }
 
+// Two folders can collapse to the same slug — e.g. a migrated `X` folder next
+// to a leftover legacy `wip-X`, or a stray git worktree whose container dir
+// happens to start with `wip-`/`done-`. Emitting both crashes the sidebar with
+// React duplicate-key warnings and makes /project/<slug> routing ambiguous.
+// Keep the most "real" one: a folder with an actual brief beats an empty one,
+// a canonical (un-prefixed, un-suffixed) name beats a legacy/archived variant,
+// and active beats archived. Deterministic, so the UI is stable across reloads.
+type Slugged = Pick<Project, "slug" | "folderName" | "status" | "overview" | "details" | "createdAt">;
+
+function realnessScore(x: Slugged): number {
+  let score = 0;
+  if (x.createdAt || x.overview || x.details) score += 4; // has a brief
+  if (x.folderName === x.slug) score += 2;                // canonical folder name
+  if (x.status === "active") score += 1;
+  return score;
+}
+
+function dedupeBySlug<T extends Slugged>(items: T[]): T[] {
+  const best = new Map<string, T>();
+  for (const x of items) {
+    const cur = best.get(x.slug);
+    if (!cur || realnessScore(x) > realnessScore(cur)) best.set(x.slug, x);
+  }
+  return [...best.values()];
+}
+
 // The folder name *is* the display name. Sanitize only what the filesystem
 // genuinely can't handle (path separators + a few illegal chars) and what
 // would clash with our naming scheme. Preserve case, spaces, and most
@@ -180,11 +206,12 @@ export async function listProjects(): Promise<Project[]> {
       tasks,
     });
   }
-  projects.sort((a, b) => {
+  const deduped = dedupeBySlug(projects);
+  deduped.sort((a, b) => {
     if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
-  return projects;
+  return deduped;
 }
 
 async function listTasks(projectFolder: string): Promise<Task[]> {
@@ -213,11 +240,12 @@ async function listTasks(projectFolder: string): Promise<Task[]> {
       createdAt: brief.createdAt,
     });
   }
-  out.sort((a, b) => {
+  const deduped = dedupeBySlug(out);
+  deduped.sort((a, b) => {
     if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
-  return out;
+  return deduped;
 }
 
 export async function getProject(slug: string): Promise<Project | null> {
@@ -418,11 +446,7 @@ function ensureSafePath(base: string, rel: string): string {
 // Files to hide from artifact listings (macOS metadata, etc.)
 const HIDDEN_FILES = new Set([".DS_Store"]);
 
-export async function listFiles(projectSlug: string, taskSlug: string): Promise<string[]> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) return [];
-  const base = path.join(taskDir(project, task), "files");
+async function listFilesIn(base: string): Promise<string[]> {
   try {
     const entries = await fs.readdir(base, { withFileTypes: true, recursive: true });
     return entries
@@ -431,6 +455,47 @@ export async function listFiles(projectSlug: string, taskSlug: string): Promise<
   } catch {
     return [];
   }
+}
+
+export interface FileMeta {
+  path: string;
+  /** Modification time in epoch milliseconds. */
+  mtime: number;
+}
+
+// Same listing as listFilesIn but carries each file's mtime so callers can
+// sort artifacts by recency.
+async function listFilesMetaIn(base: string): Promise<FileMeta[]> {
+  try {
+    const entries = await fs.readdir(base, { withFileTypes: true, recursive: true });
+    const files = entries.filter((e) => e.isFile() && !HIDDEN_FILES.has(e.name));
+    return Promise.all(
+      files.map(async (e) => {
+        const full = path.join(e.parentPath, e.name);
+        let mtime = 0;
+        try { mtime = (await fs.stat(full)).mtimeMs; } catch { /* ignore */ }
+        return { path: path.relative(base, full), mtime };
+      }),
+    );
+  } catch {
+    return [];
+  }
+}
+
+export async function listFiles(projectSlug: string, taskSlug: string): Promise<string[]> {
+  const project = await getProject(projectSlug);
+  const task = project?.tasks.find((t) => t.slug === taskSlug);
+  if (!project || !task) return [];
+  const base = path.join(taskDir(project, task), "files");
+  return listFilesIn(base);
+}
+
+export async function listFilesMeta(projectSlug: string, taskSlug: string): Promise<FileMeta[]> {
+  const project = await getProject(projectSlug);
+  const task = project?.tasks.find((t) => t.slug === taskSlug);
+  if (!project || !task) return [];
+  const base = path.join(taskDir(project, task), "files");
+  return listFilesMetaIn(base);
 }
 
 export async function readFileText(projectSlug: string, taskSlug: string, rel: string): Promise<string> {
@@ -461,14 +526,14 @@ export async function listProjectFiles(projectSlug: string): Promise<string[]> {
   const project = await getProject(projectSlug);
   if (!project) return [];
   const base = path.join(projectDir(project), "files");
-  try {
-    const entries = await fs.readdir(base, { withFileTypes: true, recursive: true });
-    return entries
-      .filter((e) => e.isFile() && !HIDDEN_FILES.has(e.name))
-      .map((e) => path.relative(base, path.join(e.parentPath, e.name)));
-  } catch {
-    return [];
-  }
+  return listFilesIn(base);
+}
+
+export async function listProjectFilesMeta(projectSlug: string): Promise<FileMeta[]> {
+  const project = await getProject(projectSlug);
+  if (!project) return [];
+  const base = path.join(projectDir(project), "files");
+  return listFilesMetaIn(base);
 }
 
 export async function readProjectFileText(projectSlug: string, rel: string): Promise<string> {

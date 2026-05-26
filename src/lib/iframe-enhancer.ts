@@ -325,7 +325,25 @@ ${userHtml}
     const a = target.closest("a[href]");
     if (a && !e.defaultPrevented) {
       const href = a.getAttribute("href") || "";
-      if (!href || href.startsWith("#")) return;
+      if (!href) return;
+      // In-document anchor: scroll within the iframe instead of letting the
+      // browser resolve "#id" against the parent page's URL (srcDoc inherits
+      // the parent base URL, which would navigate the iframe to the app).
+      if (href.startsWith("#")) {
+        e.preventDefault();
+        const id = decodeURIComponent(href.slice(1));
+        if (!id) {
+          window.scrollTo({ top: 0, behavior: "smooth" });
+          return;
+        }
+        let dest = document.getElementById(id);
+        if (!dest) {
+          const named = document.getElementsByName(id);
+          dest = named && named.length ? named[0] : null;
+        }
+        if (dest) dest.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
       if (/^(?:[a-z]+:)|^\\/\\//i.test(href) || href.startsWith("mailto:")) {
         e.preventDefault();
         parent.postMessage({ type: "wb:open-external", href: href }, "*");

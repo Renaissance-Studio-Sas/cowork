@@ -10,10 +10,12 @@
 import type { AgentRuntime } from "../agent-runtime";
 import { claudeRuntime } from "./claude";
 import { geminiRuntime } from "./gemini";
+import { remoteRuntime } from "./remote";
 
 export const RUNTIMES: Record<string, AgentRuntime> = {
   [claudeRuntime.id]: claudeRuntime,
   [geminiRuntime.id]: geminiRuntime,
+  [remoteRuntime.id]: remoteRuntime,
 };
 
 export function getRuntime(id: string): AgentRuntime {
@@ -22,4 +24,4 @@ export function getRuntime(id: string): AgentRuntime {
   return r;
 }
 
-export { claudeRuntime, geminiRuntime };
+export { claudeRuntime, geminiRuntime, remoteRuntime };

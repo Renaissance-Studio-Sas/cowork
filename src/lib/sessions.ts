@@ -22,8 +22,17 @@ import type {
 import { getRuntime } from "./runtimes";
 
 import { InputChannel, makeUserMessage, makeUserMessageWithImages, type ImageContent } from "./input-channel";
+import {
+  appendEvent,
+  flushEvents,
+  forgetSession,
+  readSessionEvents,
+  deleteSessionEvents,
+  registerSessionLog,
+} from "./cloud-events";
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
+import { extractTodosFromMessages } from "./todos";
 import { updateMeta, persistSdkSessionId, persistSessionState } from "./sessions/meta";
 import {
   buildPlanningTools,
@@ -184,6 +193,38 @@ export function subscribeFileChanges(
   };
 }
 
+// Subscribe to open_artifact events from every live session matching
+// (projectSlug, taskSlug), including sessions added after this call. These are
+// emitted by the workbench-session.open_artifact tool so an agent can push a
+// freshly-saved artifact into the user's artifact panel. Returns an unsubscribe
+// function. Multiplexed by /api/file-events/stream alongside file_changed.
+export function subscribeOpenArtifact(
+  projectSlug: string,
+  taskSlug: string,
+  listener: (data: { path: string; sessionId: string }) => void,
+): () => void {
+  const attached = new Map<string, (data: { path: string }) => void>();
+  const attach = (s: RuntimeSession) => {
+    if (s.projectSlug !== projectSlug || s.taskSlug !== taskSlug) return;
+    if (attached.has(s.id)) return;
+    const wrapper = (data: { path: string }) =>
+      listener({ ...data, sessionId: s.id });
+    s.events.on("open_artifact", wrapper);
+    attached.set(s.id, wrapper);
+  };
+  for (const s of registry.values()) attach(s);
+  const onAdded = (s: RuntimeSession) => attach(s);
+  sessionRegistryEvents.on("added", onAdded);
+  return () => {
+    sessionRegistryEvents.off("added", onAdded);
+    for (const [id, wrapper] of attached) {
+      const s = registry.get(id);
+      if (s) s.events.off("open_artifact", wrapper);
+    }
+    attached.clear();
+  };
+}
+
 const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback with error emit
 const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
@@ -260,7 +301,7 @@ function runWatchdog() {
         } as unknown as SDKMessage);
         s.interrupted = true;
         s.input.close();
-        s.log.end();
+        void flushEvents(s.id);
         s.inputLog.end();
         setState(s, "stopped");
       } catch { /* best effort */ }
@@ -268,7 +309,7 @@ function runWatchdog() {
       console.log(`[watchdog] Session ${s.id} idle for ${Math.round(sinceActivity / 1000)}s — closing (resumable on next message)`);
       try {
         s.input.close();
-        s.log.end();
+        void flushEvents(s.id);
         s.inputLog.end();
         setState(s, "stopped");
       } catch { /* best effort */ }
@@ -308,12 +349,12 @@ if (!globalThis.__wb_watchdog_interval) {
 if (!globalThis.__wb_reconciled) {
   globalThis.__wb_reconciled = true;
   setImmediate(async () => {
-    if (!isColdStart()) return;
+    // Always run reconciliation — it's idempotent and cheap.
     await reconcileSessionsOnDisk();
-    // Resume sessions that were mid-process when the server died. Awaited
-    // after reconcile so we read freshly-corrected (projectSlug, taskSlug,
-    // cwd) values — otherwise auto-resume could try to restore against a
-    // stale path and silently fail.
+    // Resume sessions that were mid-process when the server died. The
+    // function itself checks whether each session is already in the
+    // registry (preserved via globalThis during HMR) and skips those,
+    // so we don't need the isColdStart() gate here anymore.
     await autoResumeRunningSessions();
   });
 }
@@ -473,8 +514,19 @@ export function getSessionQuery(id: string): AgentQuery | null {
 // passing the SDK-shaped option blobs they already build. When a future
 // runtime needs a different option shape, this is where the translation
 // goes.
-function createAgentQuery(runtime: SessionRuntime, opts: Record<string, unknown>): AgentQuery {
-  return getRuntime(runtime).query(opts as unknown as AgentQueryOptions);
+function createAgentQuery(
+  runtime: SessionRuntime,
+  opts: Record<string, unknown>,
+  context?: { projectSlug: string; taskSlug: string },
+): AgentQuery {
+  // The remote runtime needs project/task identity to forward to the
+  // controller (the cwd alone is just the workspace root). Inject here so
+  // callers don't have to remember which runtimes need which extras.
+  const withRemote =
+    runtime === "remote" && context
+      ? { ...opts, remote: { project: context.projectSlug, task: context.taskSlug } }
+      : opts;
+  return getRuntime(runtime).query(withRemote as unknown as AgentQueryOptions);
 }
 
 // Debug helper to inspect the session registry
@@ -553,14 +605,10 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
         if (first) title = (JSON.parse(first).text as string).trim().slice(0, 120);
       } catch { /* missing */ }
     }
-    // Prefer persisted lastActivity from meta.json (reliable); fall back to file mtime (unreliable across restarts)
-    let lastActivity = meta.lastActivity ?? meta.startedAt ?? new Date(0).toISOString();
-    if (!meta.lastActivity) {
-      try {
-        const st = await fs.stat(path.join(sessDir, id, "events.jsonl"));
-        lastActivity = st.mtime.toISOString();
-      } catch { /* missing */ }
-    }
+    // lastActivity is persisted to meta.json on every state transition; new
+    // sessions always have it. Pre-D1 legacy sessions without it fall back
+    // to startedAt or epoch.
+    const lastActivity = meta.lastActivity ?? meta.startedAt ?? new Date(0).toISOString();
     // Session is unread only if it completed after user last viewed it.
     // For legacy sessions without completedAt, use lastActivity as proxy (they're already done).
     // Sessions explicitly marked complete are never unread.
@@ -616,18 +664,12 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
   return out;
 }
 
-// Read a historical session's events.jsonl from disk for clients viewing a
-// stopped session. Handles both project-level (taskSlug === "") and task-
-// level locations.
+// Read a historical session's events from the D1 cowork-sessions-marco table.
+// The projectSlug/taskSlug args remain for parity with the rest of the API but
+// are only used for the project/task existence check — events themselves are
+// keyed solely by session id.
 //
-// Pagination support for lazy loading:
-// - limit: maximum number of events to return (undefined = all)
-// - offset: how many events to skip from the END (0 = most recent)
-//
-// Example: total 200 events, limit=50, offset=0 → returns events 150-199 (newest 50)
-//          total 200 events, limit=50, offset=50 → returns events 100-149 (next 50 older)
-//
-// Returns { events, total, hasMore } for pagination context.
+// Pagination: offset is from the END (offset=0 = most recent `limit` events).
 export async function readSessionHistory(
   projectSlug: string,
   taskSlug: string,
@@ -637,40 +679,20 @@ export async function readSessionHistory(
 ): Promise<{ events: unknown[]; total: number; hasMore: boolean } | null> {
   const project = await getProject(projectSlug);
   if (!project) return null;
-  let file: string;
+  let eventsPath: string;
   if (!taskSlug) {
-    file = path.join(PROJECTS_DIR, project.folderName, "sessions", id, "events.jsonl");
+    eventsPath = path.join(PROJECTS_DIR, project.folderName, "sessions", id, "events.jsonl");
   } else {
     const task = project.tasks.find((t) => t.slug === taskSlug);
     if (!task) return null;
-    file = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id, "events.jsonl");
+    eventsPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id, "events.jsonl");
   }
+  // Tell the file backend where this stopped session's log lives, then read.
+  registerSessionLog(id, eventsPath);
   try {
-    const raw = await fs.readFile(file, "utf8");
-    const allEvents = raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-    const total = allEvents.length;
-
-    // If no limit specified, return all events
-    if (limit === undefined) {
-      return { events: allEvents, total, hasMore: false };
-    }
-
-    // Calculate slice indices from the end
-    // offset=0, limit=50 with 200 total → start=150, end=200 → events[150:200]
-    // offset=50, limit=50 with 200 total → start=100, end=150 → events[100:150]
-    const end = total - offset;
-    const start = Math.max(0, end - limit);
-
-    if (end <= 0) {
-      // Offset is beyond the total events
-      return { events: [], total, hasMore: false };
-    }
-
-    const events = allEvents.slice(start, end);
-    const hasMore = start > 0;
-
-    return { events, total, hasMore };
-  } catch {
+    return await readSessionEvents(id, { limit, offset });
+  } catch (err) {
+    console.error(`[sessions] readSessionHistory(${id}) failed:`, err);
     return null;
   }
 }
@@ -724,14 +746,17 @@ export async function restoreSession(
     return null; // No meta.json means session doesn't exist
   }
 
-  // Read history from events.jsonl
-  const eventsPath = path.join(sessionDir, "events.jsonl");
+  // Read history back from the event log (file backend by default; see
+  // cloud-events.ts). Empty (file missing or backend unreachable) is fine —
+  // the UI just won't have a replay buffer, and resume will pick up via the
+  // SDK's own transcript anyway.
+  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
   let history: SDKMessage[] = [];
   try {
-    const raw = await fs.readFile(eventsPath, "utf8");
-    history = raw.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-  } catch {
-    // Empty history is fine
+    const { events } = await readSessionEvents(id);
+    history = events as SDKMessage[];
+  } catch (err) {
+    console.warn(`[sessions] restoreSession(${id}) could not load history:`, err);
   }
 
   // Create a placeholder InputChannel and Query that will be replaced on resume
@@ -743,7 +768,7 @@ export async function restoreSession(
   const pendingQuestions = new Map<string, PendingQuestion>();
   const pendingCompletions = new Map<string, PendingCompletion>();
 
-  // Don't create file streams yet — they'll be created on resume
+  // Placeholder input log — replaced on resume when input.jsonl reopens.
   const sink = createWriteStream("/dev/null");
 
   const session: RuntimeSession = {
@@ -759,9 +784,11 @@ export async function restoreSession(
     q: null as unknown as AgentQuery, // Placeholder — replaced on resume
     input,
     events,
-    log: sink,
     inputLog: sink,
     history,
+    // Continue the seq sequence past the events already persisted in D1
+    // (history was just rebuilt from the full event log above).
+    seq: history.length,
     streamingText: "",
     // A restored session has closed streams and a placeholder query, so the
     // runtime state must be "stopped" regardless of what meta.json says —
@@ -795,6 +822,48 @@ export async function restoreSession(
 // on shared cwd transcripts is asking for trouble.
 const RESUME_PROMPT = "[Server restarted — please continue where you left off.]";
 
+// Check if the session's history ends with a pending tool_use (no matching tool_result).
+// Returns the tool_use IDs that need synthetic tool_results before we can send a user message.
+function findPendingToolUses(history: SDKMessage[]): string[] {
+  // Walk backwards to find the last assistant message
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i] as { type?: string; message?: { role?: string; content?: unknown[] } };
+    if (msg.type === "assistant" && msg.message?.role === "assistant") {
+      const content = msg.message.content;
+      if (!Array.isArray(content)) continue;
+
+      // Collect tool_use IDs from this assistant message
+      const toolUseIds: string[] = [];
+      for (const block of content) {
+        if ((block as { type?: string }).type === "tool_use") {
+          toolUseIds.push((block as { id: string }).id);
+        }
+      }
+      if (toolUseIds.length === 0) return [];
+
+      // Check if there's a matching tool_result in subsequent messages
+      const answeredIds = new Set<string>();
+      for (let j = i + 1; j < history.length; j++) {
+        const userMsg = history[j] as { type?: string; message?: { role?: string; content?: unknown[] } };
+        if (userMsg.type === "user" && userMsg.message?.role === "user") {
+          const userContent = userMsg.message.content;
+          if (Array.isArray(userContent)) {
+            for (const block of userContent) {
+              if ((block as { type?: string }).type === "tool_result") {
+                answeredIds.add((block as { tool_use_id: string }).tool_use_id);
+              }
+            }
+          }
+        }
+      }
+
+      // Return IDs that weren't answered
+      return toolUseIds.filter(id => !answeredIds.has(id));
+    }
+  }
+  return [];
+}
+
 async function findRunningSessionsInDir(
   sessDir: string,
   projectSlug: string,
@@ -809,13 +878,25 @@ async function findRunningSessionsInDir(
   }
   for (const d of dirents) {
     if (!d.isDirectory()) continue;
+    // Skip sessions already in the registry — they're still live (preserved
+    // via globalThis during HMR) and don't need resume.
+    if (registry.has(d.name)) continue;
     const metaPath = path.join(sessDir, d.name, "meta.json");
     try {
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
       // sdkSessionId is required: resume() needs it to find the SDK's
       // transcript. A session that crashed before the first `init` event has
-      // no transcript to resume against — skip it.
-      if (meta.finalState === "running" && meta.sdkSessionId) {
+      // no transcript to resume against — skip it. Also skip "resuming" state
+      // which means another worker is already handling this session.
+      // Remote (Docker) sessions are also skipped: their container is orphaned
+      // after a cowork restart and auto-resume would spawn a fresh container
+      // per session at boot — slow, noisy, and dependent on Docker being up.
+      // The user resumes them manually by sending a message.
+      if (
+        meta.finalState === "running"
+        && meta.sdkSessionId
+        && meta.runtime !== "remote"
+      ) {
         out.push({ projectSlug, taskSlug, id: d.name });
       }
     } catch { /* skip unreadable meta */ }
@@ -823,7 +904,48 @@ async function findRunningSessionsInDir(
   return out;
 }
 
+// Lock file to prevent multiple workers from running auto-resume simultaneously.
+// Next.js dev mode spawns multiple workers, each with its own globalThis, so
+// the __wb_reconciled flag isn't enough.
+const AUTO_RESUME_LOCK = path.join(os.tmpdir(), "cowork-auto-resume.lock");
+const LOCK_STALE_MS = 30_000; // 30 seconds — if lock is older, it's stale
+
+async function acquireAutoResumeLock(): Promise<boolean> {
+  try {
+    const stat = await fs.stat(AUTO_RESUME_LOCK);
+    if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) {
+      return false; // Another worker has the lock and it's fresh
+    }
+    // Lock is stale — remove it and try to acquire
+    await fs.unlink(AUTO_RESUME_LOCK);
+  } catch { /* file doesn't exist — we can take it */ }
+  try {
+    await fs.writeFile(AUTO_RESUME_LOCK, String(Date.now()), { flag: "wx" });
+    return true;
+  } catch {
+    // Another worker beat us to it
+    return false;
+  }
+}
+
+async function releaseAutoResumeLock(): Promise<void> {
+  try { await fs.unlink(AUTO_RESUME_LOCK); } catch { /* best effort */ }
+}
+
 export async function autoResumeRunningSessions(): Promise<{ resumed: number; failed: number }> {
+  // Acquire lock to prevent multiple workers from resuming the same sessions.
+  // Don't release the lock — let it expire naturally (LOCK_STALE_MS = 30s).
+  // This ensures all workers that start within 30s will skip auto-resume,
+  // preventing duplicate "[Server restarted]" messages.
+  if (!(await acquireAutoResumeLock())) {
+    console.log("[auto-resume] Skipping — another worker is handling it");
+    return { resumed: 0, failed: 0 };
+  }
+
+  return await doAutoResume();
+}
+
+async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
   let projects;
   try {
     projects = await listProjects();
@@ -855,6 +977,9 @@ export async function autoResumeRunningSessions(): Promise<{ resumed: number; fa
     try {
       const s = await restoreSession(c.projectSlug, c.taskSlug, c.id);
       if (!s) { failed++; continue; }
+      // Clear finalState immediately so other workers (Next.js dev mode runs
+      // multiple) don't also try to resume this session.
+      await updateMeta(s, (meta) => { meta.finalState = "resuming"; });
       const ok = await resumeSession(s, RESUME_PROMPT);
       if (ok) {
         resumed++;
@@ -923,7 +1048,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     ),
   );
 
-  const log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
+  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
   const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
 
   const input = new InputChannel();
@@ -960,6 +1085,9 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
     },
+    // RemoteRuntime needs project/task to provision a container against the
+    // right task folder. Other runtimes ignore this block.
+    remote: { project: p.projectSlug, task: p.taskSlug },
   });
 
   const now = new Date();
@@ -976,9 +1104,9 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     q,
     input,
     events,
-    log,
     inputLog,
     history: [],
+    seq: 0,
     streamingText: "",
     state: "running",
     pendingPermissions,
@@ -995,10 +1123,10 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   };
   registerSession(session);
 
-  // Echo the first user message into history + events.jsonl so the UI shows
-  // the user's prompt (the SDK doesn't echo typed inputs in streaming mode).
+  // Echo the first user message into history + cloud event log so the UI
+  // shows the user's prompt (the SDK doesn't echo typed inputs in streaming mode).
   session.history.push(firstMsg);
-  session.log.write(JSON.stringify(firstMsg) + "\n");
+  appendEvent(session.id, session.seq++, firstMsg);
   session.events.emit("event", firstMsg);
 
   // Pump events in the background — never await this in the request handler.
@@ -1032,6 +1160,30 @@ function isInterruptError(message: string): boolean {
   return /request was aborted|ede_diagnostic|returned an error result/i.test(message);
 }
 
+// 529 = Anthropic API overloaded. Retryable with backoff.
+function is529Error(message: string): boolean {
+  return /529|overloaded/i.test(message);
+}
+
+// Exponential backoff delay: 2s, 4s, 8s, 16s, 32s (capped)
+function backoffDelay(attempt: number): number {
+  return Math.min(2000 * Math.pow(2, attempt), 32000);
+}
+
+// Re-derive the todo list from the FULL in-memory history and emit a `todos`
+// event when it changes. Deriving over the complete history (not a paginated
+// window) is the whole point — it keeps the task panel coherent no matter how
+// much transcript the chat UI has loaded. Cheap: only runs on assistant
+// messages (the only carrier of TodoWrite/TaskCreate/TaskUpdate tool calls)
+// and short-circuits via a serialized diff so unchanged turns emit nothing.
+function maybeEmitTodos(s: RuntimeSession) {
+  const todos = extractTodosFromMessages(s.history);
+  const json = JSON.stringify(todos);
+  if (json === s.lastTodosJson) return;
+  s.lastTodosJson = json;
+  s.events.emit("todos", todos);
+}
+
 async function pumpEvents(s: RuntimeSession) {
   try {
     for await (const msg of s.q) {
@@ -1049,8 +1201,13 @@ async function pumpEvents(s: RuntimeSession) {
       // "interrupted" note stay correct — they just won't resurrect state below.
       if (s.interrupted && isStreamEvent) continue;
       if (!isStreamEvent) {
-        s.log.write(JSON.stringify(msg) + "\n");
+        appendEvent(s.id, s.seq++, msg);
         s.history.push(msg);
+        // Todo list only changes via tool calls in assistant messages. Re-derive
+        // from the full history and push a `todos` snapshot to live clients when
+        // it changes, so the task panel stays correct without the client having
+        // to load the entire (possibly very long) transcript.
+        if ((msg as { type?: string }).type === "assistant") maybeEmitTodos(s);
       }
       // Track per-token text so a client that joins mid-stream can be
       // seeded with the text that streamed before it connected. Mirrors
@@ -1097,8 +1254,16 @@ async function pumpEvents(s: RuntimeSession) {
       // A `result` event ends the turn. Use the state machine to determine
       // the next state based on whether the agent asked a question.
       if (msg.type === "result") {
-        const resultMsg = msg as { subtype?: string; error?: string };
-        // Check for error results
+        const resultMsg = msg as { subtype?: string; error?: string; is_error?: boolean };
+        // "error_during_execution" is a user interrupt, not a real error — the
+        // "[Request interrupted by user]" message the SDK emits covers it.
+        const isInterrupt = resultMsg.subtype === "error_during_execution";
+        // Check for error results — is_error covers rate limits (429) and other
+        // API errors where subtype may still be "success". Exclude interrupts.
+        const isError = !isInterrupt && (resultMsg.is_error || resultMsg.subtype === "error" || !!resultMsg.error);
+        // Only emit a system error event for explicit SDK errors (subtype=error or
+        // error field set). Rate limit results (is_error=true) are rendered directly
+        // by MessageStream from the result event — no separate system error needed.
         if (resultMsg.subtype === "error" || resultMsg.error) {
           const errorText = resultMsg.error ?? "Unknown error";
           s.events.emit("event", {
@@ -1110,16 +1275,27 @@ async function pumpEvents(s: RuntimeSession) {
         // A user interrupt already drove the session to "stopped"; don't let the
         // trailing result flip it back to idle/awaiting_input.
         if (!s.interrupted) {
-          const text = lastAssistantText(s.history);
-          const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
-          setState(s, stateAfterResult(isQuestion));
+          if (isError) {
+            setState(s, "error");
+          } else {
+            const text = lastAssistantText(s.history);
+            const isQuestion = /[?？]\s*['""')\]]*\s*$/.test(text.trim());
+            setState(s, stateAfterResult(isQuestion));
+          }
         }
-        // First completed turn → auto-title. The model can't reliably call
+        // First *successful* turn → auto-title. The model can't reliably call
         // set_session_title on turn 1 in the 1M-context Opus runtime (deferred
         // tools take a ToolSearch round-trip), so the workbench summarizes
         // turn 1 itself via a sub-query. Skipped if the title has already
         // been overridden (model or human) during the turn.
-        if (!s.autoTitleAttempted) {
+        //
+        // Only on a clean turn: an errored turn (e.g. rate/session limit, where
+        // subtype can still be "success" but is_error is set) or a user
+        // interrupt leaves autoTitleAttempted false so the next real turn gets
+        // to name the session. Otherwise the auto-title sub-query — which runs
+        // on the same account — also hits the limit and the SDK's error text
+        // ("You've hit your session limit…") leaks in as the title.
+        if (!isError && !s.interrupted && !s.autoTitleAttempted) {
           s.autoTitleAttempted = true;
           void autoTitleFromFirstTurn(s);
         }
@@ -1129,6 +1305,8 @@ async function pumpEvents(s: RuntimeSession) {
         if (s.state !== "running" && !s.interrupted) setState(s, "running");
       }
     }
+    // Query completed successfully — reset retry counter
+    s.retryAttempts = 0;
     // Only transition to "stopped" if the state machine allows it.
     // This prevents overwriting "idle" (completed) or "running" (resumed).
     if (canOverwriteWithStopped(s.state)) {
@@ -1150,18 +1328,58 @@ async function pumpEvents(s: RuntimeSession) {
     }
 
     console.error(`[session ${s.id}] Error in pumpEvents:`, errorMsg);
+
+    // Auto-retry for 529 (overloaded) errors with exponential backoff
+    const MAX_RETRIES = 3;
+    if (is529Error(errorMsg)) {
+      const attempts = (s.retryAttempts ?? 0) + 1;
+      s.retryAttempts = attempts;
+
+      if (attempts <= MAX_RETRIES) {
+        const delay = backoffDelay(attempts - 1);
+        const retryMsg = {
+          type: "system",
+          subtype: "info",
+          message: `API overloaded (529). Retrying in ${delay / 1000}s... (attempt ${attempts}/${MAX_RETRIES})`,
+        } as unknown as SDKMessage;
+        s.history.push(retryMsg);
+        appendEvent(s.id, s.seq++, retryMsg);
+        s.events.emit("event", retryMsg);
+
+        // Schedule retry after backoff delay
+        setTimeout(async () => {
+          try {
+            await retrySession(s.id);
+          } catch (err) {
+            console.error(`[session ${s.id}] Auto-retry failed:`, err);
+          }
+        }, delay);
+        return; // Don't set error state — retry is in progress
+      }
+      // Exceeded max retries — fall through to error state
+      const maxRetryMsg = `API overloaded (529). Max retries (${MAX_RETRIES}) exceeded. Use the Retry button to try again.`;
+      s.events.emit("event", {
+        type: "system",
+        subtype: "error",
+        message: maxRetryMsg,
+      } as unknown as SDKMessage);
+      appendEvent(s.id, s.seq++, { type: "system", subtype: "error", message: maxRetryMsg } as unknown as SDKMessage);
+      setState(s, "error");
+      return;
+    }
+
     s.events.emit("event", {
       type: "system",
       subtype: "error",
       message: errorMsg,
     } as unknown as SDKMessage);
-    s.log.write(JSON.stringify({ type: "system", subtype: "error", message: errorMsg }) + "\n");
+    appendEvent(s.id, s.seq++, { type: "system", subtype: "error", message: errorMsg } as unknown as SDKMessage);
     setState(s, "error");
   } finally {
-    // Don't close streams if session was resumed (new streams were created)
-    // or if it was cleanly stopped (interrupt already closed them or will)
+    // Don't close streams if session was resumed (a new inputLog was created)
+    // or if it was cleanly stopped (interrupt already closed them or will).
     if (s.state !== "running" && s.state !== "stopped") {
-      s.log.end();
+      void flushEvents(s.id);
       s.inputLog.end();
       // Mark the InputChannel closed too. sendInput uses this as its signal
       // that the SDK has gone away — without it, an input arriving here
@@ -1212,6 +1430,7 @@ async function autoTitleFromFirstTurn(s: RuntimeSession): Promise<void> {
       },
     });
     let text = "";
+    let subErrored = false;
     for await (const msg of sub) {
       if (msg.type === "assistant") {
         const parts = (msg as { message?: { content?: unknown } }).message?.content;
@@ -1221,9 +1440,15 @@ async function autoTitleFromFirstTurn(s: RuntimeSession): Promise<void> {
           }
         }
       } else if (msg.type === "result") {
+        // If the sub-query itself errored (e.g. it hit the same rate/session
+        // limit as the parent), `text` may hold the SDK's error message rather
+        // than a real title. Bail rather than rename the session to that.
+        const r = msg as { subtype?: string; error?: string; is_error?: boolean };
+        subErrored = !!(r.is_error || r.subtype === "error" || r.error);
         break;
       }
     }
+    if (subErrored) return;
     const title = text
       .trim()
       .split("\n")[0]
@@ -1242,7 +1467,11 @@ function lastAssistantText(history: SDKMessage[]): string {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
     if (m.type !== "assistant") continue;
-    const parts = (m as { message?: { content?: unknown } }).message?.content;
+    // Skip synthetic messages (e.g. rate-limit notices) — they're system-generated,
+    // not actual model output, and shouldn't be used for auto-titling or question detection.
+    const msg = m as { message?: { content?: unknown; model?: string }; error?: string };
+    if (msg.message?.model === "<synthetic>" || msg.error) continue;
+    const parts = msg.message?.content;
     if (!Array.isArray(parts)) return "";
     return (parts as Array<{ type?: string; text?: string }>)
       .filter((p) => p.type === "text" && typeof p.text === "string")
@@ -1387,7 +1616,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     }, null, 2),
   );
 
-  const log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
+  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
   const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
 
   const input = new InputChannel();
@@ -1441,6 +1670,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
     },
+    remote: { project: p.projectSlug, task: "" },
   });
 
   const now = new Date();
@@ -1458,9 +1688,9 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     q,
     input,
     events,
-    log,
     inputLog,
     history: [firstUserEcho],
+    seq: 0,
     streamingText: "",
     state: "running",
     pendingPermissions,
@@ -1476,7 +1706,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     autoTitleAttempted: false,
   };
   registerSession(session);
-  session.log.write(JSON.stringify(firstUserEcho) + "\n");
+  appendEvent(session.id, session.seq++, firstUserEcho);
   session.events.emit("event", firstUserEcho);
   void pumpEvents(session);
   return session;
@@ -1505,12 +1735,14 @@ export async function sendInput(id: string, text: string): Promise<boolean> {
   s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text }) + "\n");
   const msg = makeUserMessage(text, id);
   s.history.push(msg);
-  s.log.write(JSON.stringify(msg) + "\n");
+  appendEvent(s.id, s.seq++, msg);
   s.events.emit("event", msg);
   s.input.push(msg);
   s.lastActivity = new Date();
   // Sending a new message restarts a completed session — clear the sticky
   // completion flag so the UI flips back to "working" and out of "Completed".
+  // Also reset retry counter since this is fresh user input.
+  s.retryAttempts = 0;
   if (s.completed) {
     s.completed = false;
     void updateMeta(s, (meta) => { meta.completed = false; });
@@ -1594,7 +1826,7 @@ export async function sendInputWithFiles(
   // Log and emit the message
   s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: messageText, files }) + "\n");
   s.history.push(msg);
-  s.log.write(JSON.stringify(msg) + "\n");
+  appendEvent(s.id, s.seq++, msg);
   s.events.emit("event", msg);
   s.input.push(msg);
   s.lastActivity = new Date();
@@ -1687,7 +1919,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     }
 
     // Re-create log streams
-    s.log = createWriteStream(path.join(sessionDir, "events.jsonl"), { flags: "a" });
+    registerSessionLog(s.id, path.join(sessionDir, "events.jsonl"));
     s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
 
     // Create a new input channel
@@ -1705,7 +1937,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
           "doesn't remember it.",
       } as unknown as SDKMessage;
       s.history.push(notice);
-      s.log.write(JSON.stringify(notice) + "\n");
+      appendEvent(s.id, s.seq++, notice);
       s.events.emit("event", notice);
     }
 
@@ -1735,13 +1967,39 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         ...(s.model ? { model: s.model } : {}),
         ...(s.effort ? { effort: s.effort } : {}),
       },
+      remote: { project: s.projectSlug, task: s.taskSlug },
     });
+
+    // Check if there are pending tool_uses without tool_results.
+    // If so, inject synthetic tool_results first so the conversation is valid.
+    const pendingToolIds = findPendingToolUses(s.history);
+    if (pendingToolIds.length > 0) {
+      const toolResults = pendingToolIds.map(id => ({
+        type: "tool_result" as const,
+        tool_use_id: id,
+        content: "[Tool execution interrupted by server restart]",
+        is_error: true,
+      }));
+      const toolResultMsg = {
+        type: "user",
+        message: {
+          role: "user",
+          content: toolResults,
+        },
+        parent_tool_use_id: null,
+        session_id: s.id,
+      } as unknown as SDKUserMessage;
+      s.history.push(toolResultMsg);
+      appendEvent(s.id, s.seq++, toolResultMsg);
+      s.events.emit("event", toolResultMsg);
+      s.input.push(toolResultMsg);
+    }
 
     // Write the new message to logs
     s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: newMessage }) + "\n");
     const msg = makeUserMessage(newMessage, s.id);
     s.history.push(msg);
-    s.log.write(JSON.stringify(msg) + "\n");
+    appendEvent(s.id, s.seq++, msg);
     s.events.emit("event", msg);
 
     // Push the message to the input channel
@@ -1809,12 +2067,54 @@ export function forceStop(id: string): boolean {
     s.interrupted = true;
     setState(s, "stopped");
     s.input.close();
-    s.log.end();
+    forgetSession(s.id);
     s.inputLog.end();
     return true;
   } catch {
     return false;
   }
+}
+
+// Retry a session that's in error state. Re-sends the last user message
+// (if any) to restart the conversation. Returns true if retry started.
+export async function retrySession(id: string): Promise<boolean> {
+  const s = registry.get(id);
+  if (!s) return false;
+  if (s.state !== "error" && s.state !== "stopped") return false;
+
+  // Find the last user message to retry
+  let lastUserMessage = "";
+  for (let i = s.history.length - 1; i >= 0; i--) {
+    const msg = s.history[i] as { role?: string; content?: unknown };
+    if (msg.role === "user") {
+      const content = msg.content;
+      if (typeof content === "string") {
+        lastUserMessage = content;
+      } else if (Array.isArray(content)) {
+        // Handle content array (text blocks)
+        const textBlock = content.find((b: { type?: string }) => b.type === "text");
+        if (textBlock && typeof (textBlock as { text?: string }).text === "string") {
+          lastUserMessage = (textBlock as { text: string }).text;
+        }
+      }
+      break;
+    }
+  }
+
+  // Emit a system message noting the retry
+  const retryNotice = {
+    type: "system",
+    subtype: "info",
+    message: "Retrying after error...",
+  } as unknown as SDKMessage;
+  s.history.push(retryNotice);
+  appendEvent(s.id, s.seq++, retryNotice);
+  s.events.emit("event", retryNotice);
+
+  // Resume the session - sendInput handles the state transition
+  // If no user message found, just use an empty prompt to restart
+  const success = await sendInput(id, lastUserMessage || "continue");
+  return success;
 }
 
 // Mark a session as seen by updating its meta.json with a seenAt timestamp.
@@ -1981,7 +2281,7 @@ export async function deleteSession(
     // Session is stopped/idle/error — clean up streams and remove from registry
     try {
       liveSession.input.close();
-      liveSession.log.end();
+      forgetSession(liveSession.id);
       liveSession.inputLog.end();
     } catch {
       // Ignore stream cleanup errors
@@ -2025,7 +2325,7 @@ export function injectSystemMessage(id: string, message: string): boolean {
   } as unknown as SDKMessage;
 
   s.history.push(msg);
-  s.log.write(JSON.stringify(msg) + "\n");
+  appendEvent(s.id, s.seq++, msg);
   s.events.emit("event", msg);
   s.lastActivity = new Date();
 

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { handleComposerEnter } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
-import { TodoList, extractTodosFromMessages } from "./TodoList";
+import { TodoList, extractTodosFromMessages, type TodoItem } from "./TodoList";
 import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
 import { WorkingIndicator } from "./WorkingIndicator";
 import { useStickyDraft } from "./chat/useStickyDraft";
@@ -28,13 +28,27 @@ interface UploadedFile {
 // Number of messages to load initially and per batch
 const PAGE_SIZE = 50;
 
+interface Brief {
+  label: string;
+  overview: string;
+  details: string;
+}
+
 interface Props {
   session: SessionSummaryDTO;
   onChange: () => void;
   onBack: () => void;
+  brief?: Brief | null;
+  /**
+   * When true, Chat is embedded as a column inside the workspace layout. The
+   * host renders its own brief/header context; Chat drops the back button to
+   * the parent (project / task) and the inline brief banner.
+   */
+  embedded?: boolean;
 }
 
-export function Chat({ session, onChange, onBack }: Props) {
+export function Chat({ session, onChange, onBack, brief, embedded = false }: Props) {
+  const [showBriefDetails, setShowBriefDetails] = useState(false);
   const [messages, setMessages] = useState<SDKMessageLite[]>([]);
   const [state, setState] = useState<string>("idle");
   const [draft, setDraft] = useStickyDraft(session.id);
@@ -84,6 +98,12 @@ export function Chat({ session, onChange, onBack }: Props) {
   // suggestion is approved.
   const [completed, setCompletedState] = useState<boolean>(session.completed);
 
+  // Todo list pushed by the server, derived from the FULL session history. The
+  // chat transcript is paginated, so deriving todos from `messages` alone misses
+  // tool calls in older, not-yet-loaded messages. Prefer this when present; fall
+  // back to client-side derivation (e.g. if the SSE connection failed).
+  const [serverTodos, setServerTodos] = useState<TodoItem[] | null>(null);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -128,6 +148,7 @@ export function Chat({ session, onChange, onBack }: Props) {
 
   useEffect(() => {
     setMessages([]);
+    setServerTodos(null);
     setState(session.state);
     setStreamConnected(false);
     setHistoryMeta(null);
@@ -170,6 +191,15 @@ export function Chat({ session, onChange, onBack }: Props) {
       try {
         const meta = JSON.parse((ev as MessageEvent).data);
         setHistoryMeta(meta);
+      } catch { /* ignore */ }
+    });
+
+    // Server-derived todo list (computed over the full history). Replaces the
+    // client-side derivation so the task panel doesn't depend on how much of
+    // the transcript has been lazily loaded.
+    es.addEventListener("todos", (ev) => {
+      try {
+        setServerTodos(JSON.parse((ev as MessageEvent).data) as TodoItem[]);
       } catch { /* ignore */ }
     });
 
@@ -387,8 +417,11 @@ export function Chat({ session, onChange, onBack }: Props) {
   // Use streamConnected OR session.isLive to determine if we can interact
   const isLive = streamConnected || session.isLive;
 
-  // Extract todos from the message stream
-  const todos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+  // Prefer the server-derived todo list (computed over the FULL history);
+  // fall back to deriving from the loaded messages when the SSE didn't supply
+  // it (e.g. the connection dropped to the one-shot history fetch).
+  const derivedTodos = useMemo(() => extractTodosFromMessages(messages), [messages]);
+  const todos = serverTodos ?? derivedTodos;
 
   // Todo panel visibility (defaults to shown when there are todos)
   const [showTodos, setShowTodos] = useState(true);
@@ -539,12 +572,14 @@ export function Chat({ session, onChange, onBack }: Props) {
 
   return (
     <>
-      <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3">
+      <header className={`border-b border-[var(--border)] flex items-center ${embedded ? "min-h-10 px-3 gap-2 bg-[var(--bg-2)] shrink-0" : "h-14 px-6 gap-3"}`}>
         <button
           onClick={onBack}
-          className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"
-          title="Back to task"
-        >← Task</button>
+          className={embedded
+            ? "text-[var(--muted)] hover:text-[var(--text)] text-[14px] leading-none w-6 h-6 rounded hover:bg-[var(--panel-2)] flex items-center justify-center shrink-0"
+            : "text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"}
+          title={embedded ? "Collapse chat" : "Back to task"}
+        >{embedded ? "×" : "← Task"}</button>
         <div className="flex-1 min-w-0">
           {isRenaming ? (
             <input
@@ -561,9 +596,29 @@ export function Chat({ session, onChange, onBack }: Props) {
               }}
               className="text-[14px] w-full bg-[var(--panel)] border border-[var(--accent)] rounded px-2 py-0.5 outline-none"
             />
+          ) : embedded ? (
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[13px] truncate">{session.title || "(empty)"}</span>
+              <span
+                className={`text-[11px] shrink-0 inline-flex items-center gap-1 ${isPending ? "pulse" : ""}`}
+                style={{ color: stateColor }}
+                title={stateLabel}
+              >
+                {isWorking ? (
+                  <WorkingIndicator size={9} title="Working" />
+                ) : completed ? (
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                ) : (
+                  <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: stateColor }} />
+                )}
+              </span>
+            </div>
           ) : (
             <div className="text-[14px] truncate">{session.title || "(empty)"}</div>
           )}
+          {!embedded && (
           <div className="text-[11.5px] text-[var(--muted)] flex items-center gap-1.5">
             <span>{session.projectSlug}{session.taskSlug ? ` · ${session.taskSlug}` : ""}</span>
             <span>·</span>
@@ -616,15 +671,10 @@ export function Chat({ session, onChange, onBack }: Props) {
               </>
             )}
           </div>
+          )}
         </div>
-        {/* Mark complete / Reopen button — always available so the human can
-            flip the flag without waiting for the agent to suggest it. */}
-        {!isRenaming && (
-          <CompleteToggleButton
-            session={session}
-            completed={completed}
-          />
-        )}
+        {/* Mark complete / Reopen lives in the composer now (next to the
+            interrupt button), so it's not in the header anymore. */}
         {/* Session menu for stopped sessions */}
         {canManageSession && !isRenaming && (
           <div className="relative">
@@ -658,6 +708,41 @@ export function Chat({ session, onChange, onBack }: Props) {
           </div>
         )}
       </header>
+
+      {!embedded && brief && (brief.overview || brief.details) && (
+        <div className="border-b border-[var(--border)] bg-[var(--panel)] px-6 py-3 shrink-0">
+          <div className="max-w-[760px] mx-auto">
+            <div className="flex items-start gap-3">
+              <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-medium pt-1 shrink-0">
+                {brief.label}
+              </div>
+              <div className="flex-1 min-w-0">
+                {brief.overview && (
+                  <div className="text-[13px] leading-relaxed text-[var(--text)]">
+                    {brief.overview}
+                  </div>
+                )}
+                {brief.details && (
+                  <>
+                    <button
+                      onClick={() => setShowBriefDetails((s) => !s)}
+                      className="text-[11px] text-[var(--muted)] hover:text-[var(--text)] inline-flex items-center gap-1 mt-1"
+                    >
+                      <span>{showBriefDetails ? "▾" : "▸"}</span>
+                      <span>{showBriefDetails ? "Hide details" : "Show details"}</span>
+                    </button>
+                    {showBriefDetails && (
+                      <div className="text-[var(--text-soft)] text-[12.5px] pt-1 max-h-[280px] overflow-y-auto">
+                        <Markdown text={brief.details} />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <div className="max-w-[760px] mx-auto px-6 py-8 space-y-5">
@@ -816,23 +901,33 @@ export function Chat({ session, onChange, onBack }: Props) {
                   onClick={send}
                   disabled={(!draft.trim() && attachments.length === 0) || sending || uploading}
                   className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-                  title="Send (↵)"
+                  title="Send message (↵)"
+                  aria-label="Send message"
                 >{uploading ? "…" : "↑"}</button>
                 {isWorking && (
                   <button
                     onClick={stop}
                     className="rounded-lg border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[#dc2626] hover:border-[#dc2626] w-9 h-9 flex items-center justify-center transition shrink-0"
-                    title="Stop"
+                    title="Interrupt the agent (stop the current turn)"
+                    aria-label="Interrupt the agent"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                       <rect x="6" y="6" width="12" height="12" rx="2" />
                     </svg>
                   </button>
                 )}
+                {!isRenaming && (
+                  <CompleteToggleButton session={session} completed={completed} variant="icon" />
+                )}
               </div>
             </FileDropZone>
           ) : (
-            <ContinueComposer session={session} draft={draft} setDraft={setDraft} />
+            <ContinueComposer
+              session={session}
+              draft={draft}
+              setDraft={setDraft}
+              completeButton={!isRenaming ? <CompleteToggleButton session={session} completed={completed} variant="icon" /> : null}
+            />
           )}
         </div>
       </div>
