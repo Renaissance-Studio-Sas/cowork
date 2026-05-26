@@ -42,7 +42,9 @@ interface Entry {
 }
 
 function iconForFile(p: string): string {
-  const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  const lower = p.toLowerCase();
+  if (lower.endsWith(".emlthread.json")) return "📧";
+  const ext = lower.split(".").pop() ?? "";
   if (["md", "markdown", "txt"].includes(ext)) return "📄";
   if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "🖼";
   if (ext === "pdf") return "📕";

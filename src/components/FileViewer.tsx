@@ -16,6 +16,7 @@ import { buildEnhancedHtml } from "@/lib/iframe-enhancer";
 import { resolveRelative } from "@/lib/relative-path";
 import { AgentPanel } from "./AgentPanel";
 import { ChatPanel } from "./ChatPanel";
+import { EmailThreadViewer, type ThreadRecord } from "./EmailThreadViewer";
 import { Resizer } from "./Resizer";
 import { handleComposerEnter } from "@/lib/composer";
 import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute, saveTaskPath } from "@/lib/routes";
@@ -127,11 +128,12 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const ext = extOf(filePath);
+  const isEmailThread = filePath.toLowerCase().endsWith(".emlthread.json");
   const isImage = IMAGE_EXT.has(ext);
   const isPdf = ext === "pdf";
   const isHtml = ext === "html" || ext === "htm";
   const isMd = ext === "md" || ext === "markdown";
-  const isText = TEXT_EXT.has(ext);
+  const isText = TEXT_EXT.has(ext) && !isEmailThread;
   const supportsComments = isMd || isHtml;
   const rawUrl = `/api/files/raw?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`;
 
@@ -574,6 +576,17 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
   const liveCount = resolvedComments.filter((c) => !c.obsolete).length;
   const obsoleteCount = resolvedComments.filter((c) => c.obsolete).length;
 
+  const thread = useMemo<ThreadRecord | null>(() => {
+    if (!isEmailThread || text == null) return null;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.messages)) {
+        return parsed as ThreadRecord;
+      }
+    } catch { /* fall through to raw view */ }
+    return null;
+  }, [isEmailThread, text]);
+
   return (
     <>
       {!embedded && (
@@ -636,7 +649,14 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
 
       <div className="flex-1 min-h-0 flex">
         {/* Iframe-style viewers fill the available area without page scroll */}
-        {isHtml && text !== null ? (
+        {isEmailThread && thread ? (
+          <EmailThreadViewer
+            thread={thread}
+            filePath={filePath}
+            projectSlug={projectSlug}
+            taskSlug={taskSlug}
+          />
+        ) : isHtml && text !== null ? (
           <div className="flex-1 min-w-0 flex flex-col p-4">
             <iframe
               ref={iframeRef}
@@ -681,7 +701,16 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
                 <pre className="text-[12.5px] bg-[var(--panel-2)] border border-[var(--border)] rounded-xl p-4 overflow-x-auto whitespace-pre-wrap break-words">{text}</pre>
               )}
 
-              {!isImage && !isPdf && !isHtml && !isMd && !isText && (
+              {isEmailThread && text !== null && !thread && (
+                <div className="space-y-2">
+                  <div className="text-[12.5px] text-[#dc2626]">
+                    Could not parse this file as an email thread (expected JSON with a <code>messages</code> array). Showing raw contents.
+                  </div>
+                  <pre className="text-[12.5px] bg-[var(--panel-2)] border border-[var(--border)] rounded-xl p-4 overflow-x-auto whitespace-pre-wrap break-words">{text}</pre>
+                </div>
+              )}
+
+              {!isImage && !isPdf && !isHtml && !isMd && !isText && !isEmailThread && (
                 <div className="text-[13px] text-[var(--muted)]">
                   No preview for <span className="font-mono">.{ext}</span> files.{" "}
                   <a href={rawUrl} download className="text-[var(--accent)] hover:underline">Download</a>.
