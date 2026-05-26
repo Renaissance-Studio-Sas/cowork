@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wrangler/
+# Local secrets — never commit (holds API_TOKEN etc.)
+.dev.vars
+.dev.vars.*
+*.log
+.DS_Store

@@ -1,0 +1,8 @@
+{
+  "name": "cloud-browser-cf-agent",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}
