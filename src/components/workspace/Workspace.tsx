@@ -383,7 +383,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   };
 
   const commitRename = async () => {
-    if (!renamingPath || !taskSlug) {
+    if (!renamingPath) {
       setRenamingPath(null);
       return;
     }
@@ -399,7 +399,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     const res = await fetch(`/api/files`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: projectSlug, task: taskSlug, from: renamingPath.path, to: newPath }),
+      body: JSON.stringify({ project: projectSlug, task: taskSlug ?? "", from: renamingPath.path, to: newPath }),
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
@@ -411,12 +411,11 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   };
 
   const deleteEntry = async (e: Entry) => {
-    if (!taskSlug) return;
     if (!confirm(e.type === "folder"
       ? `Delete folder "${e.name}" and everything in it?`
       : `Delete "${e.name}"?`)) return;
     const r = await fetch(
-      `/api/files?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(e.path)}`,
+      `/api/files?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug ?? "")}&path=${encodeURIComponent(e.path)}`,
       { method: "DELETE" },
     );
     if (!r.ok) {
@@ -428,9 +427,9 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   };
 
   const openEntryContextMenu = (e: React.MouseEvent, entry: Entry) => {
-    if (!taskSlug) return;
     e.preventDefault();
-    if (entry.type === "file" && entry.path === "task.json") return;
+    const briefName = taskSlug ? "task.json" : "project.json";
+    if (entry.type === "file" && entry.path === briefName) return;
     const items: MenuItem[] = [
       { label: "Rename", onClick: () => startRename(entry) },
       { label: "Delete", danger: true, onClick: () => deleteEntry(entry) },

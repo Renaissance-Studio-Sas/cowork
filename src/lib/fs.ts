@@ -566,6 +566,32 @@ export async function projectDirFor(projectSlug: string): Promise<string> {
   return projectDir(project);
 }
 
+export async function renameProjectFile(projectSlug: string, from: string, to: string): Promise<void> {
+  const project = await getProject(projectSlug);
+  if (!project) throw new Error("not found");
+  if (from === PROJECT_BRIEF_FILENAME) throw new Error(`${PROJECT_BRIEF_FILENAME} cannot be renamed`);
+  if (!to.trim()) throw new Error("destination required");
+  const base = path.join(projectDir(project), "files");
+  const src = ensureSafePath(base, from);
+  const dst = ensureSafePath(base, to);
+  try { await fs.access(dst); throw new Error(`${to} already exists`); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      if ((err as Error).message?.includes("already exists")) throw err;
+    }
+  }
+  await fs.mkdir(path.dirname(dst), { recursive: true });
+  await fs.rename(src, dst);
+}
+
+export async function deleteProjectFile(projectSlug: string, rel: string): Promise<void> {
+  const project = await getProject(projectSlug);
+  if (!project) throw new Error("not found");
+  if (rel === PROJECT_BRIEF_FILENAME) throw new Error(`${PROJECT_BRIEF_FILENAME} cannot be deleted`);
+  const base = path.join(projectDir(project), "files");
+  const full = ensureSafePath(base, rel);
+  await fs.rm(full, { recursive: true, force: true });
+}
+
 export async function renameFile(projectSlug: string, taskSlug: string, from: string, to: string): Promise<void> {
   const project = await getProject(projectSlug);
   const task = project?.tasks.find((t) => t.slug === taskSlug);

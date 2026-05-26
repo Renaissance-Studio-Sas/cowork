@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
-import { deleteFile, readFileText, renameFile, writeFileText, readProjectFileText } from "@/lib/fs";
+import {
+  deleteFile, deleteProjectFile, readFileText, readProjectFileText,
+  renameFile, renameProjectFile, writeFileText,
+} from "@/lib/fs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,11 +41,15 @@ export async function PUT(req: Request) {
 export async function PATCH(req: Request) {
   const body = await req.json();
   const { project, task, from, to } = body ?? {};
-  if (!project || !task || !from || !to) {
-    return NextResponse.json({ error: "project, task, from, to required" }, { status: 400 });
+  if (!project || !from || !to) {
+    return NextResponse.json({ error: "project, from, to required" }, { status: 400 });
   }
   try {
-    await renameFile(project, task, from, to);
+    if (task) {
+      await renameFile(project, task, from, to);
+    } else {
+      await renameProjectFile(project, from, to);
+    }
     return NextResponse.json({ ok: true, path: to });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 400 });
@@ -54,11 +61,15 @@ export async function DELETE(req: Request) {
   const project = url.searchParams.get("project");
   const task = url.searchParams.get("task");
   const file = url.searchParams.get("path");
-  if (!project || !task || !file) {
-    return NextResponse.json({ error: "project, task, path required" }, { status: 400 });
+  if (!project || !file) {
+    return NextResponse.json({ error: "project, path required" }, { status: 400 });
   }
   try {
-    await deleteFile(project, task, file);
+    if (task) {
+      await deleteFile(project, task, file);
+    } else {
+      await deleteProjectFile(project, file);
+    }
     return NextResponse.json({ ok: true });
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 400 });
