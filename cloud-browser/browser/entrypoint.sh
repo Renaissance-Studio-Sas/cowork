@@ -10,6 +10,14 @@ VIEWPORT_HEIGHT="${VIEWPORT_HEIGHT:-800}"
 # Clear any stale Chrome singleton lock (a previous container died uncleanly)
 rm -f /profile/Singleton* 2>/dev/null || true
 
+# Persist gnome-keyring DB inside /profile so it's saved/restored alongside
+# the rest of the profile. gnome-keyring stores its data under
+# $XDG_DATA_HOME/keyrings/, defaulting to ~/.local/share/keyrings/. Pointing
+# XDG_DATA_HOME inside /profile means the keyring lives in the profile bind
+# mount and survives container restarts.
+export XDG_DATA_HOME=/profile/xdg-data
+mkdir -p "$XDG_DATA_HOME/keyrings"
+
 # Symlink Chrome's downloadable component caches from /opt/chrome-shared,
 # which the MCP server bind-mounts (read-write) from SHARED_COMPONENTS_DIR
 # on the host. The MCP pre-creates each subdir before spawning so the symlink
@@ -107,14 +115,32 @@ XMSG_KILLER_PID=$!
 websockify --web=/usr/share/novnc 6080 localhost:5900 &
 NOVNC_PID=$!
 
-# Chromium v108+ silently binds CDP to 127.0.0.1 only, ignoring
+# Chrome v108+ silently binds CDP to 127.0.0.1 only, ignoring
 # --remote-debugging-address. socat forwards container-external 9223 to it.
-# Started in the background: it'll retry until chromium binds 9222.
+# Started in the background: it'll retry until chrome binds 9222.
 (
   until curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; do sleep 0.1; done
   exec socat -d tcp-listen:9223,fork,reuseaddr tcp:127.0.0.1:9222
 ) &
 SOCAT_PID=$!
+
+# Start a session dbus daemon — gnome-keyring needs it to advertise the
+# Secret Service over the bus. dbus-launch prints VAR=value lines we eval
+# into this shell so children (gnome-keyring, chrome) inherit them.
+eval "$(dbus-launch --sh-syntax)"
+
+# Start gnome-keyring with an empty unlock password. There's no real security
+# boundary inside this container — the point of the keyring isn't to gate
+# access, it's to give Chrome a stable, persistent encryption key for cookies
+# and saved passwords so they decrypt cleanly after a container restart.
+#   --unlock      : read the password from stdin and unlock (or create) the
+#                   default "login" keyring. Empty password → empty unlock.
+#   --components  : enable just the Secret Service component (no SSH agent,
+#                   no PKCS#11 — Chrome only needs Secret Service).
+#   --start       : daemonize and print env vars (GNOME_KEYRING_CONTROL,
+#                   DBUS_SESSION_BUS_ADDRESS …) we eval into the shell.
+printf '\n' | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+eval "$(printf '\n' | gnome-keyring-daemon --start --components=secrets 2>/dev/null)"
 
 # Chrome window sizing is delegated to fluxbox (see the apps config above:
 # [Maximized] {yes} for every window). Fluxbox keeps chrome maximized at boot
@@ -130,18 +156,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Run chromium as PID 1 (well, child of tini) so docker stop signals reach it.
+# Run Chrome as PID 1 (well, child of tini) so docker stop signals reach it.
 #
 # --test-type suppresses the yellow "You are using an unsupported command-line
 # flag: --no-sandbox" infobar that otherwise covers the top of the viewport.
 # Trade-off: a few anti-bot heuristics can detect the test-type marker. If a
-# target site flakes on that, the cleaner long-term fix is to run chromium as
+# target site flakes on that, the cleaner long-term fix is to run chrome as
 # a non-root user (in which case --no-sandbox stops being necessary).
+#
+# --password-store=gnome-libsecret routes cookie/password encryption through
+# the gnome-keyring Secret Service we started above. The keyring DB lives in
+# $XDG_DATA_HOME/keyrings and is part of the persisted profile, so encrypted
+# state stays decryptable across container restarts.
 #
 # --start-maximized + fluxbox makes chrome fill the current screen; when the
 # Xvnc framebuffer later resizes (client-requested via embed.html), fluxbox
 # re-maximizes the chrome window so the page re-layouts at the new size.
-exec chromium \
+exec google-chrome-stable \
   --no-sandbox \
   --test-type \
   --disable-gpu \
@@ -149,6 +180,7 @@ exec chromium \
   --remote-debugging-port=9222 \
   --remote-debugging-address=0.0.0.0 \
   --user-data-dir=/profile \
+  --password-store=gnome-libsecret \
   --no-first-run \
   --no-default-browser-check \
   --disable-features=Translate \

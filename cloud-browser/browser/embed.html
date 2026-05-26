@@ -42,23 +42,37 @@
   // RFB.js already listens for window resize and sends new ExtendedDesktopSize
   // requests when resizeSession is true — nothing extra needed here.
 
-  // ── Local → remote clipboard paste ────────────────────────────────────────
-  // noVNC forwards the raw keystroke (Cmd+V on Mac → Meta+V on the remote),
-  // which Linux Chrome ignores for paste. So we capture the paste, push the
-  // text into the remote VNC clipboard, then synthesize Ctrl+V on the remote
-  // so Linux Chrome actually performs the paste.
+  // ── Mac → Linux keyboard translation ──────────────────────────────────────
+  // The remote is Linux Chrome, which uses Ctrl for shortcuts. Mac users
+  // expect Cmd. Forwarding Cmd+V raw lands as Meta+V on the remote and gets
+  // ignored. So on Mac clients we intercept Cmd-shortcuts here and synthesize
+  // the Ctrl-equivalent on the remote.
   //
-  // We listen for the native `paste` event rather than calling
-  // navigator.clipboard.readText(): the event's clipboardData is provided
-  // by the browser as part of the user gesture, with no Clipboard API
-  // permission required, so it works even when the page is nested inside
-  // iframes that don't delegate the `clipboard-read` Permissions Policy.
+  // Paste is a special case in both directions — local and remote clipboards
+  // are separate processes, so we also bridge the actual clipboard text.
+  const isMacClient = /Mac/i.test(navigator.platform || "");
   const KS_CONTROL_L = 0xffe3;
-  const KS_V = 0x76;
+  const KS_SHIFT_L   = 0xffe1;
+  const KS_ALT_L     = 0xffe9;
+  const KS_V         = 0x76;
+
+  // X11 keysyms for keys whose name doesn't equal their char code.
+  const NAMED_KEYSYM = {
+    Enter: 0xff0d, Backspace: 0xff08, Tab: 0xff09, Escape: 0xff1b,
+    ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+    Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+    Delete: 0xffff, Insert: 0xff63, " ": 0x20,
+  };
+  function keysymFromKey(key) {
+    if (!key) return null;
+    if (key.length === 1) return key.toLowerCase().charCodeAt(0);
+    return NAMED_KEYSYM[key] ?? null;
+  }
 
   function forwardPasteText(text) {
     if (!text) return;
     rfb.clipboardPasteFrom(text);
+    // Tiny delay so the server has staged the clipboard before we send Ctrl+V.
     setTimeout(() => {
       rfb.sendKey(KS_CONTROL_L, "ControlLeft", true);
       rfb.sendKey(KS_V, "KeyV", true);
@@ -67,11 +81,10 @@
     }, 30);
   }
 
-  // Make body focusable + grab focus so paste events have a target. Without
-  // this, Chrome may not fire `paste` because there's no editable target.
-  document.body.tabIndex = -1;
-  document.addEventListener("click", () => document.body.focus(), true);
-
+  // Native paste event — works without any Clipboard API permission, but
+  // only fires when the page has a focusable paste target. noVNC keeps focus
+  // on its canvas (so typing reaches the remote), so this rarely fires —
+  // the keydown handler below is the primary paste path.
   document.addEventListener("paste", (e) => {
     const text = e.clipboardData?.getData("text/plain");
     if (!text) return;
@@ -79,22 +92,56 @@
     forwardPasteText(text);
   }, true);
 
-  // Fallback: some browsers/configurations don't fire `paste` outside of
-  // editable elements. Catch Cmd/Ctrl+V via keydown and try the Clipboard
-  // API — works when the Permissions Policy delegates clipboard-read.
-  window.addEventListener("keydown", async (e) => {
+  window.addEventListener("keydown", (e) => {
+    // Cmd+V or Ctrl+V — bridge local clipboard to remote. Synchronously
+    // preventDefault so noVNC doesn't also forward Meta+V raw, which would
+    // race the synthesized Ctrl+V we send from the async clipboard read.
     const isPaste =
-      (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === "v" || e.key === "V");
-    if (!isPaste) return;
-    try {
-      const text = await navigator.clipboard.readText();
-      if (!text) return;
+      (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey &&
+      (e.key === "v" || e.key === "V");
+    if (isPaste) {
       e.preventDefault();
       e.stopPropagation();
-      forwardPasteText(text);
-    } catch (err) {
-      // Permission-Policy blocked or user denied; paste event handler above
-      // should have already handled it if the gesture went through.
+      navigator.clipboard.readText().then((t) => {
+        if (t) forwardPasteText(t);
+      }).catch(() => {
+        // Permissions-Policy may block readText in some embeds; the native
+        // `paste` event handler above is the primary path and should fire.
+      });
+      return;
+    }
+
+    if (!isMacClient) return;
+
+    // Swallow the bare Meta key so the remote doesn't see a stuck modifier.
+    if (e.key === "Meta") {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Cmd + <other key> — translate to remote Ctrl + <other key>.
+    if (e.metaKey && !e.ctrlKey) {
+      const ksym = keysymFromKey(e.key);
+      if (ksym === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      rfb.sendKey(KS_CONTROL_L, "ControlLeft", true);
+      if (e.shiftKey) rfb.sendKey(KS_SHIFT_L, "ShiftLeft", true);
+      if (e.altKey)   rfb.sendKey(KS_ALT_L,   "AltLeft",   true);
+      rfb.sendKey(ksym, e.code, true);
+      rfb.sendKey(ksym, e.code, false);
+      if (e.altKey)   rfb.sendKey(KS_ALT_L,   "AltLeft",   false);
+      if (e.shiftKey) rfb.sendKey(KS_SHIFT_L, "ShiftLeft", false);
+      rfb.sendKey(KS_CONTROL_L, "ControlLeft", false);
+    }
+  }, true);
+
+  window.addEventListener("keyup", (e) => {
+    // Mirror the keydown swallow so the bare Meta keyup doesn't leak either.
+    if (isMacClient && e.key === "Meta") {
+      e.preventDefault();
+      e.stopPropagation();
     }
   }, true);
 
