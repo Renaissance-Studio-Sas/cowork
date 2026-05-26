@@ -351,10 +351,13 @@ if (!globalThis.__wb_reconciled) {
   setImmediate(async () => {
     // Always run reconciliation — it's idempotent and cheap.
     await reconcileSessionsOnDisk();
-    // Resume sessions that were mid-process when the server died. The
-    // function itself checks whether each session is already in the
-    // registry (preserved via globalThis during HMR) and skips those,
-    // so we don't need the isColdStart() gate here anymore.
+    // Resume only on a real cold start. The registry-skip inside
+    // autoResumeRunningSessions isn't enough on its own: in Next.js dev
+    // this module can be re-evaluated in a fresh VM context whose
+    // globalThis isn't shared (see the comment block above), and that
+    // fresh context has an empty registry too — so every churn would
+    // otherwise push a "[Server restarted...]" prompt into live sessions.
+    if (!isColdStart()) return;
     await autoResumeRunningSessions();
   });
 }
@@ -1078,7 +1081,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // connect/disconnect) wrapped for Claude here. Gemini's runtime
       // adapter consumes workbenchToolGroups instead, registering them
       // into gemini-cli-core's ToolRegistry.
-      mcpServers: buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
+      mcpServers: await buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
       runtimeStateDir: sessionDir,
       systemPrompt,
@@ -1663,7 +1666,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       settingSources: ["project", "user"],
       canUseTool: buildCanUseTool(pendingPermissions, events),
       toolAliases: STATIC_TOOL_ALIASES,
-      mcpServers: { ...buildStaticWorkbenchMcps(id, p.projectSlug, ""), ...planningMcps },
+      mcpServers: { ...(await buildStaticWorkbenchMcps(id, p.projectSlug, "")), ...planningMcps },
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
       runtimeStateDir: sessionDir,
       systemPrompt,
@@ -1712,9 +1715,24 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   return session;
 }
 
-export async function sendInput(id: string, text: string): Promise<boolean> {
+// Wrap the user's text with a hidden <system-reminder> note about the artifact
+// currently open in their workspace. The UI strips the tag from the rendered
+// user bubble; the agent still sees it as part of the message content.
+export const OPEN_ARTIFACT_TAG = "system-reminder";
+function withOpenArtifactNote(text: string, artifactPath: string): string {
+  const note = `<${OPEN_ARTIFACT_TAG}>The user currently has the artifact "${artifactPath}" open in their workspace.</${OPEN_ARTIFACT_TAG}>`;
+  return text ? `${note}\n\n${text}` : note;
+}
+
+export async function sendInput(id: string, text: string, openArtifact?: string): Promise<boolean> {
   const s = registry.get(id);
   if (!s) return false;
+
+  // Prepend a hidden <system-reminder> when an artifact is open in the user's
+  // workspace, so the agent knows which file the user is looking at without
+  // them having to repeat it. The Chat UI strips this tag from the user
+  // bubble (see MessageStream).
+  const augmented = openArtifact ? withOpenArtifactNote(text, openArtifact) : text;
 
   // Route to resumeSession when the SDK is no longer consuming input. The
   // nominal state isn't sufficient: the SDK process can die unexpectedly
@@ -1725,15 +1743,15 @@ export async function sendInput(id: string, text: string): Promise<boolean> {
   // appear alive but never produce events.
   const sdkDead = s.input.isClosed() || s.state === "stopped" || s.state === "error";
   if (sdkDead) {
-    return resumeSession(s, text);
+    return resumeSession(s, augmented);
   }
 
   // The SDK doesn't echo typed user messages in streaming-input mode, so we
   // surface them ourselves: write to inputLog, push into the input channel
   // for the agent to receive, and also append to history + emit on the event
   // bus so the UI renders the bubble.
-  s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text }) + "\n");
-  const msg = makeUserMessage(text, id);
+  s.inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmented }) + "\n");
+  const msg = makeUserMessage(augmented, id);
   s.history.push(msg);
   appendEvent(s.id, s.seq++, msg);
   s.events.emit("event", msg);
@@ -1766,7 +1784,8 @@ export async function sendInputWithFiles(
   text: string,
   files: FileAttachmentInfo[],
   projectSlug: string,
-  taskSlug: string
+  taskSlug: string,
+  openArtifact?: string
 ): Promise<boolean> {
   const s = registry.get(id);
   if (!s) return false;
@@ -1782,6 +1801,9 @@ export async function sendInputWithFiles(
       .map((f) => `[Attached file: ${f.path}]`)
       .join("\n");
     messageText = `${fileRefs}\n\n${text}`;
+  }
+  if (openArtifact) {
+    messageText = withOpenArtifactNote(messageText, openArtifact);
   }
 
   // Route to resumeSession when the SDK is no longer consuming input — same
@@ -1960,7 +1982,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         toolAliases: STATIC_TOOL_ALIASES,
-        mcpServers: buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
+        mcpServers: await buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
         runtimeStateDir: sessionDir,
         systemPrompt,

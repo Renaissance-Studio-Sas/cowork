@@ -1,10 +1,14 @@
 import { getSession, restoreSession } from "@/lib/sessions";
 import { extractTodosFromMessages } from "@/lib/todos";
+import { isVisibleSDKMessage } from "@/components/chat/utils";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Default number of recent messages to send on initial connection
+// Default number of recent VISIBLE messages to send on initial connection.
+// Visible = rendered as a bubble/card/pill — tool calls (chips) and
+// tool_result echoes (hidden) don't count, otherwise tool-heavy turns would
+// send a 50-event page that renders almost nothing.
 const INITIAL_MESSAGE_LIMIT = 50;
 
 export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -42,16 +46,29 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         safeEnqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
 
-      // Replay recent history so new clients see the transcript.
-      // Send metadata first so client knows total count and can load more.
-      const total = s.history.length;
-      const startIdx = Math.max(0, total - initialLimit);
-      const initialHistory = s.history.slice(startIdx);
-      const hasMore = startIdx > 0;
+      // Replay recent history so new clients see the transcript. Pagination
+      // is by visible-message count (see fileRead in cloud-events.ts): walk
+      // back from the end including every event, until `initialLimit` visible
+      // messages have been collected.
+      const history = s.history;
+      const total = history.reduce<number>((n, e) => n + (isVisibleSDKMessage(e) ? 1 : 0), 0);
+      let startIdx = history.length;
+      let visibleSeen = 0;
+      while (startIdx > 0 && visibleSeen < initialLimit) {
+        startIdx--;
+        if (isVisibleSDKMessage(history[startIdx])) visibleSeen++;
+      }
+      let hasMore = false;
+      for (let k = startIdx - 1; k >= 0; k--) {
+        if (isVisibleSDKMessage(history[k])) { hasMore = true; break; }
+      }
+      const initialHistory = history.slice(startIdx);
 
       sendEvent("state", { state: s.state });
-      // Send history metadata so client can implement "load more"
-      sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: total - initialHistory.length });
+      // Send history metadata so client can implement "load more". `total` is
+      // visible-only; `loaded` is event-count for the page (matches client
+      // `messages.length`, used as `offset` on the next load-more request).
+      sendEvent("history_meta", { total, loaded: initialHistory.length, hasMore, offset: history.length - initialHistory.length });
       // Derive the todo list from the FULL history (not the truncated initial
       // window) and send it as a snapshot. The chat transcript is paginated, so
       // a client deriving todos from only the loaded messages would miss any

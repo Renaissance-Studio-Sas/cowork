@@ -13,11 +13,18 @@ export function ContinueComposer({
   session,
   draft,
   setDraft,
+  openArtifactPath,
   completeButton,
 }: {
   session: SessionSummaryDTO;
   draft: string;
   setDraft: (v: string) => void;
+  /**
+   * Path of the artifact currently open in the workspace's other column.
+   * Forwarded to the input endpoint so the agent gets a system-reminder
+   * about which file the user is looking at.
+   */
+  openArtifactPath?: string;
   /** Optional mark-complete/reopen control rendered next to the resume button. */
   completeButton?: ReactNode;
 }) {
@@ -41,6 +48,7 @@ export function ContinueComposer({
           message: draft.trim(),
           projectSlug: session.projectSlug,
           taskSlug: session.taskSlug,
+          openArtifact: openArtifactPath || undefined,
         }),
       });
       const j = await r.json();

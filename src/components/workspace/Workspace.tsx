@@ -732,6 +732,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
             project={project}
             expanded={chatExpanded}
             expandedSession={expandedSession}
+            openArtifactPath={artifactExpanded ? artifactPath : undefined}
             sessions={sortedSessions}
             renamingSession={renamingSession}
             sessionRenameValue={sessionRenameValue}
@@ -911,8 +912,6 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
             projectSlug={projectSlug}
             taskSlug={taskSlug ?? ""}
             filePath={artifactPath}
-            onBack={onCloseArtifact}
-            embedded
           />
         </div>
       </>
@@ -1046,6 +1045,8 @@ interface SessionsColumnProps {
   project: ProjectDTO;
   expanded: boolean;
   expandedSession: SessionSummaryDTO | null;
+  /** Artifact path open in the other column, if any — forwarded to Chat. */
+  openArtifactPath?: string;
   sessions: SessionSummaryDTO[];
   renamingSession: string | null;
   sessionRenameValue: string;
@@ -1068,7 +1069,7 @@ interface SessionsColumnProps {
 
 function SessionsColumn(props: SessionsColumnProps) {
   const {
-    projectSlug, taskSlug, project, expanded, expandedSession, sessions,
+    projectSlug, taskSlug, project, expanded, expandedSession, openArtifactPath, sessions,
     renamingSession, sessionRenameValue,
     onSessionRenameValue, onSessionRenameCommit, onSessionRenameCancel,
     onSessionContextMenu, onOpenSession, onCloseSession, onChange,
@@ -1085,6 +1086,7 @@ function SessionsColumn(props: SessionsColumnProps) {
         onChange={onChange}
         onBack={onCloseSession}
         embedded
+        openArtifactPath={openArtifactPath}
       />
     );
   }

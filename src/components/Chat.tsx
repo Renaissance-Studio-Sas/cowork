@@ -8,6 +8,7 @@ import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDrop
 import { WorkingIndicator } from "./WorkingIndicator";
 import { useStickyDraft } from "./chat/useStickyDraft";
 import { MessageStream } from "./chat/MessageStream";
+import { isVisibleSDKMessage } from "./chat/utils";
 import { Markdown } from "./chat/Markdown";
 import {
   PlanApprovalCard,
@@ -45,9 +46,15 @@ interface Props {
    * the parent (project / task) and the inline brief banner.
    */
   embedded?: boolean;
+  /**
+   * Path of the artifact currently open in the workspace's other column.
+   * Passed through to the input endpoint so the agent knows which file the
+   * user is looking at when they post a message.
+   */
+  openArtifactPath?: string;
 }
 
-export function Chat({ session, onChange, onBack, brief, embedded = false }: Props) {
+export function Chat({ session, onChange, onBack, brief, embedded = false, openArtifactPath }: Props) {
   const [showBriefDetails, setShowBriefDetails] = useState(false);
   const [messages, setMessages] = useState<SDKMessageLite[]>([]);
   const [state, setState] = useState<string>("idle");
@@ -477,6 +484,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false }: Pro
           projectSlug: session.projectSlug,
           taskSlug: session.taskSlug,
           files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
+          openArtifact: openArtifactPath || undefined,
         }),
       });
       setDraft("");
@@ -754,7 +762,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false }: Pro
                 disabled={isLoadingMore}
                 className="text-[12px] text-[var(--accent)] hover:text-[var(--text)] disabled:opacity-50 px-3 py-1.5 rounded-lg border border-[var(--border)] hover:border-[var(--accent)] transition"
               >
-                {isLoadingMore ? "Loading…" : `Load older messages (${historyMeta.total - messages.length} more)`}
+                {isLoadingMore ? "Loading…" : `Load older messages (${historyMeta.total - messages.filter(isVisibleSDKMessage).length} more)`}
               </button>
             </div>
           )}
@@ -926,6 +934,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false }: Pro
               session={session}
               draft={draft}
               setDraft={setDraft}
+              openArtifactPath={openArtifactPath}
               completeButton={!isRenaming ? <CompleteToggleButton session={session} completed={completed} variant="icon" /> : null}
             />
           )}

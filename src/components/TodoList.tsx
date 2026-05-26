@@ -2,9 +2,9 @@
 
 import type { TodoItem } from "@/lib/todos";
 
-// Re-exported so existing importers (Chat, ChatPanel) can keep pulling the
-// type and the deriver from this component. The implementation now lives in
-// the server-importable `@/lib/todos` so the same logic can run over the full
+// Re-exported so existing importers (Chat) can keep pulling the type and the
+// deriver from this component. The implementation now lives in the
+// server-importable `@/lib/todos` so the same logic can run over the full
 // session history on the server.
 export { extractTodosFromMessages } from "@/lib/todos";
 export type { TodoItem } from "@/lib/todos";

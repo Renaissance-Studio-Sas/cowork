@@ -76,7 +76,10 @@ export function MessageStream({
     if (mm.type === "user") {
       // User messages can also be tool-result echoes (no visible text). Those
       // mustn't break the chip row — only flush when there's actual text.
-      const text = extractText(mm.message?.content).trim();
+      // Strip any <system-reminder> blocks (e.g. the "open artifact" hint
+      // injected on the server) — the agent still sees them in its context,
+      // but the user shouldn't see their own bubble polluted by them.
+      const text = stripSystemReminders(extractText(mm.message?.content)).trim();
       // Hide system-injected resume prompts (sessions.ts pushes this as a
       // user message so the model has something to continue from after a
       // server restart — but it's not actually FROM the user). Surfaced as
@@ -253,6 +256,13 @@ export function MessageStream({
       })}
     </>
   );
+}
+
+// Remove <system-reminder>…</system-reminder> blocks from a user-message
+// string. These are server-injected context hints (e.g. which artifact the
+// user has open) — visible to the agent but noise in the user's own bubble.
+function stripSystemReminders(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "");
 }
 
 // Detects the "Send to agent" comment-briefing message and pulls the file

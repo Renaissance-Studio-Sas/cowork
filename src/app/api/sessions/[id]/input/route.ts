@@ -13,6 +13,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const projectSlug = body.projectSlug as string | undefined;
   const taskSlug = body.taskSlug as string | undefined;
   const files = body.files as FileAttachmentInfo[] | undefined;
+  const openArtifact = typeof body.openArtifact === "string" && body.openArtifact.length > 0
+    ? body.openArtifact
+    : undefined;
 
   // If session isn't in memory, try to restore it from disk
   if (!getSession(id)) {
@@ -24,9 +27,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   // Use extended function if files are provided
   let ok: boolean;
   if (files && files.length > 0 && projectSlug && taskSlug) {
-    ok = await sendInputWithFiles(id, body.message, files, projectSlug, taskSlug);
+    ok = await sendInputWithFiles(id, body.message, files, projectSlug, taskSlug, openArtifact);
   } else {
-    ok = await sendInput(id, body.message);
+    ok = await sendInput(id, body.message, openArtifact);
   }
 
   if (!ok) return NextResponse.json({ error: "session not found or failed to resume" }, { status: 404 });

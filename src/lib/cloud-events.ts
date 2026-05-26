@@ -24,6 +24,7 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isVisibleSDKMessage } from "@/components/chat/utils";
 
 // D1 isn't implemented yet — default to the local file backend.
 const BACKEND: "file" | "d1" = "file";
@@ -86,14 +87,34 @@ async function fileRead(
   } catch {
     return { events: [], total: 0, hasMore: false };
   }
-  const total = all.length;
+  // `total` is the count of VISIBLE messages (rendered as bubbles/cards/pills),
+  // not raw SDK events. Tool calls collapse into a chip row and tool_result
+  // echoes don't render at all — counting them made "Load older (N more)" lie
+  // and produced nearly-empty initial pages on tool-heavy turns.
+  const total = all.reduce<number>((n, e) => n + (isVisibleSDKMessage(e) ? 1 : 0), 0);
+
   if (opts.limit === undefined) return { events: all, total, hasMore: false };
-  // Page taken from the END: offset=0 returns the most recent `limit` events.
+
+  // Page is taken from the END. `offset` is event-count (matches the client's
+  // `messages.length` — sum of visible + invisible events already loaded);
+  // `limit` is the number of additional VISIBLE messages this page should add.
+  // Walk back from where the previous page started, including every event we
+  // pass through, until we've collected `limit` more visible messages.
   const offset = opts.offset ?? 0;
-  const end = total - offset;
-  const start = Math.max(0, end - opts.limit);
-  if (end <= 0) return { events: [], total, hasMore: false };
-  return { events: all.slice(start, end), total, hasMore: start > 0 };
+  const end = Math.max(0, all.length - offset);
+  if (end === 0) return { events: [], total, hasMore: false };
+  let i = end;
+  let visibleSeen = 0;
+  while (i > 0 && visibleSeen < opts.limit) {
+    i--;
+    if (isVisibleSDKMessage(all[i])) visibleSeen++;
+  }
+  // hasMore = at least one more visible message exists before this slice.
+  let hasMore = false;
+  for (let k = i - 1; k >= 0; k--) {
+    if (isVisibleSDKMessage(all[k])) { hasMore = true; break; }
+  }
+  return { events: all.slice(i, end), total, hasMore };
 }
 
 async function fileDelete(sessionId: string): Promise<void> {

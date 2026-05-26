@@ -44,37 +44,59 @@
 
   // ── Local → remote clipboard paste ────────────────────────────────────────
   // noVNC forwards the raw keystroke (Cmd+V on Mac → Meta+V on the remote),
-  // which Linux Chrome ignores for paste. So we intercept the shortcut here,
-  // push the local clipboard text into the remote clipboard, then synthesize
-  // a Ctrl+V on the remote so Chrome actually performs the paste.
+  // which Linux Chrome ignores for paste. So we capture the paste, push the
+  // text into the remote VNC clipboard, then synthesize Ctrl+V on the remote
+  // so Linux Chrome actually performs the paste.
   //
-  // navigator.clipboard.readText() needs HTTPS or a localhost origin (this
-  // page is served from 127.0.0.1:<novncPort> so that's fine) plus user
-  // activation — the keydown event itself counts.
+  // We listen for the native `paste` event rather than calling
+  // navigator.clipboard.readText(): the event's clipboardData is provided
+  // by the browser as part of the user gesture, with no Clipboard API
+  // permission required, so it works even when the page is nested inside
+  // iframes that don't delegate the `clipboard-read` Permissions Policy.
   const KS_CONTROL_L = 0xffe3;
   const KS_V = 0x76;
 
+  function forwardPasteText(text) {
+    if (!text) return;
+    rfb.clipboardPasteFrom(text);
+    setTimeout(() => {
+      rfb.sendKey(KS_CONTROL_L, "ControlLeft", true);
+      rfb.sendKey(KS_V, "KeyV", true);
+      rfb.sendKey(KS_V, "KeyV", false);
+      rfb.sendKey(KS_CONTROL_L, "ControlLeft", false);
+    }, 30);
+  }
+
+  // Make body focusable + grab focus so paste events have a target. Without
+  // this, Chrome may not fire `paste` because there's no editable target.
+  document.body.tabIndex = -1;
+  document.addEventListener("click", () => document.body.focus(), true);
+
+  document.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain");
+    if (!text) return;
+    e.preventDefault();
+    forwardPasteText(text);
+  }, true);
+
+  // Fallback: some browsers/configurations don't fire `paste` outside of
+  // editable elements. Catch Cmd/Ctrl+V via keydown and try the Clipboard
+  // API — works when the Permissions Policy delegates clipboard-read.
   window.addEventListener("keydown", async (e) => {
     const isPaste =
       (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === "v" || e.key === "V");
     if (!isPaste) return;
-    e.preventDefault();
-    e.stopPropagation();
     try {
       const text = await navigator.clipboard.readText();
       if (!text) return;
-      rfb.clipboardPasteFrom(text);
-      // Tiny delay so the server has staged the clipboard before we send Ctrl+V.
-      setTimeout(() => {
-        rfb.sendKey(KS_CONTROL_L, "ControlLeft", true);
-        rfb.sendKey(KS_V, "KeyV", true);
-        rfb.sendKey(KS_V, "KeyV", false);
-        rfb.sendKey(KS_CONTROL_L, "ControlLeft", false);
-      }, 30);
+      e.preventDefault();
+      e.stopPropagation();
+      forwardPasteText(text);
     } catch (err) {
-      console.warn("[embed] paste failed:", err);
+      // Permission-Policy blocked or user denied; paste event handler above
+      // should have already handled it if the gesture went through.
     }
-  }, true); // capture phase, so we fire before noVNC's own keydown listener
+  }, true);
 
   // ── Remote → local clipboard ──────────────────────────────────────────────
   // When the user copies inside the remote browser, mirror it onto the local

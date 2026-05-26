@@ -34,27 +34,27 @@ Each session still gets its own ephemeral per-session `userDataDir` under `~/.cl
 ## Run
 
 ```bash
-npm run dev                  # stdio MCP server, hot-reloaded via tsx
+npm run dev                  # HTTP MCP server on 127.0.0.1:7400, hot-reloaded via tsx
+npm start                    # HTTP MCP server, compiled (node dist/index.js)
+curl http://127.0.0.1:7400/health
 ```
 
-For Claude Desktop / Claude Code, wire it as a stdio MCP:
+The server is a **shared daemon**: one instance per machine owns the profile registry. If a second instance is started while one is already running, it exits silently (port-bind detection + PID file). Profile state survives parent (cowork) restarts — that's the point of moving off stdio.
+
+For Claude Desktop / Claude Code, wire it as an HTTP MCP:
 
 ```json
 {
   "mcpServers": {
     "cloud-browser": {
-      "command": "node",
-      "args": ["/absolute/path/to/cowork/cloud-browser/dist/index.js"],
-      "env": {
-        "R2_BUCKET": "browser-profiles-marco",
-        "R2_ACCOUNT_ID": "...",
-        "R2_ACCESS_KEY_ID": "...",
-        "R2_SECRET_ACCESS_KEY": "..."
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:7400/mcp"
     }
   }
 }
 ```
+
+Start the daemon once (`npm start`); the SDK connects over HTTP. Cowork auto-spawns the daemon when a session starts if it isn't already running.
 
 ## Tools (19)
 

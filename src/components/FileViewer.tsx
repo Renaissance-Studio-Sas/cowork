@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useSearchParams, usePathname } from "next/navigation";
+import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 // rehype-raw intentionally omitted — see Chat.tsx for rationale.
@@ -14,12 +14,9 @@ import {
 } from "@/lib/comment-anchor";
 import { buildEnhancedHtml } from "@/lib/iframe-enhancer";
 import { resolveRelative } from "@/lib/relative-path";
-import { AgentPanel } from "./AgentPanel";
-import { ChatPanel } from "./ChatPanel";
 import { EmailThreadViewer, type ThreadRecord } from "./EmailThreadViewer";
-import { Resizer } from "./Resizer";
 import { handleComposerEnter } from "@/lib/composer";
-import { taskFileRoute, taskSessionRoute, projectFileRoute, projectSessionRoute, saveTaskPath } from "@/lib/routes";
+import { taskFileRoute, projectFileRoute } from "@/lib/routes";
 import { useWorkspace } from "@/lib/workspace-context";
 import type { SessionSummaryDTO } from "@/lib/types";
 
@@ -35,22 +32,10 @@ type CommentTarget =
   | { kind: "session"; session: SessionSummaryDTO }
   | { kind: "new" };
 
-const CHAT_PANEL_WIDTH_KEY = "wb-chat-panel-width";
-const DEFAULT_CHAT_WIDTH = 380;
-const MIN_CHAT_WIDTH = 280;
-const MAX_CHAT_WIDTH = 600;
-
 interface Props {
   projectSlug: string;
   taskSlug: string;
   filePath: string;
-  onBack: () => void;
-  /**
-   * When true, the file viewer is hosted inside another layout (e.g. the
-   * workspace artifact column). It skips its own page-level header and the
-   * built-in chat side panel — the host renders those.
-   */
-  embedded?: boolean;
 }
 
 interface CommentRow {
@@ -78,19 +63,13 @@ function extOf(p: string): string {
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 const TEXT_EXT = new Set(["md", "markdown", "txt", "json", "csv", "yaml", "yml", "log"]);
 
-export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded = false }: Props) {
+export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   const router = useRouter();
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
-
-  // Initialize sidebar states from URL search params
-  const initialCommentsPanelOpen = searchParams.get("comments") === "1";
-  const initialChatPanelOpen = searchParams.get("chat") === "1";
 
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [comments, setComments] = useState<CommentRow[]>([]);
-  const [panelOpen, setPanelOpen] = useState(initialCommentsPanelOpen);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [pendingAnchor, setPendingAnchor] = useState<TextAnchor | null>(null);
@@ -98,31 +77,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   // For HTML files, the iframe tells us which comments it could anchor.
   const [htmlObsoleteIds, setHtmlObsoleteIds] = useState<Set<number>>(new Set());
-  // Chat panel state
-  const [chatPanelOpen, setChatPanelOpen] = useState(initialChatPanelOpen);
-  const [chatPanelWidth, setChatPanelWidth] = useState(() => {
-    if (typeof window === "undefined") return DEFAULT_CHAT_WIDTH;
-    const stored = localStorage.getItem(CHAT_PANEL_WIDTH_KEY);
-    return stored ? parseInt(stored, 10) : DEFAULT_CHAT_WIDTH;
-  });
 
-  // Update URL and save task path when sidebar states change.
-  // Skip in embedded mode — the workspace owns the URL there.
-  useEffect(() => {
-    if (embedded) return;
-    const params = new URLSearchParams();
-    if (panelOpen) params.set("comments", "1");
-    if (chatPanelOpen) params.set("chat", "1");
-    const search = params.toString();
-    const fullPath = search ? `${pathname}?${search}` : pathname;
-
-    const newUrl = search ? `${pathname}?${search}` : pathname;
-    window.history.replaceState(null, "", newUrl);
-
-    if (taskSlug) {
-      saveTaskPath(projectSlug, taskSlug, fullPath);
-    }
-  }, [panelOpen, chatPanelOpen, pathname, projectSlug, taskSlug, embedded]);
   const contentRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -589,46 +544,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
 
   return (
     <>
-      {!embedded && (
-        <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
-          <button
-            onClick={onBack}
-            className="text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"
-          >← Task</button>
-          <div className="flex-1 min-w-0">
-            <div className="text-[14px] truncate font-mono">{filePath}</div>
-            <div className="text-[11.5px] text-[var(--muted)]">
-              {projectSlug} · {taskSlug}
-            </div>
-          </div>
-          {supportsComments && (
-            <button
-              onClick={() => setPanelOpen((v) => !v)}
-              className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${panelOpen ? "bg-[var(--panel-2)]" : ""}`}
-              title="Comments — select text in the doc first, or write a comment on the whole document"
-            >
-              💬 {liveCount > 0 || obsoleteCount > 0
-                ? `${liveCount}${obsoleteCount > 0 ? ` · ${obsoleteCount} obsolete` : ""}`
-                : "Add"}
-            </button>
-          )}
-          {taskSlug && (
-            <button
-              onClick={() => setChatPanelOpen((v) => !v)}
-              className={`text-[12px] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)] ${chatPanelOpen ? "bg-[var(--panel-2)]" : ""}`}
-              title="Chat with an agent about this file"
-            >
-              🤖 Chat
-            </button>
-          )}
-          <a
-            href={rawUrl}
-            download
-            className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
-          >Download</a>
-        </header>
-      )}
-      {embedded && supportsComments && (
+      {supportsComments && (
         <div className="flex items-center justify-end gap-2 px-3 py-1.5 border-b border-[var(--border)] shrink-0">
           <button
             onClick={() => setPanelOpen((v) => !v)}
@@ -662,6 +578,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
               ref={iframeRef}
               srcDoc={buildEnhancedHtml(text)}
               sandbox="allow-same-origin allow-scripts"
+              allow="clipboard-read; clipboard-write"
               className="flex-1 w-full rounded-xl border border-[var(--border)] bg-white"
               title={filePath}
             />
@@ -739,46 +656,6 @@ export function FileViewer({ projectSlug, taskSlug, filePath, onBack, embedded =
             commentTarget={effectiveCommentTarget}
             onCommentTargetChange={setCommentTargetSelection}
           />
-        )}
-
-        {!embedded && agentSessionId && (
-          <AgentPanel
-            sessionId={agentSessionId}
-            projectSlug={projectSlug}
-            taskSlug={taskSlug}
-            onClose={() => setAgentSessionId(null)}
-            onOpenFull={() => {
-              const route = taskSlug
-                ? taskSessionRoute(projectSlug, taskSlug, agentSessionId)
-                : projectSessionRoute(projectSlug, agentSessionId);
-              router.push(route);
-            }}
-          />
-        )}
-
-        {!embedded && chatPanelOpen && taskSlug && (
-          <>
-            <Resizer
-              direction="horizontal"
-              minSize={MIN_CHAT_WIDTH}
-              maxSize={MAX_CHAT_WIDTH}
-              onResize={(size) => {
-                setChatPanelWidth(size);
-                localStorage.setItem(CHAT_PANEL_WIDTH_KEY, String(size));
-              }}
-            />
-            <ChatPanel
-              projectSlug={projectSlug}
-              taskSlug={taskSlug}
-              filePath={filePath}
-              width={chatPanelWidth}
-              onClose={() => setChatPanelOpen(false)}
-              onOpenFull={(sessionId) => {
-                const route = taskSessionRoute(projectSlug, taskSlug, sessionId);
-                router.push(route);
-              }}
-            />
-          </>
         )}
       </div>
 

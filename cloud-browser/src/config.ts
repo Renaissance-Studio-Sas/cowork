@@ -93,3 +93,13 @@ export const R2 =
 // Tagged on every container we spawn so we can find/clean up orphans.
 export const CONTAINER_LABEL = "cloud-browser.managed=true";
 export const CONTAINER_PROFILE_LABEL = "cloud-browser.profile";
+
+// Local HTTP MCP transport. The server runs as a daemon — one shared instance
+// per machine — that any MCP client (cowork agents, Claude Desktop, …) talks
+// to over Streamable HTTP at PID-file-coordinated 127.0.0.1:CLOUD_BROWSER_HTTP_PORT.
+// Loopback-only by design; not meant to be exposed off-host.
+export const HTTP_HOST = envOr("CLOUD_BROWSER_HTTP_HOST", "127.0.0.1");
+export const HTTP_PORT = Number(envOr("CLOUD_BROWSER_HTTP_PORT", "7400"));
+export const PID_FILE = expandHome(
+  envOr("CLOUD_BROWSER_PID_FILE", "~/.cloud-browser/server.pid"),
+);
