@@ -45,6 +45,13 @@ async function main() {
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGHUP", () => void shutdown("SIGHUP"));
+  // Parent (cowork) may die without sending us a signal — in that case the
+  // stdio pipe closes. Treat EOF on stdin as a shutdown request so we still
+  // run releaseAll() and Chrome flushes its cookie DB before the container
+  // is killed.
+  process.stdin.on("end", () => void shutdown("stdin-eof"));
+  process.stdin.on("close", () => void shutdown("stdin-close"));
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
