@@ -1,97 +1,65 @@
 // Claude-specific static MCP wiring.
 //
 // Defines buildStaticWorkbenchMcps which wraps static workbench tools
-// (comments, session, user-input) as Claude-SDK-compatible MCP servers,
-// plus the cloud-browser MCP (Chromium-in-Docker per profile).
+// (comments, session, user-input) as Claude-SDK-compatible MCP servers, plus
+// the cloud-browser MCP — now served by the platform's cloud-browser worker
+// at https://app.rowads.studio/api/browser/mcp.
 //
-// cloud-browser runs as a local HTTP daemon (Streamable HTTP) on 127.0.0.1:7400
-// by default. One daemon per machine, owned by no single cowork session — this
-// lets profile state survive cowork restarts and prevents two parallel agents
-// from each spawning their own Chrome container for the same profile.
+// Auth: the cloud-browser MCP endpoint is gated by the platform gateway.
+// Locally we pass the same __gateway_session cookie that `rw auth login`
+// drops into ~/.rw/credentials.json; for cloud-run cowork agents that
+// receive an X-Platform-Token via env, we use that instead.
 
-import { spawn } from "child_process";
-import { existsSync } from "fs";
-import path from "path";
-import {
-  type McpServerConfig,
-} from "@anthropic-ai/claude-agent-sdk";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { workbenchToolsAsClaudeMcp } from "./runtimes/claude-tool-adapter";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { buildUserInputTools } from "./workbench-tools/user-input";
 
-const CLOUD_BROWSER_HOST = process.env.CLOUD_BROWSER_HTTP_HOST ?? "127.0.0.1";
-const CLOUD_BROWSER_PORT = Number(process.env.CLOUD_BROWSER_HTTP_PORT ?? "7400");
-const CLOUD_BROWSER_URL = `http://${CLOUD_BROWSER_HOST}:${CLOUD_BROWSER_PORT}/mcp`;
-const CLOUD_BROWSER_HEALTH = `http://${CLOUD_BROWSER_HOST}:${CLOUD_BROWSER_PORT}/health`;
+const DEFAULT_GATEWAY = "https://app.rowads.studio";
+const RW_CREDS_FILE = process.env.RW_CREDS_FILE ?? path.join(os.homedir(), ".rw", "credentials.json");
+const RW_ENV = process.env.RW_ENV ?? "production";
 
-// cloud-browser lives inside this repo at <repo>/cloud-browser/. We auto-spawn
-// it the first time a session starts if no daemon is responding. Prefer the
-// tsx + src/index.ts launcher when available (dev mode — edits land without
-// `npm run build`); fall back to the compiled dist/index.js for deploys.
-const CLOUD_BROWSER_DIR = path.join(process.cwd(), "cloud-browser");
-const CLOUD_BROWSER_TSX = path.join(CLOUD_BROWSER_DIR, "node_modules", ".bin", "tsx");
-const CLOUD_BROWSER_SRC = path.join(CLOUD_BROWSER_DIR, "src", "index.ts");
-const CLOUD_BROWSER_BIN = path.join(CLOUD_BROWSER_DIR, "dist", "index.js");
-
-function resolveCloudBrowserLaunch():
-  | { command: string; args: string[] }
-  | null {
-  if (existsSync(CLOUD_BROWSER_TSX) && existsSync(CLOUD_BROWSER_SRC)) {
-    return { command: CLOUD_BROWSER_TSX, args: [CLOUD_BROWSER_SRC] };
-  }
-  if (existsSync(CLOUD_BROWSER_BIN)) {
-    return { command: process.execPath, args: [CLOUD_BROWSER_BIN] };
-  }
-  return null;
+interface RwCredentials {
+  envs?: Record<string, { gateway?: string; cookie?: string; email?: string }>;
 }
 
-async function isDaemonUp(): Promise<boolean> {
+function resolveCloudBrowserUrl(): string {
+  // Allow overrides for staging / local-dev hits against a different gateway.
+  if (process.env.CLOUD_BROWSER_URL) return process.env.CLOUD_BROWSER_URL;
+  const gateway = readRwEnv()?.gateway ?? DEFAULT_GATEWAY;
+  return `${gateway.replace(/\/+$/, "")}/api/browser/mcp`;
+}
+
+function readRwEnv(): { gateway?: string; cookie?: string; email?: string } | null {
   try {
-    const res = await fetch(CLOUD_BROWSER_HEALTH, { signal: AbortSignal.timeout(500) });
-    return res.ok;
+    const raw = fs.readFileSync(RW_CREDS_FILE, "utf8");
+    const parsed = JSON.parse(raw) as RwCredentials;
+    return parsed.envs?.[RW_ENV] ?? null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-// Best-effort: if the daemon isn't responding, spawn it detached so it
-// survives this cowork process exiting. Poll /health for up to ~3s.
-// On failure we return without throwing — the Claude SDK will surface the
-// connect error to the user, and a follow-up session can retry.
-let spawnAttempted = false;
-async function ensureDaemon(): Promise<void> {
-  if (await isDaemonUp()) return;
-  if (spawnAttempted) return;
-  spawnAttempted = true;
-
-  const launch = resolveCloudBrowserLaunch();
-  if (!launch) {
-    console.warn(`[cloud-browser] daemon not running and no launcher found at ${CLOUD_BROWSER_DIR}`);
-    return;
+function resolveCloudBrowserHeaders(): Record<string, string> {
+  // Cloud-run cowork agents inject a platform token via env. Use it
+  // verbatim — same header the gateway accepts from any internal caller.
+  if (process.env.RW_PLATFORM_TOKEN) {
+    return { "X-Platform-Token": process.env.RW_PLATFORM_TOKEN };
   }
-
-  console.log(`[cloud-browser] auto-spawning daemon: ${launch.command} ${launch.args.join(" ")}`);
-  const child = spawn(launch.command, launch.args, {
-    cwd: CLOUD_BROWSER_DIR,
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      SKIP_R2: process.env.R2_BUCKET ? "false" : "true",
-    },
-  });
-  child.unref();
-  if (child.pid != null) {
-    console.log(`[cloud-browser] daemon pid: ${child.pid}`);
+  // Local cowork: read the cookie the rw CLI persisted at login.
+  const env = readRwEnv();
+  if (env?.cookie) {
+    return { Cookie: `__gateway_session=${env.cookie}` };
   }
-
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    if (await isDaemonUp()) return;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  console.warn("[cloud-browser] daemon did not respond on /health within 5s; continuing anyway");
+  // We deliberately don't throw — the Claude SDK will report the auth
+  // error from the gateway when the agent first invokes a browser tool,
+  // which is a clearer place to surface "run `rw auth login`" than a
+  // session-start crash that masks the real problem.
+  return {};
 }
 
 // Build the static workbench-MCP map for a session. Used both at session
@@ -108,12 +76,10 @@ export async function buildStaticWorkbenchMcps(
     "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(sessionId)),
   };
 
-  // Auto-spawn the cloud-browser daemon if it's not already running, then
-  // hand the Claude SDK an HTTP MCP config pointing at it.
-  await ensureDaemon();
   base["cloud-browser"] = {
     type: "http",
-    url: CLOUD_BROWSER_URL,
+    url: resolveCloudBrowserUrl(),
+    headers: resolveCloudBrowserHeaders(),
   };
 
   return base;
