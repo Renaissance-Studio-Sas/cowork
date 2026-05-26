@@ -10,6 +10,29 @@ VIEWPORT_HEIGHT="${VIEWPORT_HEIGHT:-800}"
 # Clear any stale Chrome singleton lock (a previous container died uncleanly)
 rm -f /profile/Singleton* 2>/dev/null || true
 
+# Symlink Chrome's downloadable component caches from /opt/chrome-shared,
+# which the MCP server bind-mounts (read-write) from SHARED_COMPONENTS_DIR
+# on the host. The MCP pre-creates each subdir before spawning so the symlink
+# always has a real target. Chrome reads / writes through the symlink:
+#   - First session on a fresh host populates the dirs as component_updater
+#     fires (~30–60s after browser start)
+#   - Every subsequent session in any profile sees them already populated
+#   - Updates Chrome writes propagate to every future session
+#
+# We only create symlinks for dirs that don't already exist in /profile
+# (in case a prior session ever wrote a real subdir of one of these names).
+# EXCLUDE_NAMES in src/profile-store.ts filters all these dirs out of the
+# persisted profile so /opt/chrome-shared is always the source of truth.
+if [ -d /opt/chrome-shared ]; then
+  for src in /opt/chrome-shared/*; do
+    [ -d "$src" ] || continue
+    name=$(basename "$src")
+    if [ ! -e "/profile/$name" ]; then
+      ln -s "$src" "/profile/$name"
+    fi
+  done
+fi
+
 # Xvnc (TigerVNC's standalone X server) instead of Xvfb + x11vnc. Xvnc
 # accepts arbitrary client-driven resize via the RFB SetDesktopSize /
 # ExtendedDesktopSize extensions out of the box — no pre-defined RANDR modes,

@@ -1,20 +1,30 @@
 // cloud-browser entry point.
 // Stdio MCP server. Spawns Chromium-in-Docker containers per profile,
-// syncs profile state with R2.
+// persists profile state to R2 or to a local folder (whichever is configured).
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
 import * as reg from "./session-registry.js";
 import { log } from "./log.js";
-import { CHROME_IMAGE, DOCKER_SOCKET, IDLE_TIMEOUT_MS, R2, SKIP_R2 } from "./config.js";
+import {
+  CHROME_IMAGE,
+  DOCKER_SOCKET,
+  IDLE_TIMEOUT_MS,
+  LOCAL_STORE_DIR,
+  PERSISTENCE_BACKEND,
+  R2,
+} from "./config.js";
 
 async function main() {
   log.info("cloud-browser starting", {
     chromeImage: CHROME_IMAGE,
     dockerSocket: DOCKER_SOCKET ?? "(default)",
     idleTimeoutMs: IDLE_TIMEOUT_MS,
-    r2: SKIP_R2 ? "disabled" : { bucket: R2!.bucket, endpoint: R2!.endpoint },
+    persistence:
+      PERSISTENCE_BACKEND === "r2"
+        ? { backend: "r2", bucket: R2!.bucket, endpoint: R2!.endpoint }
+        : { backend: "local", dir: LOCAL_STORE_DIR },
   });
 
   const server = new McpServer({ name: "cloud-browser", version: "0.1.0" });

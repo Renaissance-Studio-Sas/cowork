@@ -18,7 +18,14 @@ function expandHome(p: string): string {
   return p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p;
 }
 
+// Persistence backend is chosen by env presence:
+//   - R2_BUCKET set (and SKIP_R2 != "true")  →  R2
+//   - otherwise                              →  local folder under LOCAL_STORE_DIR
+// SKIP_R2=true is the explicit override that forces local even if R2 vars exist
+// (useful when you want to iterate against the local store while R2 creds are present).
 export const SKIP_R2 = process.env.SKIP_R2 === "true";
+export const PERSISTENCE_BACKEND: "r2" | "local" =
+  !SKIP_R2 && process.env.R2_BUCKET ? "r2" : "local";
 
 export const CHROME_IMAGE = envOr("CHROME_IMAGE", "cloud-browser/chromium:latest");
 
@@ -26,6 +33,23 @@ export const IDLE_TIMEOUT_MS = Number(envOr("IDLE_TIMEOUT_MS", String(30 * 60 * 
 
 export const PROFILE_CACHE_DIR = expandHome(
   envOr("PROFILE_CACHE_DIR", "~/.cloud-browser/profiles"),
+);
+
+// Local persistent store — one folder per profile, holding the post-exclusion
+// userDataDir tree (cookies, Local Storage, IndexedDB, Login Data, …).
+// Each session still gets its own ephemeral copy under PROFILE_CACHE_DIR.
+export const LOCAL_STORE_DIR = expandHome(
+  envOr("LOCAL_STORE_DIR", "~/.cloud-browser/store"),
+);
+
+// Shared Chromium component caches (component_crx_cache, WasmTtsEngine,
+// OnDeviceHeadSuggestModel, …). Bind-mounted into every container so the
+// downloads happen once and are reused across all profiles. Contents are
+// Google-CDN-delivered, deterministic, and contain no user-specific state —
+// safe to share. See SHARED_COMPONENT_DIRS in profile-store.ts for the full
+// list of dirs that get symlinked into /profile on container start.
+export const SHARED_COMPONENTS_DIR = expandHome(
+  envOr("SHARED_COMPONENTS_DIR", "~/.cloud-browser/shared-components"),
 );
 
 // Resolve the Docker socket path. Honors DOCKER_HOST (unix://...) if set;
@@ -53,17 +77,18 @@ function resolveDockerSocket(): string | undefined {
 
 export const DOCKER_SOCKET = resolveDockerSocket();
 
-export const R2 = SKIP_R2
-  ? null
-  : {
-      bucket: envOrThrow("R2_BUCKET"),
-      accountId: envOrThrow("R2_ACCOUNT_ID"),
-      accessKeyId: envOrThrow("R2_ACCESS_KEY_ID"),
-      secretAccessKey: envOrThrow("R2_SECRET_ACCESS_KEY"),
-      get endpoint() {
-        return `https://${this.accountId}.r2.cloudflarestorage.com`;
-      },
-    };
+export const R2 =
+  PERSISTENCE_BACKEND === "r2"
+    ? {
+        bucket: envOrThrow("R2_BUCKET"),
+        accountId: envOrThrow("R2_ACCOUNT_ID"),
+        accessKeyId: envOrThrow("R2_ACCESS_KEY_ID"),
+        secretAccessKey: envOrThrow("R2_SECRET_ACCESS_KEY"),
+        get endpoint() {
+          return `https://${this.accountId}.r2.cloudflarestorage.com`;
+        },
+      }
+    : null;
 
 // Tagged on every container we spawn so we can find/clean up orphans.
 export const CONTAINER_LABEL = "cloud-browser.managed=true";

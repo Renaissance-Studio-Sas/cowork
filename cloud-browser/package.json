@@ -13,6 +13,7 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "docker:build": "docker build -t cloud-browser/chromium:latest browser",
+    "prime-components": "tsx scripts/prime-components.ts",
     "smoke": "tsx scripts/smoke-test.ts"
   },
   "dependencies": {

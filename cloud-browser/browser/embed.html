@@ -41,6 +41,51 @@
 
   // RFB.js already listens for window resize and sends new ExtendedDesktopSize
   // requests when resizeSession is true — nothing extra needed here.
+
+  // ── Local → remote clipboard paste ────────────────────────────────────────
+  // noVNC forwards the raw keystroke (Cmd+V on Mac → Meta+V on the remote),
+  // which Linux Chrome ignores for paste. So we intercept the shortcut here,
+  // push the local clipboard text into the remote clipboard, then synthesize
+  // a Ctrl+V on the remote so Chrome actually performs the paste.
+  //
+  // navigator.clipboard.readText() needs HTTPS or a localhost origin (this
+  // page is served from 127.0.0.1:<novncPort> so that's fine) plus user
+  // activation — the keydown event itself counts.
+  const KS_CONTROL_L = 0xffe3;
+  const KS_V = 0x76;
+
+  window.addEventListener("keydown", async (e) => {
+    const isPaste =
+      (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === "v" || e.key === "V");
+    if (!isPaste) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) return;
+      rfb.clipboardPasteFrom(text);
+      // Tiny delay so the server has staged the clipboard before we send Ctrl+V.
+      setTimeout(() => {
+        rfb.sendKey(KS_CONTROL_L, "ControlLeft", true);
+        rfb.sendKey(KS_V, "KeyV", true);
+        rfb.sendKey(KS_V, "KeyV", false);
+        rfb.sendKey(KS_CONTROL_L, "ControlLeft", false);
+      }, 30);
+    } catch (err) {
+      console.warn("[embed] paste failed:", err);
+    }
+  }, true); // capture phase, so we fire before noVNC's own keydown listener
+
+  // ── Remote → local clipboard ──────────────────────────────────────────────
+  // When the user copies inside the remote browser, mirror it onto the local
+  // clipboard so they can paste outside the iframe too.
+  rfb.addEventListener("clipboard", (e) => {
+    const text = e.detail?.text;
+    if (typeof text !== "string" || !text) return;
+    navigator.clipboard.writeText(text).catch((err) =>
+      console.warn("[embed] write to local clipboard failed:", err),
+    );
+  });
 </script>
 </body>
 </html>

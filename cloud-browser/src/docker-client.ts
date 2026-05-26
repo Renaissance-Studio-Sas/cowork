@@ -1,7 +1,16 @@
 // Docker container lifecycle for vanilla-chromium-novnc sessions.
 
+import fsp from "node:fs/promises";
+import path from "node:path";
 import Docker from "dockerode";
-import { CHROME_IMAGE, CONTAINER_LABEL, CONTAINER_PROFILE_LABEL, DOCKER_SOCKET } from "./config.js";
+import {
+  CHROME_IMAGE,
+  CONTAINER_LABEL,
+  CONTAINER_PROFILE_LABEL,
+  DOCKER_SOCKET,
+  SHARED_COMPONENTS_DIR,
+} from "./config.js";
+import { SHARED_COMPONENT_DIRS } from "./profile-store.js";
 import { log } from "./log.js";
 
 const docker = new Docker(DOCKER_SOCKET ? { socketPath: DOCKER_SOCKET } : undefined);
@@ -17,6 +26,24 @@ export interface SpawnOptions {
   hostProfileDir: string;
 }
 
+// Ensure the shared-components host folder exists with each shared subdir
+// pre-created. Pre-creating the subdirs lets entrypoint.sh symlink
+// /profile/<name> → /opt/chrome-shared/<name> against a real target, so
+// chromium can write through the symlink on first run. Cheap (just empty
+// dirs) — the actual ~70MB content fills in lazily on the first session as
+// chrome's component_updater fires, then sticks around for every future
+// container. Updates propagate the same way: whichever chrome instance picks
+// up a new version writes through the symlink, and every subsequent session
+// sees it.
+async function ensureSharedComponentsDir(): Promise<void> {
+  await fsp.mkdir(SHARED_COMPONENTS_DIR, { recursive: true });
+  await Promise.all(
+    SHARED_COMPONENT_DIRS.map((name) =>
+      fsp.mkdir(path.join(SHARED_COMPONENTS_DIR, name), { recursive: true }),
+    ),
+  );
+}
+
 // Spawn a fresh container with the profile dir bind-mounted at /profile.
 // Returns the container id and the host ports CDP / noVNC were published to.
 export async function spawn(opts: SpawnOptions): Promise<SpawnedContainer> {
@@ -29,6 +56,8 @@ export async function spawn(opts: SpawnOptions): Promise<SpawnedContainer> {
       `Image ${CHROME_IMAGE} not found locally. Run: npm run docker:build`,
     );
   }
+
+  await ensureSharedComponentsDir();
 
   const [labelKey, labelVal] = CONTAINER_LABEL.split("=");
   const c = await docker.createContainer({
@@ -44,7 +73,15 @@ export async function spawn(opts: SpawnOptions): Promise<SpawnedContainer> {
         "9223/tcp": [{ HostPort: "" }],
         "6080/tcp": [{ HostPort: "" }],
       },
-      Binds: [`${opts.hostProfileDir}:/profile`],
+      // Two bind mounts:
+      //   - <hostProfileDir>:/profile (rw) — per-session userDataDir
+      //   - <SHARED_COMPONENTS_DIR>:/opt/chrome-shared (rw) — see
+      //     entrypoint.sh; symlinked into /profile so chromium writes through
+      //     and updates propagate across all profiles
+      Binds: [
+        `${opts.hostProfileDir}:/profile`,
+        `${SHARED_COMPONENTS_DIR}:/opt/chrome-shared`,
+      ],
       // SHM is small by default; Chromium wants more.
       ShmSize: 1024 * 1024 * 1024, // 1 GB
       AutoRemove: false,

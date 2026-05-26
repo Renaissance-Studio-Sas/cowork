@@ -14,10 +14,30 @@ import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
 import { buildUserInputTools } from "./workbench-tools/user-input";
 
-// cloud-browser lives inside this repo at <repo>/cloud-browser/. Built artifact
-// is dist/index.js (npm run build in cloud-browser/). Resolve from cwd so this
-// works in dev and in any deploy where cowork is invoked from its repo root.
-const CLOUD_BROWSER_BIN = path.join(process.cwd(), "cloud-browser", "dist", "index.js");
+// cloud-browser lives inside this repo at <repo>/cloud-browser/. Resolve from
+// cwd so this works in dev and in any deploy where cowork is invoked from its
+// repo root.
+//
+// Launcher prefers tsx + src/index.ts when both are available (dev mode): each
+// new session spawns an MCP server reading current source, so edits land
+// without `npm run build`. Falls back to the compiled dist/index.js when src
+// or tsx aren't there (deploys with only the build artifact).
+const CLOUD_BROWSER_DIR = path.join(process.cwd(), "cloud-browser");
+const CLOUD_BROWSER_TSX = path.join(CLOUD_BROWSER_DIR, "node_modules", ".bin", "tsx");
+const CLOUD_BROWSER_SRC = path.join(CLOUD_BROWSER_DIR, "src", "index.ts");
+const CLOUD_BROWSER_BIN = path.join(CLOUD_BROWSER_DIR, "dist", "index.js");
+
+function resolveCloudBrowserLaunch():
+  | { command: string; args: string[] }
+  | null {
+  if (existsSync(CLOUD_BROWSER_TSX) && existsSync(CLOUD_BROWSER_SRC)) {
+    return { command: CLOUD_BROWSER_TSX, args: [CLOUD_BROWSER_SRC] };
+  }
+  if (existsSync(CLOUD_BROWSER_BIN)) {
+    return { command: process.execPath, args: [CLOUD_BROWSER_BIN] };
+  }
+  return null;
+}
 
 // Build the static workbench-MCP map for a session. Used both at session
 // start (in sessions.ts) and inside chrome_connect/disconnect to re-include
@@ -33,14 +53,15 @@ export function buildStaticWorkbenchMcps(
     "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(sessionId)),
   };
 
-  // Wire cloud-browser only if it's been built. Skipping when missing keeps
-  // session startup working in environments where the operator hasn't run
-  // `npm --prefix cloud-browser run build` yet.
-  if (existsSync(CLOUD_BROWSER_BIN)) {
+  // Wire cloud-browser only if a launcher is resolvable (src+tsx in dev, or
+  // built dist in deploy). Skipping when missing keeps session startup working
+  // in environments where neither is present yet.
+  const launch = resolveCloudBrowserLaunch();
+  if (launch) {
     base["cloud-browser"] = {
       type: "stdio" as const,
-      command: process.execPath, // current node binary
-      args: [CLOUD_BROWSER_BIN],
+      command: launch.command,
+      args: launch.args,
       env: {
         ...process.env,
         // Default to SKIP_R2=true unless the operator set R2 creds. Per-task

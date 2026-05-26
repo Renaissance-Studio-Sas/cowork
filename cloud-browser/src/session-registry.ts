@@ -10,11 +10,8 @@ import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import { IDLE_TIMEOUT_MS } from "./config.js";
 import { log } from "./log.js";
 import * as docker from "./docker-client.js";
-import * as r2 from "./r2-client.js";
+import * as persistence from "./persistence.js";
 import * as store from "./profile-store.js";
-import { createWriteStream, createReadStream, promises as fsp } from "node:fs";
-import path from "node:path";
-import os from "node:os";
 
 export interface Session {
   profile: string;
@@ -62,16 +59,13 @@ export async function acquire(profile: string): Promise<AcquireResult> {
 
   log.info("acquiring profile", { profile });
 
-  // 1. Make a fresh per-session profile dir and seed it from R2 if present.
+  // 1. Make a fresh per-session profile dir and seed it from the persistence
+  //    backend (R2 or local folder) if a baseline exists for this profile.
   const { dir: profileDir, sessionId } = await store.makeFreshProfileDir(profile);
   try {
-    const tarball = await r2.downloadProfileTarball(profile);
-    if (tarball) {
-      log.info("seeding profile from R2", { profile, dir: profileDir });
-      await store.untarProfileDir(tarball, profileDir);
-    } else {
-      log.info("no R2 tarball — starting from empty profile", { profile });
-    }
+    const loaded = await persistence.loadProfileInto(profile, profileDir);
+    if (loaded) log.info("seeded profile from persistence", { profile, dir: profileDir, backend: persistence.backend });
+    else log.info("no baseline — starting from empty profile", { profile, backend: persistence.backend });
   } catch (e) {
     await store.deleteProfileDir(profileDir);
     throw e;
@@ -129,13 +123,13 @@ export async function acquire(profile: string): Promise<AcquireResult> {
 }
 
 export interface ReleaseResult {
-  uploaded: boolean;
+  persisted: boolean;
 }
 
-// Release a session: stop container, upload to R2, clean up.
+// Release a session: stop container, persist to backend, clean up.
 export async function release(profile: string): Promise<ReleaseResult> {
   const s = sessions.get(profile);
-  if (!s) return { uploaded: false };
+  if (!s) return { persisted: false };
   sessions.delete(profile);
 
   log.info("releasing profile", { profile, sessionId: s.sessionId });
@@ -149,26 +143,21 @@ export async function release(profile: string): Promise<ReleaseResult> {
   // Stop the container gracefully so chromium flushes cookie DB.
   await docker.stop(s.containerId, 10);
 
-  // Upload to R2 (best-effort). On failure, leave the local dir intact so a
-  // human can recover.
-  let uploaded = false;
+  // Persist the session dir (filtering caches) via the active backend. On
+  // failure, leave the session dir intact so a human can recover.
+  let persisted = false;
   try {
-    const tmp = path.join(os.tmpdir(), `cbmcp-${s.profile}-${s.sessionId}.tar.gz`);
-    const dest = createWriteStream(tmp);
-    await store.tarProfileDir(s.profileDir, dest);
-    const buf = await fsp.readFile(tmp);
-    uploaded = await r2.uploadProfileTarball(profile, buf);
-    await fsp.unlink(tmp).catch(() => undefined);
-    if (uploaded) log.info("profile uploaded to R2", { profile, bytes: buf.length });
+    persisted = await persistence.saveProfileFrom(profile, s.profileDir, s.sessionId);
     await store.deleteProfileDir(s.profileDir);
   } catch (e) {
-    log.error("failed to upload profile to R2; local dir preserved", {
+    log.error("failed to persist profile; session dir preserved for recovery", {
       profile,
       dir: s.profileDir,
+      backend: persistence.backend,
       err: String(e),
     });
   }
-  return { uploaded };
+  return { persisted };
 }
 
 // Release every session in parallel. Used on SIGTERM / SIGINT.

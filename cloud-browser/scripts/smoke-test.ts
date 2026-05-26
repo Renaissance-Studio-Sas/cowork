@@ -1,9 +1,11 @@
 // End-to-end smoke test: spawns the MCP server as a child, runs through a
 // basic flow (list tools, acquire profile, navigate, screenshot, release).
 //
-// Run with:  npx tsx scripts/smoke-test.ts  (or:  SKIP_R2=true npx tsx ...)
+// Run with:  npx tsx scripts/smoke-test.ts
 //
-// Reads R2 creds from .env if present; sets SKIP_R2=true otherwise.
+// Forces the local-folder persistence backend (SKIP_R2=true) so the test runs
+// without Cloudflare creds. The profile baseline is written to
+// ~/.cloud-browser/store/<profile>/ — clear it to reset between runs.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
