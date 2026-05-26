@@ -4,7 +4,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as reg from "./session-registry.js";
-import * as persistence from "./persistence.js";
 import { saveArtifactInstruction, deleteArtifactInstruction } from "./artifacts.js";
 
 type ToolResult = {
@@ -41,31 +40,22 @@ export function registerTools(server: McpServer): void {
     "browser_list_profiles",
     {
       description:
-        "List browser profiles available in persistent storage + show which are currently active in this MCP session. A profile = persistent cookies/login state for one Chrome identity.",
+        "List browser profiles currently active in this MCP session. Each acquire spins up a fresh remote container — persistence isn't wired up yet, so 'profile' is currently just a session handle: same name → same container while live, fresh container after release.",
       inputSchema: {},
     },
     async () =>
       wrap(async () => {
-        const stored = await persistence.listProfiles();
-        const live = new Set(reg.listSessions().map((s) => s.profile));
-        const backendLabel = persistence.describeBackend();
-        if (stored.length === 0 && live.size === 0) {
+        const live = reg.listSessions();
+        if (live.length === 0) {
           return textOk(
-            `No profiles yet (storage: ${backendLabel}). Call browser_use_profile with any name to create one.`,
+            "No active browser sessions. Call browser_use_profile with any name to create one. " +
+              "(Note: persistence isn't wired up yet — sessions are ephemeral.)",
           );
         }
-        const lines = stored.map((p) => {
-          const liveTag = live.has(p.name) ? " (ACTIVE)" : "";
-          const mtime = p.mtime ? p.mtime.toISOString() : "—";
-          const size = p.sizeBytes != null ? `${(p.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "—";
-          return `- ${p.name}${liveTag}    saved=${mtime}    size=${size}`;
-        });
-        for (const profile of live) {
-          if (!stored.some((p) => p.name === profile)) {
-            lines.push(`- ${profile} (ACTIVE, unsaved)`);
-          }
-        }
-        return textOk(`Profiles (storage: ${backendLabel}):\n${lines.join("\n")}`);
+        const lines = live.map(
+          (s) => `- ${s.profile} (ACTIVE, sessionId=${s.sessionId}, acquired ${new Date(s.acquiredAt).toISOString()})`,
+        );
+        return textOk(`Active sessions:\n${lines.join("\n")}`);
       }),
   );
 
@@ -73,12 +63,12 @@ export function registerTools(server: McpServer): void {
     "browser_use_profile",
     {
       description:
-        "Acquire a live browser session for a profile (spawns a Chromium container, ~3–5s on cold start). Restores the profile's cookies/login state from persistent storage (R2 or local folder). Reuses an existing session if one is already live in this MCP for the same profile. Auto-creates the profile if no baseline exists (you'll get an empty, logged-out Chrome — use browser_request_human to log in, then browser_release will persist the new state).",
+        "Acquire a live browser session for a profile (spawns a remote Chromium container, ~3–5s cold). Reuses an existing session if one is already live in this MCP for the same profile name. The container is ephemeral right now — cookies and logins do NOT persist across release/re-acquire cycles. Use browser_request_human to have the user log in once for a session you'll keep alive.",
       inputSchema: {
         profile: z
           .string()
           .regex(/^[a-z0-9][a-z0-9._@-]{0,62}$/, "lowercase alphanumerics + . _ @ -, must start alphanumeric")
-          .describe("Profile name, e.g. 'linkedin-personal' or 'admin@rowads.studio'"),
+          .describe("Profile / session name, e.g. 'linkedin-personal' or 'admin@rowads.studio'"),
       },
     },
     async ({ profile }) =>
@@ -87,7 +77,7 @@ export function registerTools(server: McpServer): void {
         return textOk(
           `${reused ? "Reusing" : "Acquired"} browser session for profile "${session.profile}".\n` +
             `Live view (noVNC): ${session.novncUrl}\n` +
-            `If the profile isn't logged into the target site, call browser_request_human so the user can log in once; state will be saved on release.` +
+            `If the profile isn't logged into the target site, call browser_request_human so the user can log in once.` +
             saveArtifactInstruction(session.profile, session.novncUrl),
         );
       }),
@@ -97,17 +87,15 @@ export function registerTools(server: McpServer): void {
     "browser_release",
     {
       description:
-        "Release the browser session for a profile: stops the container and persists the (modified) profile state so future sessions start logged in. Storage backend is R2 if configured, otherwise a local folder. Always call when done — otherwise the idle reaper does it after IDLE_TIMEOUT_MS (default 30 min).",
+        "Release the browser session for a profile: closes Playwright and tells the remote to destroy the container. Always call when done — otherwise the local idle reaper does it after IDLE_TIMEOUT_MS (default 30 min) and the remote's own 15-min idle timeout will catch anything we miss.",
       inputSchema: { profile: z.string() },
     },
     async ({ profile }) =>
       wrap(async () => {
         if (!reg.getSession(profile)) return textOk(`No active session for profile "${profile}".`);
-        const { persisted } = await reg.release(profile);
+        await reg.release(profile);
         return textOk(
-          (persisted
-            ? `Released profile "${profile}". State saved to ${persistence.describeBackend()}.`
-            : `Released profile "${profile}". (Persistence failed — state not saved; see server logs.)`) +
+          `Released profile "${profile}". (Profile state is ephemeral — nothing was saved.)` +
             deleteArtifactInstruction(profile),
         );
       }),

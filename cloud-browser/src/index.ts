@@ -20,15 +20,11 @@ import { registerTools } from "./tools.js";
 import * as reg from "./session-registry.js";
 import { log } from "./log.js";
 import {
-  CHROME_IMAGE,
-  DOCKER_SOCKET,
+  GATEWAY_URL,
   HTTP_HOST,
   HTTP_PORT,
   IDLE_TIMEOUT_MS,
-  LOCAL_STORE_DIR,
-  PERSISTENCE_BACKEND,
   PID_FILE,
-  R2,
 } from "./config.js";
 
 const SERVER_VERSION = "0.1.0";
@@ -84,13 +80,9 @@ async function main() {
     transport: "http",
     host: HTTP_HOST,
     port: HTTP_PORT,
-    chromeImage: CHROME_IMAGE,
-    dockerSocket: DOCKER_SOCKET ?? "(default)",
+    gateway: GATEWAY_URL,
     idleTimeoutMs: IDLE_TIMEOUT_MS,
-    persistence:
-      PERSISTENCE_BACKEND === "r2"
-        ? { backend: "r2", bucket: R2!.bucket, endpoint: R2!.endpoint }
-        : { backend: "local", dir: LOCAL_STORE_DIR },
+    backend: "cloud (cloudflare cloud-browser worker)",
   });
 
   // One transport per MCP session. The Streamable HTTP spec assigns a session
@@ -135,7 +127,7 @@ async function main() {
             ok: true,
             version: SERVER_VERSION,
             pid: process.pid,
-            persistence: PERSISTENCE_BACKEND,
+            gateway: GATEWAY_URL,
             liveSessions: reg.listSessions().map((s) => s.profile),
           }),
         );

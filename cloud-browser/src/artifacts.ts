@@ -36,12 +36,11 @@ export function artifactPath(profile: string): string {
 // noVNC UI when they pop it out (settings, keyboard remapping, etc).
 function liveViewHtml(profile: string, novncUrl: string): string {
   const p = escapeHtml(profile);
+  // novncUrl already points at our minimal embed.html (bare canvas wired up
+  // with RFB.js, no control bar). Same URL for iframe + popout — auth flows
+  // automatically because the user's browser already has the gateway cookie.
+  const embedUrl = escapeHtml(novncUrl);
   const fullUrl = escapeHtml(novncUrl);
-  // Swap vnc.html for our custom embed.html (served by websockify from the
-  // same noVNC origin). embed.html is a bare canvas wired up with RFB.js —
-  // no control bar, no status strip, no "Send Ctrl-Alt-Del" button — so the
-  // iframe shows nothing but the live browser, no cropping needed.
-  const embedUrl = escapeHtml(novncUrl.replace(/\/vnc\.html(\?.*)?$/, "/embed.html"));
   return `<!doctype html>
 <html lang="en">
 <head>

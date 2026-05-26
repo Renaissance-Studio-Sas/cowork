@@ -1,26 +1,27 @@
 // In-process session registry: profile-name → live binding.
 //
-// One session per profile per MCP process (we treat profile name as the
-// browser handle). An agent can hold multiple sessions concurrently (one per
-// distinct profile). Across MCP processes, sessions on the same profile are
-// allowed (each gets its own physical userDataDir) — they last-writer-wins on
-// release.
+// One session per profile per MCP process — the profile name is the browser
+// handle the agent uses. Multiple agents in the same MCP that ask for the
+// same profile name share one container. Across MCP processes there's no
+// coordination (each gets its own remote session).
+//
+// The container itself runs in Cloudflare via the cloud-browser infra worker
+// (monorepo/infra/workers/cloud-browser). Profile state is currently
+// ephemeral — each acquire spins up a fresh container; nothing is restored
+// or saved. Persistence will be wired back in once the cloud side learns to
+// snapshot /profile to R2 on idle shutdown.
 
 import { chromium, type Browser, type BrowserContext } from "playwright-core";
 import { IDLE_TIMEOUT_MS } from "./config.js";
+import { authHeaders } from "./auth.js";
+import * as cloud from "./cloud-client.js";
 import { log } from "./log.js";
-import * as docker from "./docker-client.js";
-import * as persistence from "./persistence.js";
-import * as store from "./profile-store.js";
 
 export interface Session {
   profile: string;
   sessionId: string;
-  containerId: string;
-  cdpPort: number;
-  novncPort: number;
+  cdpWsEndpoint: string;
   novncUrl: string;
-  profileDir: string;
   browser: Browser;
   context: BrowserContext;
   activePageIndex: number;
@@ -49,7 +50,6 @@ export interface AcquireResult {
   reused: boolean;
 }
 
-// Acquire (or reuse) a session for the given profile.
 export async function acquire(profile: string): Promise<AcquireResult> {
   const existing = sessions.get(profile);
   if (existing) {
@@ -59,35 +59,20 @@ export async function acquire(profile: string): Promise<AcquireResult> {
 
   log.info("acquiring profile", { profile });
 
-  // 1. Make a fresh per-session profile dir and seed it from the persistence
-  //    backend (R2 or local folder) if a baseline exists for this profile.
-  const { dir: profileDir, sessionId } = await store.makeFreshProfileDir(profile);
-  try {
-    const loaded = await persistence.loadProfileInto(profile, profileDir);
-    if (loaded) log.info("seeded profile from persistence", { profile, dir: profileDir, backend: persistence.backend });
-    else log.info("no baseline — starting from empty profile", { profile, backend: persistence.backend });
-  } catch (e) {
-    await store.deleteProfileDir(profileDir);
-    throw e;
-  }
+  const remote = await cloud.createSession(profile);
 
-  // 2. Spawn the container with the dir mounted.
-  let spawned: docker.SpawnedContainer;
-  try {
-    spawned = await docker.spawn({ profile, hostProfileDir: profileDir });
-  } catch (e) {
-    await store.deleteProfileDir(profileDir);
-    throw e;
-  }
-
-  // 3. Wait for CDP + attach Playwright.
   let browser: Browser;
   try {
-    const cdpUrl = await docker.waitForCdpReady(spawned.cdpPort);
-    browser = await chromium.connectOverCDP(cdpUrl);
+    // The wsEndpoint is wss://app.rowads.studio/api/browser/.../cdp/...; we
+    // attach the gateway session cookie so the WebSocket upgrade authenticates.
+    browser = await chromium.connectOverCDP({
+      wsEndpoint: remote.cdpWsEndpoint,
+      headers: authHeaders(),
+    });
   } catch (e) {
-    await docker.stop(spawned.id, 1);
-    await store.deleteProfileDir(profileDir);
+    // Tear the remote session down — no point leaving a container running we
+    // couldn't connect to.
+    await cloud.terminateSession(remote.sessionId);
     throw e;
   }
 
@@ -105,12 +90,9 @@ export async function acquire(profile: string): Promise<AcquireResult> {
   const now = Date.now();
   const session: Session = {
     profile,
-    sessionId,
-    containerId: spawned.id,
-    cdpPort: spawned.cdpPort,
-    novncPort: spawned.novncPort,
-    novncUrl: `http://127.0.0.1:${spawned.novncPort}/vnc.html?autoconnect=1&resize=remote`,
-    profileDir,
+    sessionId: remote.sessionId,
+    cdpWsEndpoint: remote.cdpWsEndpoint,
+    novncUrl: remote.novncUrl,
     browser,
     context,
     activePageIndex: 0,
@@ -126,7 +108,6 @@ export interface ReleaseResult {
   persisted: boolean;
 }
 
-// Release a session: stop container, persist to backend, clean up.
 export async function release(profile: string): Promise<ReleaseResult> {
   const s = sessions.get(profile);
   if (!s) return { persisted: false };
@@ -140,27 +121,14 @@ export async function release(profile: string): Promise<ReleaseResult> {
     log.debug("playwright close error", { err: String(e) });
   }
 
-  // Stop the container gracefully so chromium flushes cookie DB.
-  await docker.stop(s.containerId, 10);
+  await cloud.terminateSession(s.sessionId);
 
-  // Persist the session dir (filtering caches) via the active backend. On
-  // failure, leave the session dir intact so a human can recover.
-  let persisted = false;
-  try {
-    persisted = await persistence.saveProfileFrom(profile, s.profileDir, s.sessionId);
-    await store.deleteProfileDir(s.profileDir);
-  } catch (e) {
-    log.error("failed to persist profile; session dir preserved for recovery", {
-      profile,
-      dir: s.profileDir,
-      backend: persistence.backend,
-      err: String(e),
-    });
-  }
-  return { persisted };
+  // Persistence is currently a no-op: profile state lives only inside the
+  // container's filesystem and is destroyed with it. Returning persisted:false
+  // makes that visible to the agent so it doesn't expect logins to survive.
+  return { persisted: false };
 }
 
-// Release every session in parallel. Used on SIGTERM / SIGINT.
 export async function releaseAll(): Promise<void> {
   const profiles = [...sessions.keys()];
   log.info("releasing all sessions", { count: profiles.length });
@@ -186,12 +154,10 @@ function startReaperIfNeeded(): void {
       clearInterval(reaperTimer);
       reaperTimer = null;
     }
-  }, 60_000); // check every minute
-  // Don't keep the event loop alive solely for the reaper
+  }, 60_000);
   reaperTimer.unref?.();
 }
 
-// Look up the active page within a profile's session.
 export function activePage(profile: string) {
   const s = sessions.get(profile);
   if (!s) throw new Error(`No active session for profile "${profile}". Call browser_use_profile first.`);
