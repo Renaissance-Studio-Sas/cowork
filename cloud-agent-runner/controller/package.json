@@ -1,0 +1,14 @@
+{
+  "name": "rowads-agent-controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
