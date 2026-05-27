@@ -182,8 +182,16 @@ export function MessageStream({
           url: sysMsg.url,
           message: sysMsg.message ?? "Sign in to continue.",
         });
+      } else if (sysMsg.subtype === "auth_submitted") {
+        // Code was POSTed to the runner — optimistically dismiss the card so
+        // the chat returns to its working state. The submit button no longer
+        // sits on "Waiting…". If setup-token rejects the code, an
+        // `auth_failed` event arrives and the user sees the error.
+        for (let k = items.length - 1; k >= 0; k--) {
+          if (items[k].kind === "auth-card") items.splice(k, 1);
+        }
       } else if (sysMsg.subtype === "auth_done") {
-        // Auth succeeded — drop the card. A small confirmation note replaces it.
+        // Auth fully confirmed — drop any lingering card + show a small note.
         for (let k = items.length - 1; k >= 0; k--) {
           if (items[k].kind === "auth-card") items.splice(k, 1);
         }
@@ -219,7 +227,7 @@ export function MessageStream({
           return (
             <div key={it.key} className="flex justify-end">
               <div className="max-w-[80%] rounded-2xl rounded-br-md bg-[var(--user-bubble)] text-[var(--text)] px-4 py-2.5 text-[14px] leading-relaxed border border-[var(--border)]">
-                {parsed ? <CommentBriefBubble parsed={parsed} /> : <span className="whitespace-pre-wrap">{it.text}</span>}
+                {parsed ? <CommentBriefBubble parsed={parsed} /> : <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{it.text}</span>}
               </div>
             </div>
           );
@@ -396,10 +404,15 @@ function AuthCard({ sessionId, url, message }: { sessionId: string; url: string;
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-block text-[12.5px] text-[var(--accent)] hover:underline break-all pb-2.5"
+          className="inline-flex items-center gap-1.5 mb-3 rounded-md bg-[var(--accent)] text-white text-[12.5px] font-medium px-3 py-1.5 hover:opacity-90"
         >
-          {url}
+          Sign in with Claude
+          <span aria-hidden className="text-[11px]">↗</span>
         </a>
+        <details className="text-[11px] text-[var(--muted)] -mt-2 mb-2">
+          <summary className="cursor-pointer select-none">Use the URL directly</summary>
+          <div className="mt-1 break-all font-mono">{url}</div>
+        </details>
         <form onSubmit={submit} className="flex items-center gap-2 pt-1">
           <input
             type="text"

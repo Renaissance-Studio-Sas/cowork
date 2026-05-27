@@ -74,7 +74,7 @@ export function TodoList({ todos, compact = false }: Props) {
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4">
-      <div className="flex items-center justify-between gap-2 mb-3 pr-6">
+      <div className="flex items-center justify-between gap-2 mb-3 pr-24">
         <span className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold">
           Task Progress
         </span>

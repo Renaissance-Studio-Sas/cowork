@@ -229,40 +229,58 @@ const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback wit
 const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 
-// Heartbeat used to distinguish a genuine cold start (the whole `next dev`
-// process tree was down) from Next.js dev churn — HMR re-evals and worker /
-// helper-process recycles that all re-run this module's top-level code. Auto-
-// resume must only fire on a true restart; otherwise every churn re-pushes a
-// "[Server restarted...]" prompt into whatever session was mid-turn (we've
-// seen 16+ stack up in a single uninterrupted dev run). A PID guard is no good
-// here because in dev there is no single stable "server" PID — parent, worker
-// and short-lived helpers all execute this file under different PIDs. Instead
-// the watchdog touches a heartbeat file every minute while *any* part of the
-// tree is alive; on boot, a fresh heartbeat means the server was up moments
-// ago (churn → skip), a stale/absent one means a real cold start (→ resume).
-const HEARTBEAT_FILE = path.join(
+// Distinguishes a genuine cold start (the `next dev` process is freshly up)
+// from Next.js dev churn (HMR re-evals this module in a new VM context within
+// the same OS process). Auto-resume must only fire on a real restart;
+// otherwise every churn re-pushes a "[Server restarted...]" prompt into
+// whatever session was mid-turn (we've seen 16+ stack up in a single
+// uninterrupted dev run).
+//
+// We write the server's PID to a sidecar file at boot and check it on the
+// next boot:
+//   - PID matches our own       → same process, module re-evaluated in a new
+//                                  VM context (HMR) → churn, skip resume.
+//   - PID is a live, different
+//     process                   → another cowork instance owns this workspace
+//                                  → skip resume to avoid duplicate prompts.
+//   - PID is dead or absent     → previous server died → cold start, resume.
+//
+// PID-alive is more responsive than the prior time-based heartbeat: a manual
+// `Ctrl+C` + `npm run dev` is detected immediately instead of being mis-
+// classified as churn for the first ~2 minutes after the restart.
+const PID_FILE = path.join(
   os.tmpdir(),
-  `cowork-server-${createHash("sha1").update(process.cwd()).digest("hex").slice(0, 8)}.heartbeat`,
+  `cowork-server-${createHash("sha1").update(process.cwd()).digest("hex").slice(0, 8)}.pid`,
 );
-const HEARTBEAT_STALE_MS = 2 * WATCHDOG_INTERVAL_MS; // tolerate one missed tick
 
-function touchHeartbeat(): void {
-  // Sync write: called from setInterval and boot init where we don't await.
-  try { writeFileSync(HEARTBEAT_FILE, String(Date.now())); } catch { /* best effort */ }
+function writePidFile(): void {
+  try { writeFileSync(PID_FILE, String(process.pid)); } catch { /* best effort */ }
 }
 
-// True iff the heartbeat is stale/absent — i.e. the server tree was NOT alive
-// within the last couple of watchdog intervals, so this boot is a real cold
-// start rather than dev churn. Touches the heartbeat before returning so the
-// next churn within this same tree sees it fresh even before the first
-// watchdog tick lands.
+function isPidAlive(pid: number): boolean {
+  try {
+    // Signal 0 doesn't deliver anything — it just probes whether the process
+    // exists and we have permission to signal it. ESRCH means dead.
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but we can't signal it — treat as alive.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function isColdStart(): boolean {
   let cold = true;
   try {
-    const ts = parseInt(readFileSync(HEARTBEAT_FILE, "utf8"), 10);
-    if (Number.isFinite(ts) && Date.now() - ts < HEARTBEAT_STALE_MS) cold = false;
+    const pid = parseInt(readFileSync(PID_FILE, "utf8"), 10);
+    if (Number.isFinite(pid)) {
+      // Same OS process re-evaluating the module (HMR) — not a cold start.
+      if (pid === process.pid) cold = false;
+      // A different process is still alive — another cowork on this workspace.
+      else if (isPidAlive(pid)) cold = false;
+    }
   } catch { /* missing/unreadable → cold start */ }
-  touchHeartbeat();
+  writePidFile();
   return cold;
 }
 
@@ -275,9 +293,6 @@ function isColdStart(): boolean {
 // state to stopped together. resumeSession is responsible for re-opening
 // streams when the user sends another message.
 function runWatchdog() {
-  // Mark the server tree as alive so a boot that follows soon after is
-  // recognised as dev churn rather than a cold start (see isColdStart).
-  touchHeartbeat();
   const now = Date.now();
   for (const s of registry.values()) {
     // A session blocked on a user decision (ExitPlanMode approval or an
@@ -342,10 +357,10 @@ if (!globalThis.__wb_watchdog_interval) {
 //   - globalThis.__wb_reconciled is a fast in-process flag, but dev sometimes
 //     re-evals this module in a fresh VM context whose globalThis isn't shared,
 //     so the flag reads `undefined` and we'd run again.
-//   - isColdStart() is the real gate: it consults the on-disk heartbeat to tell
-//     a true cold start (resume interrupted sessions) from dev churn — HMR and
-//     worker/helper recycles that all re-run this top-level code (skip, so we
-//     don't spam "[Server restarted...]" prompts).
+//   - isColdStart() is the real gate: it consults the on-disk PID file to tell
+//     a true cold start (resume interrupted sessions) from dev churn — HMR re-
+//     evaluating this module in a new VM context within the same OS process
+//     (skip, so we don't spam "[Server restarted...]" prompts).
 if (!globalThis.__wb_reconciled) {
   globalThis.__wb_reconciled = true;
   setImmediate(async () => {
@@ -1306,6 +1321,33 @@ async function pumpEvents(s: RuntimeSession) {
       const modifiedPath = extractModifiedFilePath(msg);
       if (modifiedPath) {
         s.events.emit("file_changed", { path: modifiedPath });
+      }
+
+      // Remote auth flow: the runner emits `system/auth_required` when the
+      // SDK reports "Not logged in" and pivots to claude setup-token. While
+      // the AuthCard waits on the user, the session is genuinely awaiting a
+      // user action — flip out of "running" so the "Working…" indicator
+      // disappears and the UI shows the pending state instead. Flip back to
+      // "running" on auth_done so the SDK restart's events render normally.
+      if (msg.type === "system") {
+        const sub = (msg as { subtype?: string }).subtype;
+        if (sub === "auth_required" && isValidTransition(s.state, "awaiting_input")) {
+          setState(s, "awaiting_input");
+        } else if (
+          (sub === "auth_submitted" || sub === "auth_done")
+          && isValidTransition(s.state, "running")
+        ) {
+          // auth_submitted = code POSTed to runner, optimistic flip back.
+          // auth_done     = setup-token actually finished writing creds.
+          // Either signals "stop showing the AuthCard, resume working state".
+          setState(s, "running");
+        } else if (sub === "auth_failed" && isValidTransition(s.state, "awaiting_input")) {
+          // Reopen the awaiting state — the UI's MessageStream will treat the
+          // next auth_required (if the runner spawns a fresh setup-token) as
+          // a new card. Until then, the error message from the auth_failed
+          // event surfaces in chat.
+          setState(s, "awaiting_input");
+        }
       }
 
       // A `result` event ends the turn. Use the state machine to determine

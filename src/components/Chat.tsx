@@ -117,6 +117,13 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     Map<string, { reason: string | null }>
   >(new Map());
 
+  // Set when the remote runner's `claude setup-token` is waiting on the user
+  // to paste an OAuth code. Same idea as pendingPermissions/Questions/etc —
+  // the session is awaiting user action, not actively computing, so it should
+  // read "pending" not "working". Cleared on `auth_done` (success) or
+  // `auth_failed` (the user can still re-try; AuthCard stays visible).
+  const [pendingAuth, setPendingAuth] = useState(false);
+
   // Sticky completion mark — drives the header badge and the Mark complete /
   // Reopen toggle. Bootstraps from the DTO (which the listing API populates
   // from meta.json) and stays in sync via `completed_changed` SSE events so
@@ -183,6 +190,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   useEffect(() => {
     setMessages([]);
     setServerTodos(null);
+    setClearedTasks(null);
     setState(session.state);
     setStreamConnected(false);
     setHistoryMeta(null);
@@ -277,6 +285,13 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         // message about to render.
         if (msg?.type === "assistant" || msg?.type === "result" || msg?.type === "user") {
           setStreamingText("");
+        }
+        // Inline /login flow: flip the "auth pending" flag so the working
+        // indicator hides and the session reads as "pending" while the user
+        // pastes the OAuth code into the AuthCard. Cleared on auth_done.
+        if (msg?.type === "system") {
+          if (msg?.subtype === "auth_required") setPendingAuth(true);
+          else if (msg?.subtype === "auth_done") setPendingAuth(false);
         }
 
         if (isInitialLoadRef.current) {
@@ -467,6 +482,47 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // Todo panel visibility (defaults to shown when there are todos)
   const [showTodos, setShowTodos] = useState(true);
 
+  // "Clear" snapshot — when the user clicks Clear, we record the current set of
+  // task content strings. The panel stays hidden until a NEW task (one whose
+  // content isn't in this snapshot) appears, at which point we reset to null
+  // and the panel shows again. Persisted to localStorage so reopening the
+  // session keeps it cleared.
+  const clearedTasksKey = `cowork:clearedTasks:${session.id}`;
+  const [clearedTasks, setClearedTasks] = useState<Set<string> | null>(null);
+
+  // Load persisted clear state on session change.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(clearedTasksKey);
+      if (raw) {
+        const arr = JSON.parse(raw) as string[];
+        setClearedTasks(Array.isArray(arr) ? new Set(arr) : null);
+      } else {
+        setClearedTasks(null);
+      }
+    } catch {
+      setClearedTasks(null);
+    }
+  }, [clearedTasksKey]);
+
+  // If the agent adds a new task that wasn't in the cleared snapshot, unhide
+  // and forget the persisted clear (writes happen synchronously alongside the
+  // state update to avoid effect-ordering races on session switch).
+  useEffect(() => {
+    if (clearedTasks === null) return;
+    const hasNew = todos.some((t) => !clearedTasks.has(t.content));
+    if (hasNew) {
+      setClearedTasks(null);
+      try { localStorage.removeItem(clearedTasksKey); } catch {}
+    }
+  }, [todos, clearedTasks, clearedTasksKey]);
+
+  const handleClearTasks = () => {
+    const contents = todos.map((t) => t.content);
+    setClearedTasks(new Set(contents));
+    try { localStorage.setItem(clearedTasksKey, JSON.stringify(contents)); } catch {}
+  };
+
   // Handle file drop/paste
   const handleFiles = useCallback((files: FileAttachment[]) => {
     setAttachments((prev) => [...prev, ...files]);
@@ -619,7 +675,8 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // completion card. State stays "running" while the prompt is open, but the
   // user is the one being asked to act, so we treat it as pending.
   const hasPendingPrompt =
-    pendingPermissions.size > 0 || pendingQuestions.size > 0 || pendingCompletions.size > 0;
+    pendingPermissions.size > 0 || pendingQuestions.size > 0 || pendingCompletions.size > 0
+    || pendingAuth;
   const isWorking = state === "running" && !hasPendingPrompt;
   const isPending = !completed && state !== "error" && !isWorking;
   const stateLabel =
@@ -848,7 +905,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
           {pendingSends.map((p) => (
             <div key={p.id} className="flex justify-end">
               <div className="max-w-[80%] rounded-2xl rounded-br-md bg-[var(--user-bubble)] text-[var(--text)] px-4 py-2.5 text-[14px] leading-relaxed border border-[var(--border)]">
-                <span className="whitespace-pre-wrap">{p.text}</span>
+                <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{p.text}</span>
               </div>
             </div>
           ))}
@@ -876,22 +933,31 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
       </div>
 
       {/* Todo list above input when present */}
-      {todos.length > 0 && (
+      {todos.length > 0 && clearedTasks === null && (
         <div className="border-t border-[var(--border)] bg-[var(--bg)]">
           <div className="max-w-[760px] mx-auto px-6">
             {showTodos ? (
               <div className="py-3">
                 <div className="relative">
                   <TodoList todos={todos} />
-                  <button
-                    onClick={() => setShowTodos(false)}
-                    className="absolute top-2 right-2 text-[var(--muted)] hover:text-[var(--text)] p-1.5 rounded hover:bg-[var(--panel-2)] transition"
-                    title="Hide tasks"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M18 6L6 18M6 6l12 12" />
-                    </svg>
-                  </button>
+                  <div className="absolute top-2 right-2 flex items-center gap-1">
+                    <button
+                      onClick={handleClearTasks}
+                      className="text-[11px] text-[var(--muted)] hover:text-[var(--text)] px-2 py-1 rounded hover:bg-[var(--panel-2)] transition"
+                      title="Clear — hide until new tasks are added"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={() => setShowTodos(false)}
+                      className="text-[var(--muted)] hover:text-[var(--text)] p-1.5 rounded hover:bg-[var(--panel-2)] transition"
+                      title="Hide tasks"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
