@@ -8,7 +8,7 @@ import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDrop
 import { WorkingIndicator } from "./WorkingIndicator";
 import { useStickyDraft } from "./chat/useStickyDraft";
 import { MessageStream } from "./chat/MessageStream";
-import { isVisibleSDKMessage } from "./chat/utils";
+import { extractText, isVisibleSDKMessage } from "./chat/utils";
 import { Markdown } from "./chat/Markdown";
 import {
   PlanApprovalCard,
@@ -28,6 +28,23 @@ interface UploadedFile {
 
 // Number of messages to load initially and per batch
 const PAGE_SIZE = 50;
+
+// Detects the SSE echo of a user-typed message — used to pop the optimistic
+// bubble queue. Skips tool_result echoes (no visible text), subagent messages,
+// and SDK-injected synthetics (resume prompt, interrupt note, compaction
+// summary) so those don't accidentally consume a real send.
+function isRealUserEcho(msg: unknown): boolean {
+  const m = msg as { type?: string; parent_tool_use_id?: string | null; message?: { content?: unknown } };
+  if (m?.type !== "user" || m.parent_tool_use_id) return false;
+  const text = extractText(m.message?.content)
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, "")
+    .trim();
+  if (!text) return false;
+  if (text === "[Server restarted — please continue where you left off.]") return false;
+  if (text === "[Request interrupted by user]") return false;
+  if (text.startsWith("This session is being continued from a previous conversation that ran out of context.")) return false;
+  return true;
+}
 
 interface Brief {
   label: string;
@@ -59,7 +76,10 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   const [messages, setMessages] = useState<SDKMessageLite[]>([]);
   const [state, setState] = useState<string>("idle");
   const [draft, setDraft] = useStickyDraft(session.id);
-  const [sending, setSending] = useState(false);
+  // Optimistic user bubbles — rendered immediately when the user hits send so
+  // the message appears without waiting for the SSE echo. Each entry is popped
+  // (FIFO) when the corresponding `user` SDK message arrives on the stream.
+  const [pendingSends, setPendingSends] = useState<Array<{ id: string; text: string }>>([]);
   // Track whether we have an active SSE connection (session is truly live)
   const [streamConnected, setStreamConnected] = useState(false);
   // In-progress streaming text for the current assistant turn. Accumulates
@@ -77,7 +97,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
 
   // File attachment state
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
 
   // Tool calls awaiting user approval (today: only ExitPlanMode). Keyed by
   // toolUseId. Populated from SSE `permission_request` events, cleared on
@@ -153,6 +172,14 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
+  // Latest draft + attachments, read at send-error time. Async send() captures
+  // both in closure at call time and can't peek at what the user typed while
+  // the request was in flight, so we mirror them into refs for the error path.
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+
   useEffect(() => {
     setMessages([]);
     setServerTodos(null);
@@ -162,6 +189,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     setPendingPermissions(new Map());
     setPendingQuestions(new Map());
     setPendingCompletions(new Map());
+    setPendingSends([]);
     setCompletedState(session.completed);
     isInitialLoadRef.current = true;
 
@@ -258,6 +286,12 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         } else {
           // Append new message and auto-scroll if at bottom
           setMessages((p) => [...p, msg]);
+          // When the SSE echoes back a real user-typed message, pop the FIFO
+          // head of pendingSends so the optimistic bubble swaps in for the
+          // canonical one in the same React batch (no flicker).
+          if (isRealUserEcho(msg)) {
+            setPendingSends((p) => p.slice(1));
+          }
           if (isAtBottomRef.current) {
             requestAnimationFrame(() => {
               const el = scrollRef.current;
@@ -466,32 +500,53 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   };
 
   const send = async () => {
-    if (!isLive || (!draft.trim() && attachments.length === 0) || sending || uploading) return;
-    setSending(true);
-    setUploading(attachments.length > 0);
+    if (!isLive || (!draft.trim() && attachments.length === 0)) return;
+
+    const text = draft.trim();
+    const messageText = text || "(attached files)";
+    const filesToSend = attachments;
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    // Optimistic UI: clear the composer and show the bubble immediately. The
+    // SSE echo from the server (sendInput emits synchronously) will swap in
+    // the canonical message and pop this pending entry — typically within a
+    // single React batch, so there's no visible flicker.
+    setDraft("");
+    setAttachments([]);
+    setPendingSends((prev) => [...prev, { id: pendingId, text: messageText }]);
+    if (isAtBottomRef.current) {
+      requestAnimationFrame(() => {
+        const el = scrollRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    }
+
     try {
-      // Upload attachments first
       let uploadedFiles: UploadedFile[] = [];
-      if (attachments.length > 0) {
-        uploadedFiles = await uploadFiles(attachments);
+      if (filesToSend.length > 0) {
+        uploadedFiles = await uploadFiles(filesToSend);
       }
 
-      await fetch(`/api/sessions/${session.id}/input`, {
+      const res = await fetch(`/api/sessions/${session.id}/input`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: draft.trim() || "(attached files)",
+          message: messageText,
           projectSlug: session.projectSlug,
           taskSlug: session.taskSlug,
           files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
           openArtifact: openArtifactPath || undefined,
         }),
       });
-      setDraft("");
-      setAttachments([]);
-    } finally {
-      setSending(false);
-      setUploading(false);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      // Send failed — drop the optimistic bubble and restore the input so the
+      // user can retry. Only restore the draft if the composer is still empty
+      // (the user might have started typing the next message already).
+      console.error("Failed to send message:", err);
+      setPendingSends((prev) => prev.filter((p) => p.id !== pendingId));
+      if (!draftRef.current) setDraft(text);
+      if (attachmentsRef.current.length === 0) setAttachments(filesToSend);
     }
   };
 
@@ -622,6 +677,26 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                   <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: stateColor }} />
                 )}
               </span>
+              {(session.model || session.runtime) && (
+                <span className="text-[11px] shrink-0 inline-flex items-center gap-0.5 text-[var(--muted)]">
+                  <span
+                    className="font-mono"
+                    title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+                  >
+                    {session.model ?? session.runtime}
+                  </span>
+                  <span
+                    className="font-mono"
+                    title={
+                      session.effort
+                        ? `Thinking effort: ${session.effort}`
+                        : "Thinking effort: high (SDK default)"
+                    }
+                  >
+                    ({session.effort ?? "high"})
+                  </span>
+                </span>
+              )}
             </div>
           ) : (
             <div className="text-[14px] truncate">{session.title || "(empty)"}</div>
@@ -767,6 +842,16 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
             </div>
           )}
           <MessageStream messages={messages} session={session} onChange={onChange} />
+          {/* Optimistic user bubbles for messages the user just hit send on
+              but whose SSE echo hasn't landed yet. Styled identically to real
+              user bubbles in MessageStream so the swap is invisible. */}
+          {pendingSends.map((p) => (
+            <div key={p.id} className="flex justify-end">
+              <div className="max-w-[80%] rounded-2xl rounded-br-md bg-[var(--user-bubble)] text-[var(--text)] px-4 py-2.5 text-[14px] leading-relaxed border border-[var(--border)]">
+                <span className="whitespace-pre-wrap">{p.text}</span>
+              </div>
+            </div>
+          ))}
           {/* In-progress streamed text from the current assistant turn. Lives
               outside the persisted message stream — gets cleared and replaced
               by the final assistant message when the turn completes. Rendered
@@ -778,7 +863,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               <span className="dots inline-block ml-0.5" aria-hidden />
             </div>
           )}
-          {messages.length === 0 && !streamingText && (
+          {messages.length === 0 && !streamingText && pendingSends.length === 0 && (
             <div className="text-[var(--muted)] text-[13px]">Waiting for the agent to start…</div>
           )}
           {isWorking && !streamingText && (
@@ -907,11 +992,11 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                 />
                 <button
                   onClick={send}
-                  disabled={(!draft.trim() && attachments.length === 0) || sending || uploading}
+                  disabled={!draft.trim() && attachments.length === 0}
                   className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
                   title="Send message (↵)"
                   aria-label="Send message"
-                >{uploading ? "…" : "↑"}</button>
+                >↑</button>
                 {isWorking && (
                   <button
                     onClick={stop}

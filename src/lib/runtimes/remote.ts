@@ -12,15 +12,27 @@
 //   WORKSPACE_ROOT          host workspace; used to rewrite cwd into the
 //                            container view (/workspace).
 //
+// Workbench-tool proxying:
+//   - cowork serializes every workbench tool (comments, AskUserQuestion,
+//     session-management, planning) to JSON Schema and passes them to the
+//     runner at session start. The runner registers a proxy MCP server that
+//     emits a `workbench_tool_call` SSE event with a correlation id when the
+//     SDK invokes a tool. This file intercepts those events (they don't
+//     reach the chat UI), runs the local handler on cowork's side, and POSTs
+//     the result back to /sessions/{id}/tool-result. Multiple in-flight
+//     calls run concurrently — handlers are dispatched fire-and-forget and
+//     resolutions race correctly because each is keyed by id.
+//
 // MVP caveats:
-//   - workbench tools (comments, AskUserQuestion, completion-suggest) and
-//     canUseTool approvals are NOT forwarded. Remote agents run in
-//     bypassPermissions without those tools. Sessions that need them
-//     should use runtime: "claude".
-//   - MCP setMcpServers / mcpServerStatus are no-ops in remote mode.
+//   - canUseTool is NOT forwarded — the runner auto-allows every tool
+//     (bypassPermissions). ExitPlanMode and other permission flows therefore
+//     don't gate in remote mode.
+//   - MCP setMcpServers / mcpServerStatus are no-ops in remote mode (no
+//     chrome-bridge dynamic MCP).
 //   - cwd is remapped from the laptop workspace path into /workspace inside
 //     the container. Paths outside the workspace collapse to /workspace.
 
+import { z } from "zod";
 import type {
   AgentRuntime,
   AgentQuery,
@@ -30,6 +42,7 @@ import type {
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
 } from "../agent-runtime";
+import type { WorkbenchTool, ToolCallResult } from "../workbench-tools/types";
 
 const CONTROLLER_URL = process.env.AGENT_CONTROLLER_URL ?? "http://127.0.0.1:8090";
 const CONTROLLER_TOKEN = process.env.AGENT_CONTROLLER_TOKEN ?? "";
@@ -82,7 +95,8 @@ async function destroyControllerSession(sessionId: string): Promise<void> {
 
 // Strip non-serializable fields from cowork's options blob. Function refs
 // (canUseTool, mcpServers with handlers, workbenchToolGroups) live host-side;
-// forwarding them would require bidirectional RPC and is out of MVP scope.
+// canUseTool and runtime-bound MCP servers stay host-only. Workbench tools
+// get their own serialized channel (see serializeWorkbenchTools below).
 function serializeOptions(opts: AgentQueryOptions): Record<string, unknown> {
   const o = (opts.options ?? {}) as Record<string, unknown>;
   const out: Record<string, unknown> = { ...o };
@@ -97,6 +111,107 @@ function serializeOptions(opts: AgentQueryOptions): Record<string, unknown> {
     if (k in opts && !(k in out)) out[k] = (opts as Record<string, unknown>)[k];
   }
   return out;
+}
+
+// One workbench tool descriptor as it travels over the wire to the runner.
+// The runner uses zod v4's fromJSONSchema to reconstruct the field-level
+// types it needs to register a proxy with the Claude SDK's tool() helper.
+interface WorkbenchToolSpec {
+  server: string;
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  alwaysLoad?: boolean;
+}
+
+// Build the WorkbenchToolSpec[] payload from cowork's workbenchToolGroups.
+// Returns null if there are no groups so the runner can skip the proxy MCP
+// server entirely.
+function serializeWorkbenchTools(opts: AgentQueryOptions): {
+  specs: WorkbenchToolSpec[];
+  handlers: Map<string, (args: unknown) => Promise<ToolCallResult>>;
+} | null {
+  const groups = (opts as unknown as {
+    options?: { workbenchToolGroups?: Array<{ name: string; tools: WorkbenchTool[] }> };
+  }).options?.workbenchToolGroups;
+  if (!groups?.length) return null;
+
+  const specs: WorkbenchToolSpec[] = [];
+  // Keyed by "server/tool" so dispatchWorkbenchCall can look up the handler
+  // when the runner reports a call.
+  const handlers = new Map<string, (args: unknown) => Promise<ToolCallResult>>();
+  for (const group of groups) {
+    for (const t of group.tools) {
+      const objectSchema = z.object(t.schema);
+      const inputSchema = z.toJSONSchema(objectSchema, { target: "draft-7" });
+      specs.push({
+        server: group.name,
+        name: t.name,
+        description: t.description,
+        inputSchema,
+        alwaysLoad: t.alwaysLoad,
+      });
+      handlers.set(`${group.name}/${t.name}`, t.handler);
+    }
+  }
+  return { specs, handlers };
+}
+
+interface WorkbenchToolCallEvent {
+  type: "workbench_tool_call";
+  id: string;
+  server: string;
+  tool: string;
+  arguments: unknown;
+}
+
+function isWorkbenchToolCall(ev: unknown): ev is WorkbenchToolCallEvent {
+  return (
+    !!ev
+    && typeof ev === "object"
+    && (ev as { type?: string }).type === "workbench_tool_call"
+    && typeof (ev as WorkbenchToolCallEvent).id === "string"
+  );
+}
+
+// Dispatch one workbench tool call locally and POST the result back to the
+// runner. Called fire-and-forget so concurrent calls don't serialize on each
+// other — multiple in-flight handlers race freely and the runner resolves
+// each pending entry by id.
+async function dispatchWorkbenchCall(
+  controller: ControllerSession,
+  sessionId: string,
+  ev: WorkbenchToolCallEvent,
+  handlers: Map<string, (args: unknown) => Promise<ToolCallResult>>,
+): Promise<void> {
+  const key = `${ev.server}/${ev.tool}`;
+  const handler = handlers.get(key);
+  let payload: { id: string; result?: ToolCallResult; error?: string };
+  if (!handler) {
+    payload = { id: ev.id, error: `unknown workbench tool: ${key}` };
+  } else {
+    try {
+      const result = await handler(ev.arguments);
+      payload = { id: ev.id, result };
+    } catch (err) {
+      payload = { id: ev.id, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  try {
+    await fetch(`${controller.runner_url}/sessions/${sessionId}/tool-result`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${controller.runner_token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    // The runner closed before we could deliver — likely the session ended
+    // while a handler was in flight. Drop quietly; the SDK on the runner
+    // side will see the tool call timeout or the parent process exit.
+    console.warn(`[remote] tool-result POST failed for ${key}: ${(e as Error).message}`);
+  }
 }
 
 function remapPath(p: string | undefined): string {
@@ -152,6 +267,10 @@ class RemoteAgentQuery implements AgentQuery {
   }> | null = null;
   private inputDrainPromise: Promise<void> | null = null;
   private interrupted = false;
+  // Local workbench tool handlers, keyed by "server/tool". Populated at boot
+  // from opts.options.workbenchToolGroups; consulted whenever the runner
+  // emits a workbench_tool_call event over SSE.
+  private workbenchHandlers: Map<string, (args: unknown) => Promise<ToolCallResult>> = new Map();
 
   constructor(opts: AgentQueryOptions) { this.opts = opts; }
 
@@ -186,6 +305,10 @@ class RemoteAgentQuery implements AgentQuery {
       if (!next.done) firstMessage = next.value;
 
       const sessionId = controller.session_id;
+      // Serialize workbench tools (if any) so the runner can register a proxy
+      // MCP server. Hold onto the local handler map for SSE dispatch.
+      const wb = serializeWorkbenchTools(this.opts);
+      if (wb) this.workbenchHandlers = wb.handlers;
       const r = await fetch(`${controller.runner_url}/sessions`, {
         method: "POST",
         headers: {
@@ -196,6 +319,7 @@ class RemoteAgentQuery implements AgentQuery {
           session_id: sessionId,
           options: serializeOptions(this.opts),
           message: firstMessage,
+          workbenchTools: wb?.specs ?? [],
         }),
       });
       if (!r.ok) {
@@ -265,19 +389,55 @@ class RemoteAgentQuery implements AgentQuery {
           }
           continue;
         }
-        try { yield JSON.parse(frame.data) as AgentEvent; }
+        let parsed: unknown;
+        try { parsed = JSON.parse(frame.data); }
         catch {
           yield {
             type: "system",
             subtype: "error",
             message: `malformed SSE frame: ${frame.data.slice(0, 200)}`,
           } as unknown as AgentEvent;
+          continue;
         }
+        // Workbench tool call → run the local handler and POST the result
+        // back. Fire-and-forget so multiple parallel calls don't block the
+        // SSE consumer or each other.
+        if (isWorkbenchToolCall(parsed)) {
+          void dispatchWorkbenchCall(controller, sessionId, parsed, this.workbenchHandlers);
+          continue;
+        }
+        yield parsed as AgentEvent;
       }
     } finally {
       this.abort.abort();
       await destroyControllerSession(controller.session_id);
     }
+  }
+
+  // Forward an arbitrary POST to the underlying runner. Used by cowork's API
+  // routes (/api/sessions/[id]/auth-code, etc.) to talk to endpoints that
+  // weren't part of the AgentRuntime interface. Returns the runner's status
+  // code + parsed body so the route can mirror it back to the browser.
+  async relayToRunner(
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; body: unknown }> {
+    if (!this.bootPromise) {
+      throw new Error("remote runner has not been provisioned yet");
+    }
+    const { controller, sessionId } = await this.bootPromise;
+    const r = await fetch(`${controller.runner_url}/sessions/${sessionId}${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${controller.runner_token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    let parsed: unknown = text;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* keep raw text */ }
+    return { status: r.status, body: parsed };
   }
 
   async interrupt(): Promise<void> {

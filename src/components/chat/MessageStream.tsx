@@ -33,7 +33,12 @@ export function MessageStream({
     | { kind: "system-info"; key: string; text: string }
     | { kind: "system-note"; key: string; text: string }
     | { kind: "system-error"; key: string; text: string }
-    | { kind: "system-compaction"; key: string; summary: string };
+    | { kind: "system-compaction"; key: string; summary: string }
+    // Inline /login flow for remote sessions. Surfaced when the runner emits
+    // `auth_required` (SDK threw "Not logged in") and stays until a later
+    // `auth_done` event hides it. The card has a clickable OAuth URL plus a
+    // code-paste field that POSTs to /api/sessions/[id]/auth-code.
+    | { kind: "auth-card"; key: string; url: string; message: string };
 
   // Find the (i, j) index of the last propose_plan / propose_task tool_use
   // so we know which one to render as an actionable card. Earlier proposals
@@ -151,7 +156,7 @@ export function MessageStream({
         items.push({ kind: "result", key: `r-${i}` });
       }
     } else if (mm.type === "system") {
-      const sysMsg = m as { subtype?: string; message?: string };
+      const sysMsg = m as { subtype?: string; message?: string; url?: string };
       if (sysMsg.subtype === "info" && sysMsg.message) {
         flush();
         items.push({ kind: "system-info", key: `si-${i}`, text: sysMsg.message });
@@ -163,6 +168,44 @@ export function MessageStream({
         // before the server-side fix, so keep filtering it on replay.)
         if (isInterruptNoise(sysMsg.message)) return;
         items.push({ kind: "system-error", key: `se-${i}`, text: sysMsg.message });
+      } else if (sysMsg.subtype === "auth_required" && sysMsg.url) {
+        // Remove any earlier auth-card so we only ever render the most recent
+        // one (a fresh /auth-start while a stale card is sitting around would
+        // otherwise stack two URLs in the chat).
+        for (let k = items.length - 1; k >= 0; k--) {
+          if (items[k].kind === "auth-card") items.splice(k, 1);
+        }
+        flush();
+        items.push({
+          kind: "auth-card",
+          key: `auth-${i}`,
+          url: sysMsg.url,
+          message: sysMsg.message ?? "Sign in to continue.",
+        });
+      } else if (sysMsg.subtype === "auth_done") {
+        // Auth succeeded — drop the card. A small confirmation note replaces it.
+        for (let k = items.length - 1; k >= 0; k--) {
+          if (items[k].kind === "auth-card") items.splice(k, 1);
+        }
+        flush();
+        items.push({
+          kind: "system-info",
+          key: `ad-${i}`,
+          text: sysMsg.message ?? "Authenticated — resuming session.",
+        });
+      } else if (sysMsg.subtype === "auth_failed" && sysMsg.message) {
+        flush();
+        items.push({ kind: "system-error", key: `af-${i}`, text: sysMsg.message });
+      } else if (sysMsg.subtype === "auth_pending") {
+        // The runner saw an auth error and is bringing up setup-token — no
+        // URL yet. Render a transient note; the card replaces it when the
+        // URL lands.
+        flush();
+        items.push({
+          kind: "system-info",
+          key: `ap-${i}`,
+          text: "Claude is not logged in — preparing sign-in…",
+        });
       }
     }
   });
@@ -237,6 +280,16 @@ export function MessageStream({
             </div>
           );
         }
+        if (it.kind === "auth-card") {
+          return (
+            <AuthCard
+              key={it.key}
+              sessionId={session.id}
+              url={it.url}
+              message={it.message}
+            />
+          );
+        }
         if (it.kind === "system-compaction") {
           return (
             <div key={it.key} className="flex justify-center">
@@ -293,6 +346,84 @@ function parseAddressCommentsMessage(text: string): null | {
   }
   if (items.length === 0) return null;
   return { filePath, items, footer };
+}
+
+// Inline auth card for the /login flow. Renders the OAuth URL the runner
+// captured from `claude setup-token` and a code-paste field. On submit, POSTs
+// to /api/sessions/[id]/auth-code which forwards into the runner's setup-
+// token subprocess. The card stays mounted until the SSE stream delivers an
+// `auth_done` event (handled by MessageStream by dropping the card item).
+function AuthCard({ sessionId, url, message }: { sessionId: string; url: string; message: string }) {
+  const [code, setCode] = useState("");
+  const [status, setStatus] = useState<"idle" | "sending" | "done" | "error">("idle");
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!code.trim()) return;
+    setStatus("sending");
+    setErrMsg(null);
+    try {
+      const r = await fetch(`/api/sessions/${sessionId}/auth-code`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code: code.trim() }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({} as Record<string, unknown>));
+        setStatus("error");
+        setErrMsg(typeof body.error === "string" ? body.error : `HTTP ${r.status}`);
+        return;
+      }
+      // Don't flip to "done" here — wait for the SSE auth_done event which
+      // unmounts the card. The 202 response just means the code was queued.
+      setStatus("done");
+    } catch (err) {
+      setStatus("error");
+      setErrMsg(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="flex justify-center">
+      <div className="max-w-[80%] w-full rounded-lg bg-[var(--bg-2)] border border-[var(--accent)]/40 px-4 py-3 text-[13px] leading-relaxed">
+        <div className="flex items-center gap-2 text-[var(--text)] font-medium pb-1">
+          <span className="text-[14px]">🔐</span>
+          <span>Sign in to Claude Code</span>
+        </div>
+        <div className="text-[12.5px] text-[var(--muted)] pb-2.5">{message}</div>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-block text-[12.5px] text-[var(--accent)] hover:underline break-all pb-2.5"
+        >
+          {url}
+        </a>
+        <form onSubmit={submit} className="flex items-center gap-2 pt-1">
+          <input
+            type="text"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="Paste authorization code…"
+            autoFocus
+            disabled={status === "sending" || status === "done"}
+            className="flex-1 rounded border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
+          />
+          <button
+            type="submit"
+            disabled={!code.trim() || status === "sending" || status === "done"}
+            className="rounded bg-[var(--accent)] text-white text-[12.5px] font-medium px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {status === "sending" ? "Submitting…" : status === "done" ? "Waiting…" : "Submit"}
+          </button>
+        </form>
+        {errMsg && (
+          <div className="mt-2 text-[12px] text-red-400">{errMsg}</div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function CommentBriefBubble({ parsed }: { parsed: NonNullable<ReturnType<typeof parseAddressCommentsMessage>> }) {

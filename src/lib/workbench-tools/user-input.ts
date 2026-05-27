@@ -16,6 +16,7 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { defineTool, type WorkbenchTool } from "./types";
 import { getSession } from "../sessions";
+import { persistPendingPromptFlag } from "../sessions/meta";
 
 const optionSchema = z.object({
   label: z.string().describe("The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice."),
@@ -72,6 +73,9 @@ This tool is wired to the built-in AskUserQuestion via toolAliases — calling e
             requestedAt: new Date(),
           });
           s.events.emit("question_request", { questionId, questions: items });
+          // Persist hasPendingPrompt so a server restart while the user is
+          // answering doesn't auto-push a "[Server restarted...]" prompt.
+          void persistPendingPromptFlag(s);
         });
 
         if (answers === null) {

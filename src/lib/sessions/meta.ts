@@ -85,3 +85,19 @@ export async function persistSessionState(s: RuntimeSession, state: SessionState
     }
   });
 }
+
+// Persist whether the session is currently parked on a user decision
+// (pending permission / question / completion). The boot-time auto-resume
+// pass reads this so it can skip sessions that were waiting for the user —
+// otherwise it would push a "[Server restarted...]" prompt into them, blowing
+// away the parked tool call.
+export async function persistPendingPromptFlag(s: RuntimeSession): Promise<void> {
+  const hasPendingPrompt =
+    s.pendingPermissions.size > 0
+    || (s.pendingQuestions?.size ?? 0) > 0
+    || (s.pendingCompletions?.size ?? 0) > 0;
+  await updateMeta(s, (meta) => {
+    if (hasPendingPrompt) meta.hasPendingPrompt = true;
+    else delete meta.hasPendingPrompt;
+  });
+}

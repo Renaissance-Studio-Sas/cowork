@@ -83,10 +83,13 @@ export function isCompletedState(state: SessionState): boolean {
  * Terminal states (idle/error/stopped) are persisted so the UI shows the
  * correct state after refresh. "running" is also persisted so the boot-time
  * auto-resume pass can detect sessions that were mid-process when the server
- * died (no terminal state ever got written).
+ * died (no terminal state ever got written). "awaiting_input" is persisted so
+ * the auto-resume pass can distinguish a pending session (don't push a restart
+ * prompt — the user resumes it manually) from one that was genuinely running
+ * mid-turn.
  */
 export function shouldPersistState(state: SessionState): boolean {
-  return state === "idle" || state === "error" || state === "stopped" || state === "running";
+  return state === "idle" || state === "error" || state === "stopped" || state === "running" || state === "awaiting_input";
 }
 
 /**

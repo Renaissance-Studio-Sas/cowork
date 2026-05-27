@@ -64,9 +64,13 @@ export async function GET(req: Request) {
   }
   try {
     const data = await fs.readFile(full);
+    const name = path.basename(file);
+    const asciiName = name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+    const disposition = `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(name)}`;
     return new Response(new Uint8Array(data), {
       headers: {
         "Content-Type": mimeFor(file),
+        "Content-Disposition": disposition,
         "Cache-Control": "no-store",
       },
     });

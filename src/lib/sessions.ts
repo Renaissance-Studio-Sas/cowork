@@ -33,7 +33,7 @@ import {
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
-import { updateMeta, persistSdkSessionId, persistSessionState } from "./sessions/meta";
+import { updateMeta, persistSdkSessionId, persistSessionState, persistPendingPromptFlag } from "./sessions/meta";
 import {
   buildPlanningTools,
   buildTaskPlanningTools,
@@ -387,10 +387,26 @@ function buildCanUseTool(
           toolName,
           input,
         });
+        // Persist hasPendingPrompt so a server restart while the user is
+        // deciding doesn't auto-push a "[Server restarted...]" prompt into
+        // a session that was parked on a user decision.
+        const s = sessionForPermissionsMap(pendingPermissions);
+        if (s) void persistPendingPromptFlag(s);
       });
     }
     return { behavior: "allow", updatedInput: input };
   };
+}
+
+// Reverse-lookup a session from its pendingPermissions map identity. The
+// canUseTool closure captures the map but not the session — this avoids
+// threading the session through buildCanUseTool's signature just for the
+// meta-write side effect on pending-state change.
+function sessionForPermissionsMap(map: Map<string, PendingPermission>): RuntimeSession | null {
+  for (const s of registry.values()) {
+    if (s.pendingPermissions === map) return s;
+  }
+  return null;
 }
 
 // Resolve a pending tool-use approval. Called by the permission API endpoint
@@ -406,6 +422,7 @@ export function resolvePermission(
   if (!pending) return false;
   pending.resolve(result);
   s.pendingPermissions.delete(toolUseId);
+  void persistPendingPromptFlag(s);
   // Echo the decision so the UI can clear its approval card without waiting
   // for the SDK's tool_result to come back.
   s.events.emit("permission_resolved", {
@@ -435,6 +452,7 @@ export function addPendingCompletion(
       requestedAt: new Date(),
     });
     s.events.emit("completion_request", { requestId, reason: reason ?? null });
+    void persistPendingPromptFlag(s);
   });
   return { requestId, promise };
 }
@@ -453,6 +471,7 @@ export function resolveCompletionSuggestion(
   if (!pending) return false;
   pending.resolve(approved);
   s.pendingCompletions.delete(requestId);
+  void persistPendingPromptFlag(s);
   s.events.emit("completion_resolved", { requestId, approved });
   return true;
 }
@@ -473,6 +492,7 @@ export function resolveQuestion(
   if (!pending) return false;
   pending.resolve(answers);
   s.pendingQuestions.delete(questionId);
+  void persistPendingPromptFlag(s);
   // Echo so any other clients viewing this session can clear their card.
   s.events.emit("question_resolved", { questionId });
   return true;
@@ -501,6 +521,26 @@ export function getSessionQuery(id: string): AgentQuery | null {
   const s = registry.get(id);
   if (!s || !s.q) return null;
   return s.q;
+}
+
+// Forward a POST to the underlying runner of a remote session. Used by API
+// routes that need to talk to runner-only endpoints (e.g. /auth-code for the
+// inline /login flow). Returns null if the session isn't a remote one or has
+// no live runner — the route then 404s.
+export async function relayRemoteRunner(
+  sessionId: string,
+  path: string,
+  body: unknown,
+): Promise<{ status: number; body: unknown } | null> {
+  const s = registry.get(sessionId);
+  if (!s || s.runtime !== "remote" || !s.q) return null;
+  // RemoteAgentQuery exposes relayToRunner(); other AgentQuery shapes don't.
+  // Duck-type the method off the AgentQuery so we don't need a runtime cast.
+  const q = s.q as unknown as {
+    relayToRunner?: (p: string, b: unknown) => Promise<{ status: number; body: unknown }>;
+  };
+  if (typeof q.relayToRunner !== "function") return null;
+  return q.relayToRunner(path, body);
 }
 
 // Dispatch the query() call to whatever AgentRuntime the session uses. The
@@ -598,7 +638,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const id = d.name;
     const metaPath = path.join(sessDir, id, "meta.json");
     const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
+    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
     // Prefer generated name from meta.json; fall back to first message for legacy sessions
     let title = meta.name ?? "(no message)";
@@ -631,7 +671,7 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       isLive: false,
       unread,
       completed: meta.completed === true,
-      hasPendingPrompt: false, // historical sessions have no in-memory pending state
+      hasPendingPrompt: meta.hasPendingPrompt === true,
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
       effort: meta.effort ?? null,
@@ -895,8 +935,14 @@ async function findRunningSessionsInDir(
       // after a cowork restart and auto-resume would spawn a fresh container
       // per session at boot — slow, noisy, and dependent on Docker being up.
       // The user resumes them manually by sending a message.
+      // Sessions parked on a user decision (awaiting_input state, or a pending
+      // permission/question/completion at restart time) are also skipped: the
+      // parked tool call lived in-memory only and is gone, so resuming would
+      // just blow away the pending card with a "[Server restarted...]" prompt.
+      // The user resumes them by answering or sending a new message.
       if (
         meta.finalState === "running"
+        && !meta.hasPendingPrompt
         && meta.sdkSessionId
         && meta.runtime !== "remote"
       ) {
@@ -1188,6 +1234,14 @@ function maybeEmitTodos(s: RuntimeSession) {
 }
 
 async function pumpEvents(s: RuntimeSession) {
+  // Snapshot the query this pump is iterating. resumeSession() / retrySession()
+  // swap s.q for a fresh AgentQuery; the OLD pump's iterator throws on the
+  // interrupt and we use this reference to recognize "I'm a stale loop, don't
+  // mutate state." Checking by `s.q !== myQuery` is precise — checking by
+  // s.state (e.g. "running") gave false positives for INITIAL pumps that
+  // fail before producing any event (remote runtime ECONNREFUSED on a dead
+  // controller would silently strand the session as "working").
+  const myQuery = s.q;
   try {
     for await (const msg of s.q) {
       // stream_event = per-token streaming delta (Claude SDKPartialAssistantMessage
@@ -1316,9 +1370,11 @@ async function pumpEvents(s: RuntimeSession) {
       setState(s, "stopped");
     }
   } catch (err) {
-    // If session is already running (resumed) or stopped (interrupted),
-    // this is a stale pumpEvents — don't touch state
-    if (s.state === "running" || s.state === "stopped") return;
+    // Only bail if our query was replaced (resume / retry started a fresh
+    // one). Don't gate on s.state — initial pumps fail before producing any
+    // event and state stays at "running", which previously caused silent
+    // hangs.
+    if (s.q !== myQuery) return;
 
     const errorMsg = err instanceof Error ? err.message : String(err);
 
