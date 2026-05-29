@@ -5,8 +5,8 @@ import { getProject, getTask, taskDir, projectDir } from "@/lib/fs";
 
 export const runtime = "nodejs";
 
-// Max file size: 10MB
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
+// Max file size: 500MB
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
 function ensureSafePath(base: string, rel: string): string {
   const target = path.resolve(base, rel);
@@ -29,7 +29,9 @@ export async function POST(req: Request) {
   const url = new URL(req.url);
   const projectSlug = url.searchParams.get("project");
   const taskSlug = url.searchParams.get("task") || "";
-  const subdir = url.searchParams.get("subdir") || "uploads";
+  // Default to the artifacts root (files/). Callers can still pass an explicit
+  // subdir (e.g. the artifacts list passes the folder currently being viewed).
+  const subdir = url.searchParams.get("subdir") || "";
 
   if (!projectSlug) {
     return NextResponse.json({ error: "project required" }, { status: 400 });

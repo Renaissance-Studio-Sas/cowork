@@ -19,6 +19,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ project: strin
       effort: body.effort,
       runtime: body.runtime,
       openArtifact: typeof body.openArtifact === "string" && body.openArtifact.length > 0 ? body.openArtifact : undefined,
+      files: Array.isArray(body.files) && body.files.length > 0 ? body.files : undefined,
     });
     return NextResponse.json({ id: s.id, state: s.state });
   } catch (err) {

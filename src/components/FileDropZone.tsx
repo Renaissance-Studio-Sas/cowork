@@ -12,12 +12,21 @@ interface Props {
   onFiles: (files: FileAttachment[]) => void;
   children: ReactNode;
   accept?: string;
-  maxSize?: number; // bytes, default 10MB
+  maxSize?: number; // bytes, default 500MB
   disabled?: boolean;
   className?: string;
+  /** Called with a human-readable message when a file is rejected (too large / wrong type). */
+  onError?: (message: string) => void;
 }
 
-const DEFAULT_MAX_SIZE = 10 * 1024 * 1024; // 10MB
+const DEFAULT_MAX_SIZE = 500 * 1024 * 1024; // 500MB
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)}MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${bytes}B`;
+}
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -37,6 +46,28 @@ async function createPreview(file: File): Promise<string | undefined> {
   });
 }
 
+/**
+ * Convert files picked via an <input type="file"> (or any FileList) into
+ * FileAttachment objects, generating image previews. Shared by the explicit
+ * upload/attach buttons so they behave exactly like drag-and-drop.
+ */
+export async function filesToAttachments(
+  fileList: FileList | File[],
+  maxSize = DEFAULT_MAX_SIZE,
+  onError?: (message: string) => void,
+): Promise<FileAttachment[]> {
+  const attachments: FileAttachment[] = [];
+  for (const file of Array.from(fileList)) {
+    if (file.size > maxSize) {
+      onError?.(`"${file.name}" is too large (${formatBytes(file.size)}). Max is ${formatBytes(maxSize)}.`);
+      continue;
+    }
+    const preview = await createPreview(file);
+    attachments.push({ file, preview, id: generateId() });
+  }
+  return attachments;
+}
+
 export function FileDropZone({
   onFiles,
   children,
@@ -44,6 +75,7 @@ export function FileDropZone({
   maxSize = DEFAULT_MAX_SIZE,
   disabled = false,
   className = "",
+  onError,
 }: Props) {
   const [isDragging, setIsDragging] = useState(false);
   const dragCounter = useRef(0);
@@ -56,7 +88,7 @@ export function FileDropZone({
       for (const file of files) {
         // Check file size
         if (file.size > maxSize) {
-          console.warn(`File ${file.name} exceeds max size of ${maxSize / 1024 / 1024}MB`);
+          onError?.(`"${file.name}" is too large (${formatBytes(file.size)}). Max is ${formatBytes(maxSize)}.`);
           continue;
         }
 
@@ -73,7 +105,7 @@ export function FileDropZone({
             return file.type === type;
           });
           if (!isAccepted) {
-            console.warn(`File ${file.name} type ${file.type} not accepted`);
+            onError?.(`"${file.name}" isn't an accepted file type.`);
             continue;
           }
         }
@@ -86,7 +118,7 @@ export function FileDropZone({
         onFiles(attachments);
       }
     },
-    [onFiles, accept, maxSize]
+    [onFiles, accept, maxSize, onError]
   );
 
   const handleDragEnter = useCallback(
