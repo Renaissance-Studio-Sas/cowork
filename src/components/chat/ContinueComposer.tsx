@@ -6,7 +6,7 @@
 
 import { useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { handleComposerEnter } from "@/lib/composer";
+import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
 
 export function ContinueComposer({
@@ -30,6 +30,7 @@ export function ContinueComposer({
 }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
+  const newlineMod = useNewlineModifier();
   // Only a genuine "error" state means something went wrong. "stopped" is a
   // normal terminal state (interrupt, eviction, or the agent loop ending after
   // a successful turn) — exhausted 529 retries land in "error", not "stopped",
@@ -113,10 +114,10 @@ export function ContinueComposer({
         <button
           onClick={resume}
           disabled={!draft.trim() || busy}
-          className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-          title="Resume session — send the message to continue (↵)"
-          aria-label="Resume session"
-        >↑</button>
+          className={`rounded-lg w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 transition shrink-0 ${newlineMod ? "border border-[var(--border-strong)] text-[var(--text-soft)] bg-transparent" : "bg-[var(--accent)] text-[var(--accent-text)] hover:brightness-110"}`}
+          title={newlineMod ? "Insert a new line (↵ — release the modifier to send)" : "Resume session — send the message to continue (↵)"}
+          aria-label={newlineMod ? "Insert a new line" : "Resume session"}
+        >{newlineMod ? "↵" : "↑"}</button>
         {completeButton}
       </div>
     </div>
