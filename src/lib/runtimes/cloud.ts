@@ -306,12 +306,13 @@ async function probeReusableSession(gateway: string, sessionId: string): Promise
     const r = await fetch(`${gateway}/api/agent/sessions/${sessionId}`, {
       headers: { cookie: authHeader() },
     });
-    if (!r.ok) return false;
-    const info = (await r.json().catch(() => null)) as
-      | { containerState?: { status?: string } }
-      | null;
-    const status = info?.containerState?.status;
-    return status === "running" || status === "healthy";
+    // A 200 means the DO still has this session (metadata present). Reuse it
+    // regardless of container state: if the container is running we reattach
+    // to the live SDK session; if it hibernated (stopped), the DO restores the
+    // transcript + shared auth and re-starts the SDK with `resume` on the next
+    // request. Only a 404 (session truly gone / fully deleted) falls through to
+    // provisioning a fresh session.
+    return r.ok;
   } catch {
     return false;
   }
