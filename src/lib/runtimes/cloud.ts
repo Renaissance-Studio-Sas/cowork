@@ -519,7 +519,16 @@ class CloudAgentQuery implements AgentQuery {
       }
     } finally {
       this.abort.abort();
-      await destroyCloudSession(session);
+      // Only tear down the cloud session on an explicit close/interrupt. When
+      // the stream merely ends — a container hibernation (5-min idle) breaks
+      // the SSE, or a turn finishes — the session must SURVIVE so it can be
+      // resumed: the DO keeps its storage + the R2 transcript, and the next
+      // message reattaches and restores context. Destroying here (the old
+      // behavior) DELETEd the session on every hibernation, making resume
+      // impossible.
+      if (this.interrupted) {
+        await destroyCloudSession(session);
+      }
     }
   }
 

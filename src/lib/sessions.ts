@@ -2297,8 +2297,14 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   // (events.jsonl) is preserved, only the agent's SDK memory of those turns
   // is lost. Same path covers sessions that never got an sdkSessionId at all
   // (older sessions before tracking, or sessions that crashed before init).
-  const canResume = !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
-  const lostTranscript = !!s.sdkSessionId && !canResume;
+  // The local-transcript check only applies to the Claude runtime (it resumes
+  // from an on-disk SDK transcript). Cloud resumes via the DO (restore +
+  // `resume` server-side) and Gemini from its runtimeStateDir history, so for
+  // those runtimes the on-disk check is a false alarm — skip it (no scary
+  // "couldn't resume" notice, don't clear their session id).
+  const isLocalSdkRuntime = s.runtime === "claude";
+  const canResume = isLocalSdkRuntime && !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
+  const lostTranscript = isLocalSdkRuntime && !!s.sdkSessionId && !canResume;
   if (lostTranscript) {
     s.sdkSessionId = null;
     void updateMeta(s, (meta) => {
