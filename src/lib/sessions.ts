@@ -1333,18 +1333,49 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   return session;
 }
 
-// File-modifying tools that should trigger a refresh in the UI
+// Tools whose tool_use writes a file at a known path (carried in the input).
 const FILE_MODIFYING_TOOLS = new Set(["Edit", "Write", "NotebookEdit"]);
 
-// Extract file path from a tool_use block if it's a file-modifying tool
+// Bash commands that can create, move, or (crucially) delete files. Agents have
+// no dedicated delete tool — they remove artifacts via `Bash` (rm/mv/…), which
+// otherwise never signals the UI, so a deleted artifact lingers in the list.
+// The UI re-lists the whole directory on any change rather than patching a
+// single path, so a coarse match is enough; we err toward refreshing. Matched
+// against the first token of each ;/&&/||/| / newline-separated segment.
+const FS_MUTATING_BASH = /(^|[;&|\n])\s*(sudo\s+)?(rm|rmdir|unlink|shred|mv|cp|ln|touch|mkdir|mktemp|dd|truncate|tee|install|rsync|scp|trash(-put)?|unzip)\b/i;
+// Output redirection into a real file (skip /dev/* sinks and fd duplications).
+const FS_REDIRECT_BASH = />>?\s*(?!\/dev\/|&)\S/;
+// Tools that are usually read-only — only refresh when invoked in a write mode,
+// so the agent's frequent `git status` / `find -name` / `sed -n` don't spam it.
+const FS_MUTATING_CONDITIONAL = [
+  /\bgit\s+(rm|mv|checkout|restore|clean|stash|reset|merge|rebase|pull|switch|apply|revert|cherry-pick)\b/i,
+  /\bsed\b[^|;&]*\s-i/i,
+  /\bperl\b[^|;&]*\s-i/i,
+  /\bfind\b[^|;&]*\s(-delete|-exec(dir)?)\b/i,
+  /\btar\b[^|;&]*\s-[a-z]*x/i,
+];
+
+function bashMutatesFiles(command: string): boolean {
+  if (FS_MUTATING_BASH.test(command) || FS_REDIRECT_BASH.test(command)) return true;
+  return FS_MUTATING_CONDITIONAL.some((re) => re.test(command));
+}
+
+// Returns a file path when a tool_use modifies a file at a known location
+// (Edit/Write/NotebookEdit), an empty string when a Bash command mutates the
+// filesystem (path unknown — the UI re-lists regardless), or null when nothing
+// changed. Non-null means "tell the UI to refresh the artifact list."
 function extractModifiedFilePath(msg: SDKMessage): string | null {
   if (msg.type !== "assistant") return null;
   const content = (msg as { message?: { content?: unknown[] } }).message?.content;
   if (!Array.isArray(content)) return null;
   for (const part of content) {
-    const p = part as { type?: string; name?: string; input?: { file_path?: string; notebook_path?: string } };
-    if (p.type === "tool_use" && FILE_MODIFYING_TOOLS.has(p.name ?? "")) {
-      return p.input?.file_path ?? p.input?.notebook_path ?? null;
+    const p = part as { type?: string; name?: string; input?: { file_path?: string; notebook_path?: string; command?: string } };
+    if (p.type !== "tool_use") continue;
+    if (FILE_MODIFYING_TOOLS.has(p.name ?? "")) {
+      return p.input?.file_path ?? p.input?.notebook_path ?? "";
+    }
+    if (p.name === "Bash" && typeof p.input?.command === "string" && bashMutatesFiles(p.input.command)) {
+      return "";
     }
   }
   return null;
@@ -1463,9 +1494,11 @@ async function pumpEvents(s: RuntimeSession) {
         }
       }
 
-      // Emit file_changed when the agent modifies a file so the UI can refresh
+      // Emit file_changed when the agent creates, edits, or deletes a file so
+      // the UI can refresh. "" is a valid signal (Bash mutation, path unknown) —
+      // guard on null, not truthiness, or deletions would be dropped.
       const modifiedPath = extractModifiedFilePath(msg);
-      if (modifiedPath) {
+      if (modifiedPath !== null) {
         s.events.emit("file_changed", { path: modifiedPath });
       }
 
