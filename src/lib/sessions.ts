@@ -1193,6 +1193,8 @@ export interface StartSessionParams {
   model?: string;
   effort?: EffortLevel;
   runtime?: SessionRuntime;       // defaults to "claude"
+  /** Artifact path open in the user's workspace when they started the session. */
+  openArtifact?: string;
 }
 
 export async function startSession(p: StartSessionParams): Promise<RuntimeSession> {
@@ -1247,9 +1249,15 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   const pendingQuestions = new Map<string, PendingQuestion>();
   const pendingCompletions = new Map<string, PendingCompletion>();
 
-  // First message
-  const firstMsg = makeUserMessage(p.firstMessage, id);
-  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
+  // First message. If an artifact is open in the workspace, prepend a hidden
+  // <system-reminder> with its path so the agent knows what the user is
+  // looking at from turn 1. Keep `firstMessage` raw in the session record so
+  // auto-titling and labels use the user's actual prompt.
+  const augmentedFirstMessage = p.openArtifact
+    ? withOpenArtifactNote(p.firstMessage, p.openArtifact)
+    : p.firstMessage;
+  const firstMsg = makeUserMessage(augmentedFirstMessage, id);
+  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage }) + "\n");
   input.push(firstMsg);
 
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug, name);
@@ -1828,7 +1836,7 @@ export async function moveSessionToTask(
 // `propose_plan` / `propose_task` MCP tool that the Chat UI watches for.
 // Everything else (persistence, sidebar listing, resume) behaves exactly
 // like a normal session.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task" }): Promise<RuntimeSession> {
+export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task"; openArtifact?: string }): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
@@ -1868,8 +1876,13 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   const pendingQuestions = new Map<string, PendingQuestion>();
   const pendingCompletions = new Map<string, PendingCompletion>();
 
-  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: p.firstMessage }) + "\n");
-  input.push(makeUserMessage(p.firstMessage, id));
+  // See startSession — augment with the open-artifact hint while keeping the
+  // raw user prompt in the session record for auto-titling.
+  const augmentedFirstMessage = p.openArtifact
+    ? withOpenArtifactNote(p.firstMessage, p.openArtifact)
+    : p.firstMessage;
+  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage }) + "\n");
+  input.push(makeUserMessage(augmentedFirstMessage, id));
 
   // Project-level sessions only get project.md context (no task). Comments
   // and other workbench tools scope to project-level (empty taskSlug); the
@@ -1916,7 +1929,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   });
 
   const now = new Date();
-  const firstUserEcho = makeUserMessage(p.firstMessage, id);
+  const firstUserEcho = makeUserMessage(augmentedFirstMessage, id);
   const session: RuntimeSession = {
     id,
     projectSlug: p.projectSlug,

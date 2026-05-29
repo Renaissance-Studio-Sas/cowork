@@ -532,6 +532,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
           message: draft.trim(),
           runtime,
           ...(effort ? { effort } : {}),
+          ...(artifactExpanded ? { openArtifact: artifactPath } : {}),
         }),
       });
       const j = await r.json();
