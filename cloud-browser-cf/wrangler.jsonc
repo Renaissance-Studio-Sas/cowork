@@ -1,0 +1,47 @@
+{
+  // Cloudflare deployment of cloud-browser: Worker (MCP + API) ─ Durable Objects
+  // ─ Containers (Chromium per session) ─ R2 (per-user profiles).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloud-browser-cf",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // One Chromium container image, instantiated per browser session. Each
+  // running instance is managed by a BrowserSession Durable Object.
+  "containers": [
+    {
+      "class_name": "BrowserSession",
+      "image": "./container/Dockerfile",
+      // Chromium + Xvnc need real memory; bump as needed (dev|basic|standard).
+      "instance_type": "standard-1",
+      // Hard cap on concurrent browser containers across the whole deployment.
+      "max_instances": 20
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      // Container controller (1 instance ⇒ 1 browser). DO id = `${userId}:${profile}`
+      // so a user can never address another user's browser, and we get a natural
+      // one-live-session-per-(user,profile) lock.
+      { "name": "BROWSER_SESSION", "class_name": "BrowserSession" },
+      // The remote MCP server (agents SDK McpAgent is itself a DO).
+      { "name": "MCP_OBJECT", "class_name": "BrowserMcp" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BrowserSession", "BrowserMcp"] }
+  ],
+
+  // Per-user profile blobs (cookies/login state). Keys: <userId>/<profile>/profile.tar.gz
+  "r2_buckets": [
+    { "binding": "PROFILES", "bucket_name": "cloud-browser-profiles" }
+  ]
+
+  // Auth (temporary): a single shared bearer token. Set it for deploys with
+  //   wrangler secret put API_TOKEN
+  // Local dev reads it from .dev.vars. Clients send `Authorization: Bearer <token>`
+  // to /mcp; optional `X-Tenant-Id` header namespaces isolated profile sets.
+}
