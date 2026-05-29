@@ -14,9 +14,11 @@ import type { SessionState } from "../session-state-machine";
 
 // Which agent runtime drives this session. Claude is the default and is
 // what every session today uses; Gemini runs through gemini-cli-core; remote
-// provisions a container via the cloud-agent-runner controller. Stored in
+// provisions a container via the local cloud-agent-runner controller; cloud
+// talks to the cloud-agent worker on Cloudflare (app.rowads.studio/api/agent/*)
+// and authenticates via the rw CLI's stored session cookie. Stored in
 // meta.json so resume after a server restart picks the same runtime.
-export type SessionRuntime = "claude" | "gemini" | "remote";
+export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
 
 // Thinking effort level. Mirrors the Claude Agent SDK's EffortLevel
 // (see @anthropic-ai/claude-agent-sdk). Passed to query() as `effort` and

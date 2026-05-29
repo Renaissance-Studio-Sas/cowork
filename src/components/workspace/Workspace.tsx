@@ -8,7 +8,7 @@ import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { WorkingIndicator } from "@/components/WorkingIndicator";
 import { Markdown } from "@/components/chat/Markdown";
-import { FileDropZone, type FileAttachment } from "@/components/FileDropZone";
+import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachment } from "@/components/FileDropZone";
 import { handleComposerEnter } from "@/lib/composer";
 import { FileViewer } from "@/components/FileViewer";
 import { Chat } from "@/components/Chat";
@@ -168,6 +168,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
 
   const [files, setFiles] = useState<Entry[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
   const [renamingPath, setRenamingPath] = useState<{ path: string; type: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -357,17 +358,30 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     async (attachments: FileAttachment[]) => {
       if (!taskSlug || attachments.length === 0) return;
       setUploading(true);
+      setUploadError(null);
+      const failed: string[] = [];
       try {
         for (const att of attachments) {
           const formData = new FormData();
           formData.append("file", att.file);
           const subdir = dirPath || "";
           const url = `/api/files/upload?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}${subdir ? `&subdir=${encodeURIComponent(subdir)}` : "&subdir="}`;
-          await fetch(url, { method: "POST", body: formData });
+          try {
+            const res = await fetch(url, { method: "POST", body: formData });
+            if (!res.ok) {
+              const j = await res.json().catch(() => ({}));
+              failed.push(`${att.file.name}: ${j.error ?? `HTTP ${res.status}`}`);
+            }
+          } catch (err) {
+            failed.push(`${att.file.name}: ${String(err)}`);
+          }
         }
         refreshFiles();
       } finally {
         setUploading(false);
+        if (failed.length > 0) {
+          setUploadError(`Failed to upload ${failed.length} file${failed.length === 1 ? "" : "s"} — ${failed.join("; ")}`);
+        }
       }
     },
     [projectSlug, taskSlug, dirPath, refreshFiles],
@@ -517,11 +531,49 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const [effort, setEffort] = useState<EffortLevel | "">("");
+  const [newAttachments, setNewAttachments] = useState<FileAttachment[]>([]);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  const addNewAttachments = useCallback((files: FileAttachment[]) => {
+    setNewAttachments((prev) => [...prev, ...files]);
+  }, []);
+  const removeNewAttachment = useCallback((id: string) => {
+    setNewAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
 
   const startSession = async () => {
-    if (!draft.trim() || starting) return;
+    if ((!draft.trim() && newAttachments.length === 0) || starting) return;
     setStarting(true);
+    setStartError(null);
     try {
+      // Upload any attachments first, then reference them on the first message.
+      const uploadedFiles: { name: string; path: string; mimeType: string; size: number }[] = [];
+      if (newAttachments.length > 0) {
+        const failed: string[] = [];
+        for (const att of newAttachments) {
+          const formData = new FormData();
+          formData.append("file", att.file);
+          const upUrl = `/api/files/upload?project=${encodeURIComponent(projectSlug)}${taskSlug ? `&task=${encodeURIComponent(taskSlug)}` : ""}`;
+          try {
+            const res = await fetch(upUrl, { method: "POST", body: formData });
+            if (res.ok) {
+              const data = await res.json();
+              uploadedFiles.push({ name: data.name, path: data.path, mimeType: data.mimeType, size: data.size });
+            } else {
+              const e = await res.json().catch(() => ({}));
+              failed.push(`${att.file.name}: ${e.error ?? `HTTP ${res.status}`}`);
+            }
+          } catch (err) {
+            failed.push(`${att.file.name}: ${String(err)}`);
+          }
+        }
+        if (failed.length > 0) {
+          setStartError(`Couldn't upload ${failed.length} file${failed.length === 1 ? "" : "s"} — ${failed.join("; ")}`);
+          setStarting(false);
+          return;
+        }
+      }
+
       const url = taskSlug
         ? `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`
         : `/api/projects/${projectSlug}/sessions`;
@@ -529,15 +581,17 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: draft.trim(),
+          message: draft.trim() || "(attached files)",
           runtime,
           ...(effort ? { effort } : {}),
           ...(artifactExpanded ? { openArtifact: artifactPath } : {}),
+          ...(uploadedFiles.length > 0 ? { files: uploadedFiles } : {}),
         }),
       });
-      const j = await r.json();
-      if (j.id) {
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.id) {
         setDraft("");
+        setNewAttachments([]);
         const next: WorkspaceParams = { ...currentParams, chat: j.id };
         if (!artifactExpanded && !chatExpanded) {
           listSplitRef.current = splitParam ? Number(splitParam) : null;
@@ -546,8 +600,10 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         updateParams(next);
         refresh();
       } else {
-        alert(j.error ?? "failed");
+        setStartError(j.error ?? `Failed to start session (HTTP ${r.status})`);
       }
+    } catch (err) {
+      setStartError(String(err));
     } finally {
       setStarting(false);
     }
@@ -709,6 +765,8 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
             breadcrumb={breadcrumb}
             commentCounts={commentCounts}
             uploading={uploading}
+            uploadError={uploadError}
+            onUploadError={setUploadError}
             renamingPath={renamingPath}
             renameValue={renameValue}
             onRenameValue={setRenameValue}
@@ -747,6 +805,11 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
             onDraft={setDraft}
             onStart={startSession}
             starting={starting}
+            attachments={newAttachments}
+            onAttach={addNewAttachments}
+            onRemoveAttachment={removeNewAttachment}
+            startError={startError}
+            onStartError={setStartError}
             runtime={runtime}
             onRuntime={setRuntime}
             effort={effort}
@@ -872,6 +935,8 @@ interface ArtifactsColumnProps {
   breadcrumb: { name: string; path: string }[];
   commentCounts: Record<string, number>;
   uploading: boolean;
+  uploadError: string | null;
+  onUploadError: (message: string) => void;
   renamingPath: { path: string; type: "file" | "folder" } | null;
   renameValue: string;
   onRenameValue: (v: string) => void;
@@ -887,12 +952,13 @@ interface ArtifactsColumnProps {
 function ArtifactsColumn(props: ArtifactsColumnProps) {
   const {
     projectSlug, taskSlug, expanded, artifactPath, dirPath, entries, breadcrumb,
-    commentCounts, uploading, renamingPath, renameValue,
+    commentCounts, uploading, uploadError, onUploadError, renamingPath, renameValue,
     onRenameValue, onRenameCommit, onRenameCancel, onContextMenu,
     onNavigateDir, onOpenFile, onCloseArtifact, onFileDrop,
   } = props;
   const [showAll, setShowAll] = useState(false);
   const visible = showAll ? entries : entries.slice(0, PAGE_SIZE);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
 
   if (expanded) {
     return (
@@ -1022,10 +1088,46 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
         <span className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold">
           Artifacts
         </span>
-        <span className="text-[11px] text-[var(--muted)]">· {entries.length}</span>
+        <span className="text-[11px] text-[var(--muted)]">· {entries.length}{uploading && " (uploading…)"}</span>
+        {taskSlug && (
+          <>
+            <input
+              ref={uploadInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={async (e) => {
+                const picked = e.target.files;
+                if (picked && picked.length > 0) {
+                  onFileDrop(await filesToAttachments(picked, undefined, onUploadError));
+                }
+                e.target.value = "";
+              }}
+            />
+            <button
+              onClick={() => uploadInputRef.current?.click()}
+              disabled={uploading}
+              title="Upload files"
+              aria-label="Upload files"
+              className="ml-auto text-[var(--muted)] hover:text-[var(--accent)] w-6 h-6 rounded hover:bg-[var(--panel-2)] flex items-center justify-center disabled:opacity-40 transition"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+            </button>
+          </>
+        )}
       </div>
+      {uploadError && (
+        <div className="px-3 py-2 border-b border-[var(--border)] bg-[var(--warn-soft)] text-[var(--warn)] text-[12px] flex items-start gap-2 shrink-0">
+          <span className="flex-1">{uploadError}</span>
+          <button onClick={() => onUploadError("")} title="Dismiss" className="shrink-0 hover:opacity-70">×</button>
+        </div>
+      )}
       {taskSlug ? (
-        <FileDropZone onFiles={onFileDrop} disabled={uploading} className="flex-1 min-h-0 flex flex-col">
+        <FileDropZone onFiles={onFileDrop} onError={onUploadError} disabled={uploading} className="flex-1 min-h-0 flex flex-col">
           {Body}
         </FileDropZone>
       ) : (
@@ -1061,6 +1163,11 @@ interface SessionsColumnProps {
   onDraft: (v: string) => void;
   onStart: () => void;
   starting: boolean;
+  attachments: FileAttachment[];
+  onAttach: (files: FileAttachment[]) => void;
+  onRemoveAttachment: (id: string) => void;
+  startError: string | null;
+  onStartError: (message: string) => void;
   runtime: SessionRuntime;
   onRuntime: (r: SessionRuntime) => void;
   effort: EffortLevel | "";
@@ -1073,11 +1180,14 @@ function SessionsColumn(props: SessionsColumnProps) {
     renamingSession, sessionRenameValue,
     onSessionRenameValue, onSessionRenameCommit, onSessionRenameCancel,
     onSessionContextMenu, onOpenSession, onCloseSession, onChange,
-    draft, onDraft, onStart, starting, runtime, onRuntime, effort, onEffort,
+    draft, onDraft, onStart, starting,
+    attachments, onAttach, onRemoveAttachment, startError, onStartError,
+    runtime, onRuntime, effort, onEffort,
   } = props;
 
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const newAttachInputRef = useRef<HTMLInputElement>(null);
 
   if (expanded && expandedSession) {
     return (
@@ -1268,28 +1378,64 @@ function SessionsColumn(props: SessionsColumnProps) {
 
       {/* New-session composer (hidden when chat expanded) */}
       <div className="border-t border-[var(--border)] px-3 py-3 bg-[var(--bg)]">
-        <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
-          <textarea
-            value={draft}
-            onChange={(e) => onDraft(e.target.value)}
-            placeholder={taskSlug ? "Tell an agent what to do on this task…" : "Brief an agent on this project as a whole…"}
-            rows={2}
-            style={{ maxHeight: 200 }}
-            onInput={(e) => {
-              const el = e.currentTarget;
-              el.style.height = "auto";
-              el.style.height = Math.min(el.scrollHeight, 200) + "px";
-            }}
-            onKeyDown={(e) => handleComposerEnter(e, onStart)}
-            className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
-          />
-          <button
-            onClick={onStart}
-            disabled={!draft.trim() || starting}
-            className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-            title="Start (↵)"
-          >↑</button>
-        </div>
+        {startError && (
+          <div className="mb-2 rounded-lg bg-[var(--warn-soft)] text-[var(--warn)] text-[12px] px-3 py-2 flex items-start gap-2">
+            <span className="flex-1">{startError}</span>
+            <button onClick={() => onStartError("")} title="Dismiss" className="shrink-0 hover:opacity-70">×</button>
+          </div>
+        )}
+        <FileDropZone onFiles={onAttach} onError={onStartError} className="rounded-2xl">
+          {attachments.length > 0 && (
+            <div className="px-1 pb-2">
+              <AttachmentPreview attachments={attachments} onRemove={onRemoveAttachment} compact />
+            </div>
+          )}
+          <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
+            <input
+              ref={newAttachInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={async (e) => {
+                const picked = e.target.files;
+                if (picked && picked.length > 0) {
+                  onAttach(await filesToAttachments(picked, undefined, onStartError));
+                }
+                e.target.value = "";
+              }}
+            />
+            <textarea
+              value={draft}
+              onChange={(e) => onDraft(e.target.value)}
+              placeholder={taskSlug ? "Tell an agent what to do on this task…" : "Brief an agent on this project as a whole…"}
+              rows={2}
+              style={{ maxHeight: 200 }}
+              onInput={(e) => {
+                const el = e.currentTarget;
+                el.style.height = "auto";
+                el.style.height = Math.min(el.scrollHeight, 200) + "px";
+              }}
+              onKeyDown={(e) => handleComposerEnter(e, onStart)}
+              className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
+            />
+            <button
+              onClick={() => newAttachInputRef.current?.click()}
+              className="rounded-lg border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[var(--accent)] hover:border-[var(--accent)] w-9 h-9 flex items-center justify-center transition shrink-0 self-end"
+              title="Attach files"
+              aria-label="Attach files"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+              </svg>
+            </button>
+            <button
+              onClick={onStart}
+              disabled={(!draft.trim() && attachments.length === 0) || starting}
+              className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0 self-end"
+              title="Start (↵)"
+            >↑</button>
+          </div>
+        </FileDropZone>
         <div className="flex items-center justify-end gap-2 pt-1.5">
           <span className="text-[10.5px] text-[var(--muted)]">Agent:</span>
           <select
@@ -1300,6 +1446,7 @@ function SessionsColumn(props: SessionsColumnProps) {
             <option value="claude">Claude</option>
             <option value="gemini">Gemini</option>
             <option value="remote">Remote (Docker)</option>
+            <option value="cloud">Claude (Cloud)</option>
           </select>
           <span className="text-[10.5px] text-[var(--muted)]">Effort:</span>
           <select
