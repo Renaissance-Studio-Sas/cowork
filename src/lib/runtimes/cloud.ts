@@ -34,7 +34,7 @@
 //   RW_CREDENTIALS_PATH   override credentials.json path (default: ~/.rw/
 //                         credentials.json)
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -111,6 +111,13 @@ function serializeOptions(opts: AgentQueryOptions): Record<string, unknown> {
   delete out.toolAliases;
   delete out.runtimeStateDir;
   delete out.cwd;
+  // `resume: <sdkSessionId>` is cowork's Claude-runtime mechanism for picking
+  // up a prior on-disk SDK transcript. The cloud runtime resumes differently —
+  // it reattaches to the still-live container (which holds the SDK transcript
+  // in memory) via the stored cloud sessionId. Passing `resume` to a freshly
+  // booted container would target a transcript that doesn't exist there and
+  // no-op confusingly, so drop it.
+  delete out.resume;
   for (const k of ["model", "effort", "systemPrompt", "permissionMode", "settingSources"]) {
     if (k in opts && !(k in out)) out[k] = (opts as Record<string, unknown>)[k];
   }
@@ -261,6 +268,55 @@ async function dispatchWorkbenchCall(
   }
 }
 
+// Same-DO resume persistence. We stash the cloud sessionId in the per-session
+// runtimeStateDir (the same dir Gemini uses for its history file). On the next
+// query() for this cowork session — e.g. after a server restart, or when the
+// in-process query was closed — boot() reads it back and tries to reattach to
+// the still-live container instead of provisioning a fresh one. Survives within
+// the DO's 5-minute idle window; after that the container (and its in-memory SDK
+// transcript) is gone and we fall back to a fresh session.
+const CLOUD_SESSION_FILE = "cloud-session.json";
+
+function readStoredSessionId(stateDir: string | undefined): string | null {
+  if (!stateDir) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(join(stateDir, CLOUD_SESSION_FILE), "utf8"));
+    return typeof parsed?.cloudSessionId === "string" ? parsed.cloudSessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredSessionId(stateDir: string | undefined, cloudSessionId: string): void {
+  if (!stateDir) return;
+  try {
+    writeFileSync(join(stateDir, CLOUD_SESSION_FILE), JSON.stringify({ cloudSessionId }));
+  } catch (e) {
+    console.warn(`[cloud] couldn't persist cloud session id: ${(e as Error).message}`);
+  }
+}
+
+// Probe a stored session for reuse. The worker's GET /sessions/:id returns the
+// DO's session metadata plus the live container state; we reuse only when the
+// DO still has the session AND its container is running/healthy (i.e. the SDK
+// query is still in memory). Any other state — 404 (DO hibernated + wiped),
+// stopping/stopped, or a network error — means provision fresh.
+async function probeReusableSession(gateway: string, sessionId: string): Promise<boolean> {
+  try {
+    const r = await fetch(`${gateway}/api/agent/sessions/${sessionId}`, {
+      headers: { cookie: authHeader() },
+    });
+    if (!r.ok) return false;
+    const info = (await r.json().catch(() => null)) as
+      | { containerState?: { status?: string } }
+      | null;
+    const status = info?.containerState?.status;
+    return status === "running" || status === "healthy";
+  } catch {
+    return false;
+  }
+}
+
 async function destroyCloudSession(s: CloudSession): Promise<void> {
   try {
     await fetch(`${s.gateway}/api/agent/sessions/${s.sessionId}`, {
@@ -278,6 +334,12 @@ class CloudAgentQuery implements AgentQuery {
   private bootPromise: Promise<CloudSession> | null = null;
   private inputDrainPromise: Promise<void> | null = null;
   private interrupted = false;
+  // Per-session state dir for same-DO resume persistence (see helpers above).
+  private readonly stateDir: string | undefined;
+  // True when boot() reattached to a pre-existing live container rather than
+  // provisioning a fresh one. Drives `?replay=none` on the stream open so we
+  // don't re-ingest the transcript cowork already has on disk.
+  private resumed = false;
   // Local workbench tool handlers, keyed by "server/tool". Populated at boot
   // from opts.options.workbenchToolGroups; consulted whenever the runner
   // emits a workbench_tool_call event over SSE.
@@ -285,6 +347,7 @@ class CloudAgentQuery implements AgentQuery {
 
   constructor(opts: AgentQueryOptions) {
     this.opts = opts;
+    this.stateDir = (opts.options as { runtimeStateDir?: string } | undefined)?.runtimeStateDir;
   }
 
   // POST /api/agent/sessions creates the DO + container AND starts the SDK
@@ -315,6 +378,31 @@ class CloudAgentQuery implements AgentQuery {
       const wb = serializeWorkbenchTools(this.opts);
       if (wb) this.workbenchHandlers = wb.handlers;
 
+      // Same-DO resume: if a prior cloud session for this cowork session is
+      // still live, reattach instead of provisioning a fresh container. The
+      // running container holds the SDK transcript in memory, so the agent
+      // keeps full context; we just push the new message and re-open the
+      // stream (with replay suppressed — see asyncIterator).
+      const storedId = readStoredSessionId(this.stateDir);
+      if (storedId && (await probeReusableSession(gateway, storedId))) {
+        const session: CloudSession = { sessionId: storedId, gateway };
+        this.resumed = true;
+        if (firstMessage !== undefined) {
+          try {
+            await fetch(`${gateway}/api/agent/sessions/${storedId}/input`, {
+              method: "POST",
+              headers: { "content-type": "application/json", cookie: authHeader() },
+              body: JSON.stringify({ message: firstMessage }),
+              signal: this.abort.signal,
+            });
+          } catch (e) {
+            console.warn(`[cloud] resume input POST failed: ${(e as Error).message}`);
+          }
+        }
+        this.inputDrainPromise = this.drainInput(session, iter);
+        return session;
+      }
+
       const r = await fetch(`${gateway}/api/agent/sessions`, {
         method: "POST",
         headers: {
@@ -334,6 +422,8 @@ class CloudAgentQuery implements AgentQuery {
       }
       const body = (await r.json()) as { sessionId: string };
       const session: CloudSession = { sessionId: body.sessionId, gateway };
+      // Persist for same-DO resume on the next query() for this cowork session.
+      writeStoredSessionId(this.stateDir, session.sessionId);
 
       // Forward subsequent user messages from opts.prompt to /input.
       this.inputDrainPromise = this.drainInput(session, iter);
@@ -371,8 +461,14 @@ class CloudAgentQuery implements AgentQuery {
 
   async *[Symbol.asyncIterator](): AsyncIterator<AgentEvent> {
     const session = await this.boot();
+    // On a reattach the container's event ring still holds the full prior
+    // transcript, which cowork has already persisted and rehydrated. Suppress
+    // replay so we only ingest events from this point forward and don't
+    // duplicate history. (Trade-off: events emitted in-container while cowork
+    // was disconnected — e.g. a server restart mid-turn — are not re-delivered.)
+    const streamQuery = this.resumed ? "?replay=none" : "";
     const res = await fetch(
-      `${session.gateway}/api/agent/sessions/${session.sessionId}/stream`,
+      `${session.gateway}/api/agent/sessions/${session.sessionId}/stream${streamQuery}`,
       {
         headers: {
           cookie: authHeader(),
