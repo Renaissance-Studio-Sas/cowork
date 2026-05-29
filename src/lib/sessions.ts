@@ -4,6 +4,10 @@ import { createWriteStream, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
 // SDKMessage / SDKUserMessage / CanUseTool / PermissionResult are still
 // imported from the Claude SDK because the AgentRuntime interface (see
 // agent-runtime.ts) defines AgentEvent / AgentUserMessage / AgentCanUseTool
@@ -33,7 +37,14 @@ import {
 import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
-import { updateMeta, persistSdkSessionId, persistSessionState, persistPendingPromptFlag } from "./sessions/meta";
+import {
+  updateMeta,
+  persistSdkSessionId,
+  persistSessionState,
+  persistPendingPromptFlag,
+  persistOwnerPid,
+  readMetaRaw,
+} from "./sessions/meta";
 import {
   buildPlanningTools,
   buildTaskPlanningTools,
@@ -118,9 +129,105 @@ declare global {
   var __wb_session_registry_events: EventEmitter | undefined;
   // eslint-disable-next-line no-var
   var __wb_reconciled: boolean | undefined;
+  // eslint-disable-next-line no-var
+  var __wb_restore_inflight: Map<string, Promise<RuntimeSession | null>> | undefined;
+  // eslint-disable-next-line no-var
+  var __wb_resume_inflight: Map<string, Promise<boolean>> | undefined;
 }
 const registry: Map<string, RuntimeSession> =
   globalThis.__wb_session_registry ?? (globalThis.__wb_session_registry = REGISTRY);
+
+// Per-id locks for the two state-spawning entry points. Both share registry
+// state, both can spawn an SDK subprocess, and both used to race against each
+// other (and against concurrent callers of themselves) — producing duplicate
+// claude-agent-sdk children that wrote to the same transcript and re-ran the
+// user's last request. Coalesce concurrent calls through these maps so every
+// caller for a given id awaits the same in-flight promise.
+const restoreInFlight: Map<string, Promise<RuntimeSession | null>> =
+  globalThis.__wb_restore_inflight ?? (globalThis.__wb_restore_inflight = new Map());
+const resumeInFlight: Map<string, Promise<boolean>> =
+  globalThis.__wb_resume_inflight ?? (globalThis.__wb_resume_inflight = new Map());
+
+// Session ownership across Next.js dev worker processes is authoritatively
+// recorded in meta.json's `ownerPid` — the worker PID that spawned the
+// in-process AgentQuery. Read meta to decide:
+//
+//   ownerPid alive AND != us  → another worker owns the session. We can't
+//                                reach into its InputChannel from here, so
+//                                spawning a fresh SDK would race two
+//                                subprocesses against the same on-disk
+//                                transcript. Bail.
+//   ownerPid alive AND == us  → we own it. (Caller already has the
+//                                AgentQuery in registry.)
+//   ownerPid dead / missing   → no live owner. Reclaim: kill any leftover
+//                                SDK subprocesses for this sdkSessionId,
+//                                then spawn a fresh one.
+//
+// ps is used only for orphan reclamation when claiming an unowned session
+// (the prior owner's SDK subprocess may still be alive, writing to the
+// transcript file). Posix-only — Windows skips reclamation and trusts the
+// in-process AgentQuery.
+
+interface SdkProc { pid: number; }
+
+// Find live `claude-agent-sdk --resume <sdkSessionId>` subprocesses. Used
+// after we've decided we're the new owner of a session (meta.ownerPid was
+// dead/missing) to kill leftover SDKs from the previous owner before
+// spawning a replacement.
+//
+// Caveat: a session that has NEVER been resumed has no `--resume` in its
+// args, so its SDK isn't matched here. That's fine because the previous
+// owner's process death also closed the SDK's stdin pipe, and the SDK exits
+// on EOF.
+async function findResumedSdkSubprocesses(sdkSessionId: string): Promise<SdkProc[]> {
+  if (!sdkSessionId || process.platform === "win32") return [];
+  try {
+    const { stdout } = await execAsync("ps -eo pid,args", { timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
+    const marker = `--resume ${sdkSessionId}`;
+    const out: SdkProc[] = [];
+    for (const line of stdout.split("\n")) {
+      if (!line.includes("claude-agent-sdk") || !line.includes(marker)) continue;
+      const m = line.trim().match(/^(\d+)\s/);
+      if (!m) continue;
+      const pid = parseInt(m[1], 10);
+      if (Number.isFinite(pid) && pid !== process.pid) out.push({ pid });
+    }
+    return out;
+  } catch (err) {
+    console.warn(`[sessions] ps for ${sdkSessionId.slice(0, 8)}… failed:`, (err as Error).message);
+    return [];
+  }
+}
+
+// Inspect ownership of a session, returning either "owned by another live
+// worker" (caller should bail) or a list of reclaimable SDKs (caller should
+// SIGKILL them, then spawn a fresh SDK).
+async function inspectOwnership(
+  projectSlug: string,
+  taskSlug: string,
+  sessionId: string,
+  sdkSessionId: string | null,
+): Promise<{ ownedByOther: boolean; reclaimable: SdkProc[] }> {
+  const meta = await readMetaRaw(projectSlug, taskSlug, sessionId);
+  const ownerPid = typeof meta?.ownerPid === "number" ? meta.ownerPid : null;
+  if (ownerPid && ownerPid !== process.pid && isPidAlive(ownerPid)) {
+    return { ownedByOther: true, reclaimable: [] };
+  }
+  // We're free to claim. Find leftover SDKs (best effort) so we don't end
+  // up with two SDKs writing to the same transcript.
+  const reclaimable = sdkSessionId ? await findResumedSdkSubprocesses(sdkSessionId) : [];
+  return { ownedByOther: false, reclaimable };
+}
+
+async function killReclaimableSdks(procs: SdkProc[], reason: string): Promise<void> {
+  if (procs.length === 0) return;
+  let killed = 0;
+  for (const p of procs) {
+    try { process.kill(p.pid, "SIGKILL"); killed++; }
+    catch { /* already gone */ }
+  }
+  if (killed > 0) console.log(`[sessions] reclaimed ${killed} SDK subprocess(es) (${reason})`);
+}
 
 // Backfill fields added to RuntimeSession after the registry was first
 // populated. In Next.js dev, the registry is preserved across HMR via
@@ -229,59 +336,60 @@ const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback wit
 const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 
-// Distinguishes a genuine cold start (the `next dev` process is freshly up)
-// from Next.js dev churn (HMR re-evals this module in a new VM context within
-// the same OS process). Auto-resume must only fire on a real restart;
-// otherwise every churn re-pushes a "[Server restarted...]" prompt into
-// whatever session was mid-turn (we've seen 16+ stack up in a single
-// uninterrupted dev run).
+function isPidAlive(pid: number): boolean {
+  try {
+    // Signal 0 doesn't deliver anything — it just probes whether the process
+    // exists and we have permission to signal it. ESRCH means dead; EPERM
+    // means it's alive but ours-to-signal-it permission is denied.
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// Decide whether this VM context should run the boot auto-resume pass.
 //
-// We write the server's PID to a sidecar file at boot and check it on the
-// next boot:
-//   - PID matches our own       → same process, module re-evaluated in a new
-//                                  VM context (HMR) → churn, skip resume.
-//   - PID is a live, different
-//     process                   → another cowork instance owns this workspace
-//                                  → skip resume to avoid duplicate prompts.
-//   - PID is dead or absent     → previous server died → cold start, resume.
+// Auto-resume's job is to revive sessions whose meta.json says
+// finalState="running" — but spamming it on every Next.js dev churn would
+// push a "[Server restarted…]" prompt into every live session, repeatedly.
+// So we gate it with a sidecar PID file:
 //
-// PID-alive is more responsive than the prior time-based heartbeat: a manual
-// `Ctrl+C` + `npm run dev` is detected immediately instead of being mis-
-// classified as churn for the first ~2 minutes after the restart.
+//   prior PID == ours              HMR re-eval inside the same Next.js
+//                                   worker — the prior VM context already
+//                                   ran (or skipped) auto-resume; running
+//                                   again would reclaim our own live SDKs.
+//   prior PID is a different live
+//     process                      another worker on this workspace is
+//                                   handling boot. Stand down.
+//   prior PID dead / no file       genuine cold start (or all workers
+//                                   crashed) — run auto-resume.
+//
+// The per-session ownership check inside autoResume (via inspectSdk) is
+// what makes any of this *correct*; this gate is just to avoid wasted scans
+// + duplicate "Server restarted" prompts.
 const PID_FILE = path.join(
   os.tmpdir(),
   `cowork-server-${createHash("sha1").update(process.cwd()).digest("hex").slice(0, 8)}.pid`,
 );
 
-function writePidFile(): void {
-  try { writeFileSync(PID_FILE, String(process.pid)); } catch { /* best effort */ }
-}
-
-function isPidAlive(pid: number): boolean {
+function shouldRunBootAutoResume(): boolean {
+  let priorPid: number | null = null;
+  let reason = "no prior PID file";
+  let run = true;
   try {
-    // Signal 0 doesn't deliver anything — it just probes whether the process
-    // exists and we have permission to signal it. ESRCH means dead.
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but we can't signal it — treat as alive.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function isColdStart(): boolean {
-  let cold = true;
-  try {
-    const pid = parseInt(readFileSync(PID_FILE, "utf8"), 10);
-    if (Number.isFinite(pid)) {
-      // Same OS process re-evaluating the module (HMR) — not a cold start.
-      if (pid === process.pid) cold = false;
-      // A different process is still alive — another cowork on this workspace.
-      else if (isPidAlive(pid)) cold = false;
+    priorPid = parseInt(readFileSync(PID_FILE, "utf8").trim(), 10);
+    if (Number.isFinite(priorPid)) {
+      if (priorPid === process.pid) { run = false; reason = "HMR re-eval (same PID)"; }
+      else if (isPidAlive(priorPid)) { run = false; reason = `prior PID ${priorPid} still alive`; }
+      else { reason = `prior PID ${priorPid} dead`; }
     }
   } catch { /* missing/unreadable → cold start */ }
-  writePidFile();
-  return cold;
+  console.log(`[boot] auto-resume ${run ? "running" : "skipped"} (pid=${process.pid}, prior=${priorPid}, reason=${reason})`);
+  if (run) {
+    try { writeFileSync(PID_FILE, String(process.pid)); } catch { /* best effort */ }
+  }
+  return run;
 }
 
 // Runtime contract: any session whose streams have been closed MUST be in
@@ -309,11 +417,14 @@ function runWatchdog() {
     if (s.state === "running" && sinceActivity > STALE_THRESHOLD_MS) {
       console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(sinceActivity / 1000)}s — auto-stopping`);
       try {
-        s.events.emit("event", {
+        const timeoutMsg = {
           type: "system",
           subtype: "error",
           message: "Session timed out due to inactivity",
-        } as unknown as SDKMessage);
+        } as unknown as SDKMessage;
+        s.history.push(timeoutMsg);
+        appendEvent(s.id, s.seq++, timeoutMsg);
+        s.events.emit("event", timeoutMsg);
         s.interrupted = true;
         s.input.close();
         void flushEvents(s.id);
@@ -341,38 +452,21 @@ if (!globalThis.__wb_watchdog_interval) {
   }
 }
 
-// On first boot, walk every session on disk and fix any meta.json whose
-// project/task/cwd drifted from the actual folder it lives in (e.g. a user
-// renamed a project folder outside the rename API). Fire-and-forget — the
-// registry is empty at boot, so this can race with the first incoming
-// request harmlessly: either the request reads pre-fix meta or post-fix
-// meta, both are valid JSON. The next restoreSession after reconciliation
-// sees the corrected values.
+// At module load: reconcile session meta (idempotent + cheap) and — only on
+// a real cold start — resume sessions that were mid-turn when the prior
+// server died. Deferred via setImmediate because sessions.ts ↔ fs.ts is a
+// circular import; calling reconcileSessionsOnDisk synchronously here can
+// TDZ-trip on PROJECTS_DIR depending on which module the loader entered first.
 //
-// Defer to the next tick because sessions.ts ↔ fs.ts is a circular import;
-// calling the reconciler synchronously here would hit a TDZ error on
-// PROJECTS_DIR depending on which module the loader entered first.
-//
-// Two guards, because neither alone is enough in Next.js dev:
-//   - globalThis.__wb_reconciled is a fast in-process flag, but dev sometimes
-//     re-evals this module in a fresh VM context whose globalThis isn't shared,
-//     so the flag reads `undefined` and we'd run again.
-//   - isColdStart() is the real gate: it consults the on-disk PID file to tell
-//     a true cold start (resume interrupted sessions) from dev churn — HMR re-
-//     evaluating this module in a new VM context within the same OS process
-//     (skip, so we don't spam "[Server restarted...]" prompts).
+// Two guards:
+//   - globalThis.__wb_reconciled — per-VM-context dedupe (cheap)
+//   - shouldRunBootAutoResume() — PID-file dedupe across VM contexts in the
+//     same OS process (HMR) and across other live workers
 if (!globalThis.__wb_reconciled) {
   globalThis.__wb_reconciled = true;
   setImmediate(async () => {
-    // Always run reconciliation — it's idempotent and cheap.
     await reconcileSessionsOnDisk();
-    // Resume only on a real cold start. The registry-skip inside
-    // autoResumeRunningSessions isn't enough on its own: in Next.js dev
-    // this module can be re-evaluated in a fresh VM context whose
-    // globalThis isn't shared (see the comment block above), and that
-    // fresh context has an empty registry too — so every churn would
-    // otherwise push a "[Server restarted...]" prompt into live sessions.
-    if (!isColdStart()) return;
+    if (!shouldRunBootAutoResume()) return;
     await autoResumeRunningSessions();
   });
 }
@@ -762,7 +856,35 @@ export async function restoreSession(
   taskSlug: string,
   id: string,
 ): Promise<RuntimeSession | null> {
-  // Check if already in registry
+  // Check if already in registry — fast path, no lock needed.
+  const existing = registry.get(id);
+  if (existing) return existing;
+
+  // Coalesce concurrent restores for the same id. The SSE stream endpoint,
+  // /api/sessions/[id]/input, and autoResumeRunningSessions can all race to
+  // restore the same session at the same moment; without this lock each one
+  // would create its own RuntimeSession and (worse) spawn its own SDK
+  // subprocess via resumeSession, leaving a duplicate orphaned the moment
+  // the second write to `registry` overwrote the first one's reference.
+  const inflight = restoreInFlight.get(id);
+  if (inflight) return inflight;
+
+  const promise = doRestoreSession(projectSlug, taskSlug, id);
+  restoreInFlight.set(id, promise);
+  try {
+    return await promise;
+  } finally {
+    restoreInFlight.delete(id);
+  }
+}
+
+async function doRestoreSession(
+  projectSlug: string,
+  taskSlug: string,
+  id: string,
+): Promise<RuntimeSession | null> {
+  // Re-check inside the lock — another caller may have populated the
+  // registry while we were awaiting the lock.
   const existing = registry.get(id);
   if (existing) return existing;
 
@@ -926,8 +1048,8 @@ async function findRunningSessionsInDir(
   sessDir: string,
   projectSlug: string,
   taskSlug: string,
-): Promise<Array<{ projectSlug: string; taskSlug: string; id: string }>> {
-  const out: Array<{ projectSlug: string; taskSlug: string; id: string }> = [];
+): Promise<Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }>> {
+  const out: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
   let dirents: import("node:fs").Dirent[];
   try {
     dirents = await fs.readdir(sessDir, { withFileTypes: true });
@@ -961,7 +1083,7 @@ async function findRunningSessionsInDir(
         && meta.sdkSessionId
         && meta.runtime !== "remote"
       ) {
-        out.push({ projectSlug, taskSlug, id: d.name });
+        out.push({ projectSlug, taskSlug, id: d.name, sdkSessionId: meta.sdkSessionId });
       }
     } catch { /* skip unreadable meta */ }
   }
@@ -992,20 +1114,15 @@ async function acquireAutoResumeLock(): Promise<boolean> {
   }
 }
 
-async function releaseAutoResumeLock(): Promise<void> {
-  try { await fs.unlink(AUTO_RESUME_LOCK); } catch { /* best effort */ }
-}
-
 export async function autoResumeRunningSessions(): Promise<{ resumed: number; failed: number }> {
-  // Acquire lock to prevent multiple workers from resuming the same sessions.
-  // Don't release the lock — let it expire naturally (LOCK_STALE_MS = 30s).
-  // This ensures all workers that start within 30s will skip auto-resume,
-  // preventing duplicate "[Server restarted]" messages.
+  // Coalesce concurrent boot passes across Next.js dev workers. Lock has a
+  // 30s TTL (LOCK_STALE_MS); we never release it explicitly so any worker
+  // that boots within that window stands down. Per-session ps ownership
+  // checks inside doAutoResume() handle workers that boot after the TTL.
   if (!(await acquireAutoResumeLock())) {
-    console.log("[auto-resume] Skipping — another worker is handling it");
+    console.log("[auto-resume] another worker is handling it — skip");
     return { resumed: 0, failed: 0 };
   }
-
   return await doAutoResume();
 }
 
@@ -1018,7 +1135,7 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
     return { resumed: 0, failed: 0 };
   }
 
-  const candidates: Array<{ projectSlug: string; taskSlug: string; id: string }> = [];
+  const candidates: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
   for (const p of projects) {
     candidates.push(...await findRunningSessionsInDir(
       path.join(PROJECTS_DIR, p.folderName, "sessions"),
@@ -1037,14 +1154,22 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
 
   let resumed = 0;
   let failed = 0;
+  let skipped = 0;
   for (const c of candidates) {
     try {
+      const own = await inspectOwnership(c.projectSlug, c.taskSlug, c.id, c.sdkSessionId);
+      if (own.ownedByOther) {
+        skipped++;
+        console.log(`[auto-resume] ${c.id}: owned by another worker — skip`);
+        continue;
+      }
       const s = await restoreSession(c.projectSlug, c.taskSlug, c.id);
       if (!s) { failed++; continue; }
-      // Clear finalState immediately so other workers (Next.js dev mode runs
-      // multiple) don't also try to resume this session.
+      // Belt-and-braces: clear finalState so a concurrent worker that hasn't
+      // seen our ownerPid yet doesn't double-claim this candidate.
       await updateMeta(s, (meta) => { meta.finalState = "resuming"; });
-      const ok = await resumeSession(s, RESUME_PROMPT);
+      await killReclaimableSdks(own.reclaimable, `auto-resume ${c.id}`);
+      const ok = await resumeSession(s, RESUME_PROMPT, "autoResume");
       if (ok) {
         resumed++;
         console.log(`[auto-resume] Resumed session ${c.id} (${c.projectSlug}/${c.taskSlug})`);
@@ -1056,7 +1181,7 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
       console.error(`[auto-resume] Failed to resume ${c.id}:`, (err as Error).message);
     }
   }
-  console.log(`[auto-resume] Done: ${resumed} resumed, ${failed} failed`);
+  console.log(`[auto-resume] Done: ${resumed} resumed, ${skipped} skipped (owned elsewhere), ${failed} failed`);
   return { resumed, failed };
 }
 
@@ -1186,6 +1311,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     autoTitleAttempted: false,
   };
   registerSession(session);
+  void persistOwnerPid(session);
 
   // Echo the first user message into history + cloud event log so the UI
   // shows the user's prompt (the SDK doesn't echo typed inputs in streaming mode).
@@ -1220,8 +1346,20 @@ function extractModifiedFilePath(msg: SDKMessage): string | null {
 // query iterator surfaces by throwing an abort / "ede_diagnostic" error. That's
 // the expected outcome of a user pressing stop — not a crash — so we recognize
 // it and record a clean "stopped" instead of flipping the session to "error".
+//
+// Also includes the SDK's exit messages ("Claude Code process terminated by
+// signal SIGKILL/SIGTERM", "Claude Code process exited with code …"). Those
+// fire whenever we deliberately kill the prior subprocess — via
+// AgentQuery.close() in resumeSession, or via killReclaimableSdks during
+// auto-resume / cross-worker reclamation. The pumpEvents `s.q !== myQuery`
+// bail-out catches these in most cases, but there's a narrow event-loop
+// window where the exit event lands while s.q is still the dying query.
+// Treating it as a clean stop closes the hole: intentional kill → new query
+// takes over; external kill (OOM, manual pkill) → session lands in "stopped"
+// and the user's next message restarts it via resumeSession. Either way,
+// no scary red error in the transcript.
 function isInterruptError(message: string): boolean {
-  return /request was aborted|ede_diagnostic|returned an error result/i.test(message);
+  return /request was aborted|ede_diagnostic|returned an error result|process terminated by signal|process exited with code/i.test(message);
 }
 
 // 529 = Anthropic API overloaded. Retryable with backoff.
@@ -1365,11 +1503,14 @@ async function pumpEvents(s: RuntimeSession) {
         // by MessageStream from the result event — no separate system error needed.
         if (resultMsg.subtype === "error" || resultMsg.error) {
           const errorText = resultMsg.error ?? "Unknown error";
-          s.events.emit("event", {
+          const errMsg = {
             type: "system",
             subtype: "error",
             message: errorText,
-          } as unknown as SDKMessage);
+          } as unknown as SDKMessage;
+          s.history.push(errMsg);
+          appendEvent(s.id, s.seq++, errMsg);
+          s.events.emit("event", errMsg);
         }
         // A user interrupt already drove the session to "stopped"; don't let the
         // trailing result flip it back to idle/awaiting_input.
@@ -1807,6 +1948,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     autoTitleAttempted: false,
   };
   registerSession(session);
+  void persistOwnerPid(session);
   appendEvent(session.id, session.seq++, firstUserEcho);
   session.events.emit("event", firstUserEcho);
   void pumpEvents(session);
@@ -1839,9 +1981,8 @@ export async function sendInput(id: string, text: string, openArtifact?: string)
   // Without this guard, sendInput would write to a closed inputLog, push into
   // a dead InputChannel, flip state to "running" — and the session would
   // appear alive but never produce events.
-  const sdkDead = s.input.isClosed() || s.state === "stopped" || s.state === "error";
-  if (sdkDead) {
-    return resumeSession(s, augmented);
+  if (s.input.isClosed() || s.state === "stopped" || s.state === "error") {
+    return resumeSession(s, augmented, "sendInput");
   }
 
   // The SDK doesn't echo typed user messages in streaming-input mode, so we
@@ -1906,11 +2047,10 @@ export async function sendInputWithFiles(
 
   // Route to resumeSession when the SDK is no longer consuming input — same
   // dead-SDK guard as sendInput. See its comment for rationale.
-  const sdkDead = s.input.isClosed() || s.state === "stopped" || s.state === "error";
-  if (sdkDead) {
+  if (s.input.isClosed() || s.state === "stopped" || s.state === "error") {
     // For resumed sessions, we can't easily add images to the resume flow.
     // Just include the text with file references.
-    return resumeSession(s, messageText);
+    return resumeSession(s, messageText, "sendInputWithFiles");
   }
 
   // Read images and convert to base64
@@ -1979,7 +2119,59 @@ async function sdkTranscriptExists(sdkSessionId: string): Promise<boolean> {
 // Resume a stopped session. Re-uses the SDK's `resume` mechanism when the
 // prior transcript is still on disk; otherwise starts a fresh SDK conversation
 // while keeping the visible event history intact.
-async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boolean> {
+async function resumeSession(s: RuntimeSession, newMessage: string, caller: string = "unknown"): Promise<boolean> {
+  // Coalesce concurrent resumes for the same session id. The user's send
+  // endpoint, auto-resume on boot, and any retry path can all call this at
+  // the same moment for the same session; before the lock each one created
+  // its own SDK subprocess against the same --resume <sdkSessionId>, which
+  // is exactly how we got 8 drafts when the user asked for 4 (two
+  // subprocesses both ran the user's "make calendar holds" turn from the
+  // same transcript).
+  //
+  // A second caller can't just return the in-flight promise — that would
+  // drop its own newMessage on the floor (only the first caller's message
+  // gets pushed into the fresh subprocess). Instead, await the resume and
+  // then route this caller's message through sendInput, which will hit the
+  // live input channel like any other turn.
+  const inflight = resumeInFlight.get(s.id);
+  if (inflight) {
+    console.log(`[resumeSession] ${s.id} caller=${caller} awaiting in-flight resume`);
+    await inflight;
+    return sendInput(s.id, newMessage);
+  }
+  const promise = doResumeSession(s, newMessage, caller);
+  resumeInFlight.set(s.id, promise);
+  try {
+    return await promise;
+  } finally {
+    resumeInFlight.delete(s.id);
+  }
+}
+
+async function doResumeSession(s: RuntimeSession, newMessage: string, caller: string = "unknown"): Promise<boolean> {
+  console.log(`[resumeSession] ${s.id} caller=${caller} state=${s.state} hasQuery=${!!s.q} sdkSessionId=${s.sdkSessionId} msg="${newMessage.slice(0, 60)}"`);
+
+  // Ownership check — same logic as auto-resume. If another live worker
+  // owns this session, our request landed on the wrong one; spawning a
+  // fresh SDK here would race two subprocesses against the same on-disk
+  // transcript (the bug that produced 8 drafts from one "make 4 calendar
+  // holds" request). Bail with a user-visible error. Otherwise reclaim
+  // any leftover SDK subprocesses before we spawn the replacement.
+  const own = await inspectOwnership(s.projectSlug, s.taskSlug, s.id, s.sdkSessionId);
+  if (own.ownedByOther) {
+    console.warn(`[resumeSession] ${s.id} aborting — owned by another worker`);
+    const errMsg = {
+      type: "system",
+      subtype: "error",
+      message: "This session is being handled by another server worker (Next.js dev). Please refresh the page and try again.",
+    } as unknown as SDKMessage;
+    s.history.push(errMsg);
+    appendEvent(s.id, s.seq++, errMsg);
+    s.events.emit("event", errMsg);
+    return false;
+  }
+  await killReclaimableSdks(own.reclaimable, `resume ${s.id}`);
+
   // Decide whether the SDK can actually pick up where the prior turn left off.
   // Both pieces must hold: we kept the session_id in meta.json, AND its on-disk
   // transcript is still where the SDK expects it. If the transcript is gone
@@ -2000,28 +2192,23 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     });
   }
 
-  // Interrupt any existing query to stop the old pumpEvents loop.
-  // This prevents race conditions where the old loop overwrites state after
-  // the new one has already set it.
+  // Hard-stop the existing in-process query before creating a new one.
+  // close() asks the SDK CLI subprocess to terminate (SIGTERM, then SIGKILL
+  // after 5s). The previous implementation used interrupt() with a 2s
+  // timeout, which only stops the current turn and leaves the subprocess
+  // alive — a fresh query with resume:<same sdkSessionId> would then attach
+  // to the same transcript and both subprocesses would run turns in parallel.
   //
-  // Wrap with a 2s timeout: the Claude SDK's interrupt() writes a
-  // control_request to the bridge subprocess and waits for an ack on the
-  // same channel. If the bridge has already exited (e.g. after the user
-  // hit Stop, which left s.q referencing a dead transport), the write
-  // succeeds locally but no response ever arrives — the promise hangs
-  // forever. Without this guard, resume-after-stop blocks for tens of
-  // seconds and ends up creating a new query against a dead transport,
-  // so the UI sees "send button does nothing" — the request is in flight
-  // for ~30s and produces zero agent output.
-  if (s.q) {
-    try {
-      await Promise.race([
-        s.q.interrupt(),
-        new Promise<void>((resolve) => setTimeout(resolve, 2000)),
-      ]);
-    } catch {
-      // Ignore errors — query may already be done
-    }
+  // Detach s.q BEFORE close: the old pumpEvents loop's iterator throws an
+  // exit error when its subprocess dies, and its catch block bails silently
+  // only when `s.q !== myQuery`. If we leave s.q pointing at the dying
+  // query, the catch instead surfaces "terminated by signal SIGTERM/SIGKILL"
+  // as a user-visible session error.
+  const oldQ = s.q;
+  s.q = undefined as unknown as AgentQuery;
+  if (oldQ) {
+    try { oldQ.close(); }
+    catch (err) { console.warn(`[resumeSession] ${s.id} close() failed:`, (err as Error).message); }
   }
 
   try {
@@ -2141,6 +2328,7 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
     s.interrupted = false;
     s.streamingText = "";
     setState(s, "running");
+    void persistOwnerPid(s);
 
     // Start pumping events from the new query
     void pumpEvents(s);
@@ -2149,11 +2337,14 @@ async function resumeSession(s: RuntimeSession, newMessage: string): Promise<boo
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     console.error(`[session ${s.id}] Failed to resume:`, errorMsg);
-    s.events.emit("event", {
+    const resumeFailMsg = {
       type: "system",
       subtype: "error",
       message: `Failed to resume session: ${errorMsg}`,
-    } as unknown as SDKMessage);
+    } as unknown as SDKMessage;
+    s.history.push(resumeFailMsg);
+    appendEvent(s.id, s.seq++, resumeFailMsg);
+    s.events.emit("event", resumeFailMsg);
     return false;
   }
 }
@@ -2202,22 +2393,30 @@ export async function retrySession(id: string): Promise<boolean> {
   if (!s) return false;
   if (s.state !== "error" && s.state !== "stopped") return false;
 
-  // Find the last user message to retry
+  // Find the last user message to retry. History entries follow the SDK
+  // envelope shape `{ type: "user", message: { role, content }, ... }` (see
+  // makeUserMessage in input-channel.ts), so read content from msg.message,
+  // not the top level. Skip user-typed envelopes whose content is a
+  // tool_result array — those are synthetic tool replies, not user input.
   let lastUserMessage = "";
   for (let i = s.history.length - 1; i >= 0; i--) {
-    const msg = s.history[i] as { role?: string; content?: unknown };
-    if (msg.role === "user") {
-      const content = msg.content;
-      if (typeof content === "string") {
-        lastUserMessage = content;
-      } else if (Array.isArray(content)) {
-        // Handle content array (text blocks)
-        const textBlock = content.find((b: { type?: string }) => b.type === "text");
-        if (textBlock && typeof (textBlock as { text?: string }).text === "string") {
-          lastUserMessage = (textBlock as { text: string }).text;
-        }
-      }
+    const msg = s.history[i] as { type?: string; message?: { content?: unknown } };
+    if (msg.type !== "user") continue;
+    const content = msg.message?.content;
+    if (typeof content === "string") {
+      lastUserMessage = content;
       break;
+    }
+    if (Array.isArray(content)) {
+      const isToolResult = content.some(
+        (b: { type?: string }) => b?.type === "tool_result",
+      );
+      if (isToolResult) continue;
+      const textBlock = content.find((b: { type?: string }) => b?.type === "text");
+      if (textBlock && typeof (textBlock as { text?: string }).text === "string") {
+        lastUserMessage = (textBlock as { text: string }).text;
+        break;
+      }
     }
   }
 
