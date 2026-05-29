@@ -21,6 +21,14 @@ class ClaudeAgentQuery implements AgentQuery {
     return this.q.interrupt();
   }
 
+  close() {
+    // SDK Query.close() terminates the underlying CLI subprocess. Safe to
+    // call multiple times — the SDK guards against double-close internally.
+    try {
+      this.q.close();
+    } catch { /* already closed or process gone */ }
+  }
+
   setMcpServers(servers: Parameters<Query["setMcpServers"]>[0]) {
     return this.q.setMcpServers(servers);
   }

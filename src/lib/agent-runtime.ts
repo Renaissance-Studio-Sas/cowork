@@ -92,6 +92,13 @@ export interface AgentQueryOptions {
 // AsyncIterable, and can interrupt mid-stream.
 export interface AgentQuery extends AsyncIterable<AgentEvent> {
   interrupt(): Promise<void>;
+  // Forcefully end the query and kill the underlying subprocess (Claude CLI
+  // child, gemini-cli-core abort, remote runner stream). Unlike interrupt(),
+  // which only asks the agent to stop the current turn and leaves the process
+  // alive waiting for further input, close() guarantees the subprocess is
+  // gone. resumeSession() relies on this to prevent two SDK subprocesses
+  // running concurrently against the same sdkSessionId after a resume.
+  close(): void;
   setMcpServers(servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult>;
   mcpServerStatus(): Promise<AgentMcpServerStatus[]>;
 }

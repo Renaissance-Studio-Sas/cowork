@@ -458,6 +458,14 @@ class RemoteAgentQuery implements AgentQuery {
     this.abort.abort();
   }
 
+  close(): void {
+    // Synchronously stop iterating runner SSE and drop any in-flight POSTs.
+    // The remote runner container keeps running on its own — cowork doesn't
+    // own its lifecycle here — so close() is just local cleanup.
+    this.interrupted = true;
+    this.abort.abort();
+  }
+
   async setMcpServers(_servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult> {
     return {} as AgentSetMcpServersResult;
   }

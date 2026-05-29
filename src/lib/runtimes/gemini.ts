@@ -478,6 +478,13 @@ class GeminiAgentQuery implements AgentQuery {
     this.abort.abort();
   }
 
+  close(): void {
+    // No long-lived subprocess to kill — gemini-cli-core runs in-process.
+    // Aborting drops any in-flight model call and tool execution, which is
+    // the equivalent terminal cleanup for this runtime.
+    this.abort.abort();
+  }
+
   // Run the optional canUseTool hook with a synthesized options object
   // shaped like what the Claude SDK passes. Returns the cowork-supplied
   // PermissionResult, or auto-allow when no hook is set. The promise
