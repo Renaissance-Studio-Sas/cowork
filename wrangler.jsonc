@@ -17,9 +17,25 @@
     // for non-file paths so client-side routing works on hard navigation.
     "directory": "./dist/client",
     "not_found_handling": "single-page-application",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    // Run the Worker BEFORE asset matching for /api/* so API responses pass
+    // through untouched. Without this, the assets layer's SPA not_found_handling
+    // rewrites any 404 the Worker returns into a 200 (verified) — which would
+    // silently mask real backend 404s (session-not-found, file-not-found) that
+    // the SSE route and client logic depend on. All other paths still hit
+    // static assets first, falling back to the SPA shell on a miss.
+    "run_worker_first": ["/api/*"]
   },
   "observability": {
     "enabled": true
+  },
+  "vars": {
+    // Origin of the cloud backend that owns the Node/filesystem/agent logic
+    // (the old Next handlers run there unchanged). The Worker forwards every
+    // /api/* request here via the streaming proxy. Empty until the backend is
+    // deployed — proxied routes return 503 ("BACKEND_URL not configured")
+    // until then. Set per-environment here, or as a secret for production:
+    //   wrangler secret put BACKEND_URL
+    "BACKEND_URL": ""
   }
 }
