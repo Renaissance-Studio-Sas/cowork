@@ -107,6 +107,9 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   }, [projectSlug, taskSlug, filePath, isImage, isPdf]);
 
   useEffect(() => {
+    // Reset stale content then fetch when the target file changes — intended
+    // reset-on-prop-change + data fetch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-prop-change + fetch
     setText(null);
     setError(null);
     refreshFile();
@@ -142,6 +145,9 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   }, [projectSlug, taskSlug, filePath, refreshFile, refreshComments]);
 
   useEffect(() => {
+    // Re-fetch comments and clear per-file editing UI state when the target
+    // file changes — intended reset-on-prop-change.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-prop-change
     refreshComments();
     setDraft("");
     setPendingAnchor(null);
@@ -153,6 +159,9 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
 
   // --- Markdown: resolve anchors against the visible DOM text ------------
   const [renderTick, setRenderTick] = useState(0);
+  // Bump a tick after the markdown text changes so resolvedComments recomputes
+  // against the freshly-rendered DOM (see the ref read below).
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- post-render recompute trigger
   useEffect(() => { setRenderTick((t) => t + 1); }, [text]);
 
   const resolvedComments = useMemo<ResolvedComment[]>(() => {
@@ -167,6 +176,10 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
         return { ...c, anchor: a, resolved: obs ? null : { start: 0, end: 0 }, obsolete: obs };
       });
     }
+    // Anchors resolve against the rendered DOM text, so we read contentRef
+    // during render on purpose. renderTick (above) forces this memo to rerun
+    // after each paint, which is what keeps `visible` current.
+    /* eslint-disable react-hooks/refs -- intentional post-render DOM measurement */
     const root = contentRef.current;
     const visible = root?.textContent ?? "";
     return comments.map((c) => {
@@ -175,6 +188,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
       const resolved = locateAnchor(visible, a);
       return { ...c, anchor: a, resolved, obsolete: !resolved };
     });
+    /* eslint-enable react-hooks/refs */
   }, [comments, renderTick, isHtml, htmlObsoleteIds]);
 
   // --- Markdown: highlight resolved comments in the DOM -------------------

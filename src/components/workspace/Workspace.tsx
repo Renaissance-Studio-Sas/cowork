@@ -202,6 +202,9 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   }, [projectSlug, taskSlug]);
 
   useEffect(() => {
+    // Initial load of the artifact list + comment counts; both set state from
+    // the fetch — the intended data-fetch-on-mount pattern.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data fetch
     refreshFiles();
     refreshCommentCounts();
   }, [refreshFiles, refreshCommentCounts]);
@@ -288,7 +291,6 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   const artifactExpanded = artifactPath.length > 0;
   const chatExpanded = chatSessionId.length > 0;
   const bothExpanded = artifactExpanded && chatExpanded;
-  const anyExpanded = artifactExpanded || chatExpanded;
 
   // Effective split (artifact column fraction). A user-dragged value (in the
   // URL) always wins; otherwise pick a sensible default per mode.
@@ -328,7 +330,10 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     }
     updateParams(next);
   }, [currentParams, splitParam, artifactExpanded, chatExpanded, updateParams]);
-  openArtifactRef.current = openArtifact;
+  // Keep the ref pointing at the latest openArtifact so the SSE effect can call
+  // it without depending on its identity. Updated after commit (not during
+  // render) to satisfy the rules-of-refs check.
+  useEffect(() => { openArtifactRef.current = openArtifact; }, [openArtifact]);
 
   const closeArtifact = useCallback(() => {
     const next: WorkspaceParams = { ...currentParams, artifact: undefined };

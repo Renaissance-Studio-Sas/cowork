@@ -31,10 +31,9 @@ import {
   flushEvents,
   forgetSession,
   readSessionEvents,
-  deleteSessionEvents,
   registerSessionLog,
 } from "./cloud-events";
-import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, projectDir, reconcileSessionsOnDisk } from "./fs";
+import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
 import {
@@ -121,17 +120,12 @@ const REGISTRY = new Map<string, RuntimeSession>();
 
 // In dev mode Next hot-reloads modules; survive that with a globalThis cache.
 declare global {
-  // eslint-disable-next-line no-var
+  // `var` (not let/const) is required for global augmentation here.
   var __wb_session_registry: Map<string, RuntimeSession> | undefined;
-  // eslint-disable-next-line no-var
   var __wb_watchdog_interval: ReturnType<typeof setInterval> | undefined;
-  // eslint-disable-next-line no-var
   var __wb_session_registry_events: EventEmitter | undefined;
-  // eslint-disable-next-line no-var
   var __wb_reconciled: boolean | undefined;
-  // eslint-disable-next-line no-var
   var __wb_restore_inflight: Map<string, Promise<RuntimeSession | null>> | undefined;
-  // eslint-disable-next-line no-var
   var __wb_resume_inflight: Map<string, Promise<boolean>> | undefined;
 }
 const registry: Map<string, RuntimeSession> =

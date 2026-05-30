@@ -264,7 +264,6 @@ class GeminiAgentQuery implements AgentQuery {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const turnToolUses: Array<{ type: "tool_use"; id: string; name: string; input: any }> = [];
 
-          // eslint-disable-next-line no-constant-condition
           while (true) {
             const r = await iter.next();
             if (r.done) {
@@ -551,7 +550,16 @@ class GeminiAgentQuery implements AgentQuery {
     const errors: Record<string, string> = {};
 
     try {
-      const mcpManager = this.config?.getMcpClientManager() as any;
+      // gemini-cli-core doesn't export McpClientManager's type from its public
+      // entrypoint; declare the slice of it we drive here.
+      const mcpManager = this.config?.getMcpClientManager() as
+        | {
+            stop(): Promise<void>;
+            allServerConfigs?: { clear(): void };
+            startConfiguredMcpServers(): Promise<void>;
+            getLastError?(name: string): string | undefined;
+          }
+        | undefined;
       if (!mcpManager) {
         throw new Error("McpClientManager not initialized");
       }
@@ -606,8 +614,8 @@ class GeminiAgentQuery implements AgentQuery {
             undefined, // env
             undefined, // cwd
             undefined, // url
-            (server as any).url || (server as any).httpUrl, // httpUrl
-            (server as any).headers, // headers
+            server.url, // httpUrl
+            server.headers, // headers
             undefined, // tcp
             "http", // type
           );

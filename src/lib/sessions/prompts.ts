@@ -7,7 +7,6 @@ import path from "node:path";
 import {
   getProject,
   PROJECT_BRIEF_FILENAME,
-  PROJECTS_DIR,
   TASK_BRIEF_FILENAME,
   WORKSPACE_ROOT,
   type Brief,

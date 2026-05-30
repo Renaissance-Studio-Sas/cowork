@@ -17,6 +17,10 @@ export function useStickyDraft(sessionId: string): [string, (v: string) => void]
   useEffect(() => {
     if (prevKeyRef.current === storageKey) return;
     prevKeyRef.current = storageKey;
+    // Reload the new session's saved draft when the key actually changes —
+    // intentional state reset on prop change, guarded above so it only fires
+    // on a real switch.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-prop-change, guarded
     try { setDraftState(localStorage.getItem(storageKey) ?? ""); } catch { /* ignore */ }
   }, [storageKey]);
 

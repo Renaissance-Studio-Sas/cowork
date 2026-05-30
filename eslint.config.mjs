@@ -20,6 +20,16 @@ const eslintConfig = [
   // Mirrors the previous `next/core-web-vitals` + `next/typescript` extends.
   ...nextCoreWebVitals,
   ...nextTypescript,
+  {
+    rules: {
+      // Treat `_`-prefixed args/vars as deliberately unused (placeholder
+      // params, destructure-and-drop), matching common convention.
+      "@typescript-eslint/no-unused-vars": [
+        "warn",
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" },
+      ],
+    },
+  },
 ];
 
 export default eslintConfig;

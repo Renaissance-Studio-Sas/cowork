@@ -18,8 +18,12 @@ export function AppShell({ children }: Props) {
   const [newTaskFor, setNewTaskFor] = useState<string | null>(null);
   const [showNewProject, setShowNewProject] = useState(false);
 
+  // Read the persisted sidebar state on mount. Has to run in an effect rather
+  // than a lazy initializer: localStorage is unavailable during SSR, and
+  // seeding from it during render would cause a hydration mismatch.
   useEffect(() => {
     const stored = localStorage.getItem("wb-sidebar-open");
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- client-only localStorage hydration
     if (stored !== null) setSidebarOpen(stored === "1");
   }, []);
 

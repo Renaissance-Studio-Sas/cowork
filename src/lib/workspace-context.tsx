@@ -37,6 +37,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    // Initial fetch + 2.5s poll of workspace/session state. refresh() setting
+    // state from the effect is the intended data-fetch-on-mount pattern.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data fetch + poll
     refresh();
     const t = setInterval(refresh, 2500);
     return () => clearInterval(t);

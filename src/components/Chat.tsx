@@ -140,6 +140,16 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
+
+  // "Clear" snapshot — when the user clicks Clear, we record the current set of
+  // task content strings. The panel stays hidden until a NEW task (one whose
+  // content isn't in this snapshot) appears, at which point we reset to null
+  // and the panel shows again. Persisted to localStorage so reopening the
+  // session keeps it cleared. Declared up here (above the session-reset effect
+  // that calls setClearedTasks) so the setter isn't referenced before init.
+  const clearedTasksKey = `cowork:clearedTasks:${session.id}`;
+  const [clearedTasks, setClearedTasks] = useState<Set<string> | null>(null);
+
   const isAtBottomRef = useRef(true);
   const prevScrollHeightRef = useRef(0);
   const isInitialLoadRef = useRef(true);
@@ -175,19 +185,27 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     prevScrollHeightRef.current = 0;
   }, [messages.length, isLoadingMore]);
 
-  // Stable reference to onChange to avoid re-running the effect
+  // Stable reference to onChange to avoid re-running the effect.
   const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-
   // Latest draft + attachments, read at send-error time. Async send() captures
   // both in closure at call time and can't peek at what the user typed while
   // the request was in flight, so we mirror them into refs for the error path.
   const draftRef = useRef(draft);
-  draftRef.current = draft;
   const attachmentsRef = useRef(attachments);
-  attachmentsRef.current = attachments;
+  // Mirror the latest values into the refs after each commit. These refs are
+  // only read from async callbacks (the SSE effect, the send-error path), never
+  // during the same render, so the post-commit timing is fine.
+  useEffect(() => {
+    onChangeRef.current = onChange;
+    draftRef.current = draft;
+    attachmentsRef.current = attachments;
+  });
 
   useEffect(() => {
+    // Reset all per-session UI state and (re)open the SSE stream whenever the
+    // session changes — an intentional reset-on-prop-change paired with the
+    // subscription this effect owns.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-session-change + subscribe
     setMessages([]);
     setServerTodos(null);
     setClearedTasks(null);
@@ -207,7 +225,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
       `/api/sessions/${session.id}/stream?limit=${PAGE_SIZE}&project=${encodeURIComponent(session.projectSlug)}&task=${encodeURIComponent(session.taskSlug)}`,
     );
     let connected = false;
-    let initialMessages: SDKMessageLite[] = [];
+    const initialMessages: SDKMessageLite[] = [];
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
     const flushInitial = () => {
@@ -482,20 +500,14 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // Todo panel visibility (defaults to shown when there are todos)
   const [showTodos, setShowTodos] = useState(true);
 
-  // "Clear" snapshot — when the user clicks Clear, we record the current set of
-  // task content strings. The panel stays hidden until a NEW task (one whose
-  // content isn't in this snapshot) appears, at which point we reset to null
-  // and the panel shows again. Persisted to localStorage so reopening the
-  // session keeps it cleared.
-  const clearedTasksKey = `cowork:clearedTasks:${session.id}`;
-  const [clearedTasks, setClearedTasks] = useState<Set<string> | null>(null);
-
-  // Load persisted clear state on session change.
+  // Load persisted clear state on session change — client-only localStorage
+  // hydration keyed to the session.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(clearedTasksKey);
       if (raw) {
         const arr = JSON.parse(raw) as string[];
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage hydration on key change
         setClearedTasks(Array.isArray(arr) ? new Set(arr) : null);
       } else {
         setClearedTasks(null);
@@ -512,6 +524,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     if (clearedTasks === null) return;
     const hasNew = todos.some((t) => !clearedTasks.has(t.content));
     if (hasNew) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset coupled with the localStorage write below
       setClearedTasks(null);
       try { localStorage.removeItem(clearedTasksKey); } catch {}
     }

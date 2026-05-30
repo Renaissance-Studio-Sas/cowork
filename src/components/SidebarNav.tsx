@@ -3,11 +3,11 @@
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import type { ProjectDTO, SessionSummaryDTO, TaskDTO } from "@/lib/types";
+import type { SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { isPending, useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { WorkingIndicator } from "./WorkingIndicator";
-import { projectRoute, taskRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
+import { projectRoute, taskSessionRoute, projectSessionRoute, getTaskRestoreRoute } from "@/lib/routes";
 
 const COLLAPSED_KEY = "wb-projects-collapsed";
 const RECENT_COLLAPSED_KEY = "wb-recent-sessions-collapsed";
@@ -45,7 +45,11 @@ export function SidebarNav({ onNewTask, onNewProject, onClose }: Props) {
   // Parse current selection from pathname
   const selected = parsePathname(pathname);
 
+  // Hydrate collapsed-section state from localStorage on mount. Effect rather
+  // than lazy init: localStorage is SSR-unavailable and seeding during render
+  // would mismatch hydration.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- client-only localStorage hydration
     setCollapsed(loadCollapsed());
     try {
       setRecentCollapsed(localStorage.getItem(RECENT_COLLAPSED_KEY) === "true");
