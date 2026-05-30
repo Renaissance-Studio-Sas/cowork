@@ -170,8 +170,10 @@ class GeminiAgentQuery implements AgentQuery {
     // "[Server restarted — please continue]" prompt has no context.
     const priorHistory = await this.loadHistory();
     if (priorHistory && priorHistory.length > 0) {
+      // gemini-cli-core 0.44 dropped setHistory's `{ silent }` option; it now
+      // takes the history array only.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this.chat.setHistory(priorHistory as any, { silent: true });
+      this.chat.setHistory(priorHistory as any);
     }
 
     // Scheduler executes pending tool calls between model turns. cowork
