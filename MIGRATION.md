@@ -63,13 +63,17 @@ src/
 - [x] Add `src/worker/index.ts` Hono app with health check + `/api` mount point.
 - [x] Update `package.json` scripts/deps; update `tsconfig`.
 
-### Phase 1 — frontend
-- [ ] Port `app/layout.tsx` → `index.html` `<head>` + `App.tsx` shell (`<Providers>`).
-- [ ] Map the 3 page shapes + redirect-only deep links into react-router.
-- [ ] Replace `next/link`, `next/navigation` (`useRouter`/`usePathname`/
-      `useSearchParams`/`redirect`) usages with react-router equivalents.
-- [ ] Replace any `next/*` imports across `components/` and `lib/`.
-- [ ] Wire Tailwind v4 via `@tailwindcss/vite`; drop `postcss.config.mjs`.
+### Phase 1 — frontend ✅
+- [x] Port `app/layout.tsx` → `index.html` `<head>` + `App.tsx` shell (`<Providers>`).
+- [x] Map the 3 page shapes + redirect-only deep links into react-router.
+- [x] Replace `next/link`, `next/navigation` (`useRouter`/`usePathname`/
+      `useSearchParams`/`redirect`) usages with react-router equivalents — done via
+      the `@/lib/navigation` compat shim (smaller diff than rewriting call sites).
+- [x] Replace any `next/*` imports across `components/` and `lib/` (none remain).
+- [x] Wire Tailwind v4 via `@tailwindcss/vite` (globals.css already used the v4
+      `@import "tailwindcss"` form). `postcss.config.mjs` left in place for the
+      still-present Next pages; dropped in Phase 3 cutover.
+- [x] SPA deep-link fallback: Worker serves `index.html` via the ASSETS binding.
 
 ### Phase 2 — API (Hono on the Worker)
 - [ ] Port each `app/api/**/route.ts` into `src/worker/routes/*`. The handlers
