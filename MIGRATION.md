@@ -113,9 +113,41 @@ parts of the backend move onto Cloudflare.
 - [x] `CLAUDE.template.md` has no Next/dev/deploy references — nothing to change
       there. The new dev/deploy commands are documented below.
 
-## Dev / deploy commands (target)
+### Phase 4 — Node backend (fully functional locally) ✅
+Hono is runtime-agnostic, so the same routes run on Node — calling the real
+`src/lib` logic directly instead of proxying. This makes the app fully functional
+locally (filesystem + Claude/Gemini agents), exactly like the old Next app, with
+no remote backend required.
+- [x] `src/server/routes/*` — the 34 handlers ported to native Node Hono, reusing
+      `src/lib/*` (fs, sessions, comments-store, todos) verbatim. Same paths /
+      methods as `src/worker/routes/*` (the contract); SSE + raw-file responses
+      preserved.
+- [x] `src/server/app.ts` (route tree) + `src/server/index.ts` (entry via
+      `@hono/node-server`). Loads `.env` (Node doesn't auto-load it like Next did)
+      before importing lib so `WORKSPACE_ROOT` resolves.
+- [x] Two run modes:
+      - **dev**: `npm run dev` → Vite client on :3100 (HMR) + Node API on :8787,
+        client proxies `/api/*` to it (`vite.config.node.ts`). Sidesteps the
+        miniflare loopback crash the CF dev plugin hits here.
+      - **prod**: `npm run serve` (NODE_ENV=production) → one Node process serves
+        the built SPA (`dist/client`) + API on :3100.
+- [x] The Cloudflare path (`src/worker`, `vite.config.ts`, `npm run dev:edge` /
+      `deploy`) is unchanged — still proxies to `BACKEND_URL` for edge deploy
+      once the cloud backend lands.
 
-- `npm run dev`    — Vite dev server with the Worker running in-process.
-- `npm run build`  — `vite build` (client assets + worker bundle).
-- `npm run deploy` — `wrangler deploy`.
-- `npm run preview`— `wrangler dev` against the built output.
+Verified: tsc 0 errors, edge `vite build` exit 0, dev stack on :3100 serves real
+data (23 projects, live sessions), prod single-process mode serves SPA + API.
+
+## Dev / deploy commands
+
+**Local (Node backend — full fs + Claude/Gemini, the default):**
+- `npm run dev`     — Vite client on :3100 (HMR) + Node API on :8787. Use this.
+- `npm run serve`   — single Node process serving built SPA + API on :3100
+                      (run `npm run build` first). Production-style local run.
+
+**Cloudflare edge (proxies /api/* to BACKEND_URL):**
+- `npm run dev:edge`— Vite + Worker in-process (needs BACKEND_URL; the CF dev
+                      plugin can hit a miniflare loopback crash in some setups).
+- `npm run build`   — `vite build` (client assets + worker bundle).
+- `npm run deploy`  — `wrangler deploy`.
+- `npm run preview` — `wrangler dev` against the built output.
