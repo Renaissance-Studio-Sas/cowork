@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, useEffect, Suspense, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { SidebarNav } from "./SidebarNav";
 import { NewProjectModal, NewTaskModal } from "./NewModal";
@@ -30,11 +30,16 @@ export function AppShell({ children }: Props) {
   return (
     <div className="h-screen flex bg-[var(--bg)] text-[var(--text)]">
       {sidebarOpen ? (
-        <SidebarNav
-          onNewTask={(project) => setNewTaskFor(project)}
-          onNewProject={() => setShowNewProject(true)}
-          onClose={() => setSidebarOpen(false)}
-        />
+        // SidebarNav reads useSearchParams(); a Suspense boundary keeps static
+        // prerender (e.g. /_not-found) from bailing out of the whole route.
+        // Fallback matches the sidebar's w-[300px] to avoid layout shift.
+        <Suspense fallback={<aside className="w-[300px] shrink-0 bg-[var(--bg-2)] border-r border-[var(--border)]" />}>
+          <SidebarNav
+            onNewTask={(project) => setNewTaskFor(project)}
+            onNewProject={() => setShowNewProject(true)}
+            onClose={() => setSidebarOpen(false)}
+          />
+        </Suspense>
       ) : (
         <FoldedRail onExpand={() => setSidebarOpen(true)} pendingCount={pendingCount} />
       )}
