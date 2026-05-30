@@ -8,10 +8,9 @@
     "build": "vite build",
     "preview": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "eslint",
-    "cf-typegen": "wrangler types",
-    "dev:next": "next dev -p 3100",
-    "build:next": "next build"
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.156",
@@ -19,7 +18,6 @@
     "@google/genai": "^2.5.0",
     "gray-matter": "^4.0.3",
     "hono": "^4.9.10",
-    "next": "^16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
@@ -30,7 +28,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.13.16",
-    "@tailwindcss/postcss": "^4",
+    "@eslint/js": "^9",
     "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4",
     "@types/node": "^20",
@@ -38,13 +36,11 @@
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^5.0.4",
     "eslint": "^9",
-    "eslint-config-next": "^16.2.6",
+    "eslint-plugin-react-hooks": "^6.1.1",
     "tailwindcss": "^4",
     "typescript": "^5",
+    "typescript-eslint": "^8",
     "vite": "^7.1.12",
     "wrangler": "^4.43.0"
-  },
-  "overrides": {
-    "postcss": "^8.5.10"
   }
 }

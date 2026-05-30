@@ -95,10 +95,23 @@ NOTE: per-route modules exist precisely so individual endpoints can later be
 reimplemented to run natively on the Worker (R2/D1/KV) instead of proxying, if
 parts of the backend move onto Cloudflare.
 
-### Phase 3 — cutover
-- [ ] Delete `src/app/`, `next.config.ts`, `next-env.d.ts`, `.next/`, Next deps.
-- [ ] `vite build` clean; `wrangler deploy` dry-run clean.
-- [ ] Update `CLAUDE.template.md` / docs for the new dev + deploy commands.
+### Phase 3 — cutover ✅
+- [x] Delete `src/app/`, `next.config.ts`, `next-env.d.ts`, `postcss.config.mjs`,
+      `tsconfig.tsbuildinfo`. Drop `next`, `eslint-config-next`,
+      `@tailwindcss/postcss` (PostCSS unused — Tailwind v4 goes through
+      `@tailwindcss/vite`) and the `postcss` override from `package.json`.
+- [x] Replace the Next-based `eslint.config.mjs` (which pulled `next/...` configs)
+      with a flat config: `@eslint/js` + `typescript-eslint` +
+      `eslint-plugin-react-hooks` (v6 — restores the `react-hooks/*` rules,
+      incl. `set-state-in-effect`, that the source's inline disable directives
+      rely on; `exhaustive-deps` kept at `warn` to match the old behavior).
+- [x] Update `tsconfig.json`: drop the `next` plugin and `next-env.d.ts`/`.next`
+      includes; add `vite/client` types, exclude `dist`.
+- [x] `vite build` clean, `tsc --noEmit` 0 errors, `npm run lint` clean
+      (0 errors / 11 pre-existing `exhaustive-deps` warnings), `wrangler deploy
+      --dry-run` clean.
+- [x] `CLAUDE.template.md` has no Next/dev/deploy references — nothing to change
+      there. The new dev/deploy commands are documented below.
 
 ## Dev / deploy commands (target)
 
