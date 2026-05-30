@@ -5,7 +5,7 @@
 // re-appear when isLive flips and the live composer takes over.
 
 import { useState, type ReactNode } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import { handleComposerEnter } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
 

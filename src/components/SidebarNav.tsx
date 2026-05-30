@@ -1,7 +1,6 @@
 "use client";
 
-import Link from "next/link";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Link, usePathname, useRouter, useSearchParams } from "@/lib/navigation";
 import { useEffect, useState } from "react";
 import type { SessionSummaryDTO, TaskDTO } from "@/lib/types";
 import { isPending, useWorkspace } from "@/lib/workspace-context";

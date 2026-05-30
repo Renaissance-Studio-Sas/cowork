@@ -8,7 +8,7 @@
 // `*_resolved` echo clears the card from the parent's state map.
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { SessionSummaryDTO } from "@/lib/types";

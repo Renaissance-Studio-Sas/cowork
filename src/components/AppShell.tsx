@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, Suspense, type ReactNode } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import { SidebarNav } from "./SidebarNav";
 import { NewProjectModal, NewTaskModal } from "./NewModal";
 import { useWorkspace } from "@/lib/workspace-context";

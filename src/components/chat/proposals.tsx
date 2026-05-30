@@ -4,7 +4,7 @@
 // as a record of what was offered).
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import type { SessionSummaryDTO } from "@/lib/types";
 import { taskRoute, projectRoute } from "@/lib/routes";
 import { sluggifyName } from "./utils";

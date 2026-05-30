@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter } from "@/lib/navigation";
 import { handleComposerEnter } from "@/lib/composer";
 import { projectSessionRoute } from "@/lib/routes";
 

@@ -10,10 +10,14 @@
   // run here — they live in the separate cloud backend (see MIGRATION.md).
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
-    // Built client SPA. Unmatched routes fall back to index.html so react-router
-    // can handle client-side routing; /api/* misses an asset and hits the Worker.
+    // Built client SPA. Static assets are served directly; any path that isn't a
+    // file (e.g. /project/foo deep links) misses and is routed to the Worker,
+    // which serves the SPA shell via the ASSETS binding below. /api/* is handled
+    // by Hono. `single-page-application` makes ASSETS.fetch() return index.html
+    // for non-file paths so client-side routing works on hard navigation.
     "directory": "./dist/client",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS"
   },
   "observability": {
     "enabled": true

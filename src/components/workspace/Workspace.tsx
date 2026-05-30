@@ -1,8 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useSearchParams, usePathname } from "next/navigation";
-import Link from "next/link";
+import { Link, useRouter, useSearchParams, usePathname } from "@/lib/navigation";
 import type { ProjectDTO, TaskDTO, SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
 import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
