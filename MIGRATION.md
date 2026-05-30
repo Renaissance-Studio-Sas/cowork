@@ -75,14 +75,25 @@ src/
       still-present Next pages; dropped in Phase 3 cutover.
 - [x] SPA deep-link fallback: Worker serves `index.html` via the ASSETS binding.
 
-### Phase 2 — API (Hono on the Worker)
-- [ ] Port each `app/api/**/route.ts` into `src/worker/routes/*`. The handlers
-      are already Web-standard `Request`/`Response`, so bodies port almost
-      verbatim; swap `NextResponse.json` → `c.json`, read params from Hono.
-- [ ] Storage/agent-dependent routes (`sessions/*`, `files/*`, `comments`,
-      `plan`, `workspace`) → call the remote cloud backend; mark `// TODO(cloud)`.
-- [ ] Port SSE routes (`sessions/:id/stream`, `file-events/stream`) using
-      Hono's `streamSSE` against the remote event source.
+### Phase 2 — API (Hono on the Worker) ✅
+All 35 routes mirror the old `app/api/**/route.ts` tree as a per-route proxy.
+Since the Node/fs/agent logic moves to the cloud independently, none of the
+handlers run on the Worker — each forwards to a configurable `BACKEND_URL`.
+- [x] Mirror every `app/api/**/route.ts` in `src/worker/routes/*` (explicit
+      method + path; static segments before param routes). The bodies aren't
+      reimplemented — they forward, so the cloud backend keeps the Next handlers.
+- [x] Storage/agent-dependent routes (`sessions/*`, `files/*`, `comments`,
+      `plan`, `workspace`, `projects/*`) → forward to the cloud backend via
+      `src/worker/lib/proxy.ts`. `BACKEND_URL` unset → 503; unreachable → 502.
+- [x] SSE routes (`sessions/:id/stream`, `file-events/stream`) — the proxy
+      streams `text/event-stream` (and uploads/downloads) through unbuffered, so
+      no separate `streamSSE` handler is needed while proxying.
+- [x] `run_worker_first: ["/api/*"]` so the assets layer doesn't rewrite
+      Worker 404s → 200 (would mask real backend 404s).
+
+NOTE: per-route modules exist precisely so individual endpoints can later be
+reimplemented to run natively on the Worker (R2/D1/KV) instead of proxying, if
+parts of the backend move onto Cloudflare.
 
 ### Phase 3 — cutover
 - [ ] Delete `src/app/`, `next.config.ts`, `next-env.d.ts`, `.next/`, Next deps.
