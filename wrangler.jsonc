@@ -1,0 +1,21 @@
+{
+  // Cloudflare Worker + static SPA assets.
+  // `@cloudflare/vite-plugin` reads this; `wrangler deploy` ships it.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cowork",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2025-05-01",
+  // Enables Node built-in shims (node:buffer, node:crypto, …) for the parts of
+  // the API layer that need them. Agent-process / fs / native deps still do NOT
+  // run here — they live in the separate cloud backend (see MIGRATION.md).
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    // Built client SPA. Unmatched routes fall back to index.html so react-router
+    // can handle client-side routing; /api/* misses an asset and hits the Worker.
+    "directory": "./dist/client",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

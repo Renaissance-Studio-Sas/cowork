@@ -2,35 +2,47 @@
   "name": "agent-workbench",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "next dev -p 3100",
-    "build": "next build",
-    "start": "next start -p 3100",
-    "lint": "eslint"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "lint": "eslint",
+    "cf-typegen": "wrangler types",
+    "dev:next": "next dev -p 3100",
+    "build:next": "next build"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.156",
     "@google/gemini-cli-core": "^0.44.1",
     "@google/genai": "^2.5.0",
     "gray-matter": "^4.0.3",
+    "hono": "^4.9.10",
     "next": "^16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.9.5",
     "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.13.16",
     "@tailwindcss/postcss": "^4",
     "@tailwindcss/typography": "^0.5.19",
+    "@tailwindcss/vite": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5.0.4",
     "eslint": "^9",
     "eslint-config-next": "^16.2.6",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vite": "^7.1.12",
+    "wrangler": "^4.43.0"
   },
   "overrides": {
     "postcss": "^8.5.10"
