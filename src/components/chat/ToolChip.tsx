@@ -2,8 +2,8 @@ import type { Part } from "./types";
 
 // `mcp__workbench-comments__list_comments` → `MCP list_comments`
 function shortenToolName(name: string): string {
-  const m = name.match(/^mcp__([^_]+(?:-[^_]+)*)__(.+)$/);
-  if (m) return `MCP ${m[2]}`;
+  const m = name.match(/^mcp__.+__(.+)$/);
+  if (m) return `MCP ${m[1]}`;
   return name;
 }
 

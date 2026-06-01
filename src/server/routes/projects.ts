@@ -148,6 +148,7 @@ projects.post("/:project/sessions", async (c) => {
       effort: body.effort,
       runtime: body.runtime,
       openArtifact: typeof body.openArtifact === "string" && body.openArtifact.length > 0 ? body.openArtifact : undefined,
+      files: Array.isArray(body.files) && body.files.length > 0 ? body.files : undefined,
     });
     return c.json({ id: s.id, state: s.state });
   } catch (err) {
@@ -269,6 +270,7 @@ projects.post("/:project/tasks/:task/sessions", async (c) => {
       effort: body.effort,
       runtime: body.runtime,
       openArtifact: typeof body.openArtifact === "string" && body.openArtifact.length > 0 ? body.openArtifact : undefined,
+      files: Array.isArray(body.files) && body.files.length > 0 ? body.files : undefined,
     });
     return c.json({ id: s.id, state: s.state });
   } catch (err) {

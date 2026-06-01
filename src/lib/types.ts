@@ -20,7 +20,7 @@ export interface TaskDTO {
   createdAt: string;
 }
 
-export type SessionRuntime = "claude" | "gemini" | "remote";
+export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
 
 // Thinking effort level. Matches @anthropic-ai/claude-agent-sdk's EffortLevel
 // and the Claude Code CLI's /model command labels.

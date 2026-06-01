@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
-import { handleComposerEnter } from "@/lib/composer";
+import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
 import { TodoList, extractTodosFromMessages, type TodoItem } from "./TodoList";
-import { FileDropZone, AttachmentPreview, type FileAttachment } from "./FileDropZone";
+import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachment } from "./FileDropZone";
 import { WorkingIndicator } from "./WorkingIndicator";
 import { useStickyDraft } from "./chat/useStickyDraft";
 import { MessageStream } from "./chat/MessageStream";
@@ -17,7 +17,8 @@ import {
   CompleteToggleButton,
 } from "./chat/cards";
 import { ContinueComposer } from "./chat/ContinueComposer";
-import type { SDKMessageLite, PendingQuestionItem } from "./chat/types";
+import { UsageIndicator } from "./chat/UsageIndicator";
+import type { SDKMessageLite, PendingQuestionItem, RateLimitInfoLite } from "./chat/types";
 
 interface UploadedFile {
   name: string;
@@ -94,9 +95,12 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   const [editName, setEditName] = useState(session.title);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const newlineMod = useNewlineModifier();
+  const attachInputRef = useRef<HTMLInputElement>(null);
 
   // File attachment state
   const [attachments, setAttachments] = useState<FileAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
 
   // Tool calls awaiting user approval (today: only ExitPlanMode). Keyed by
   // toolUseId. Populated from SSE `permission_request` events, cleared on
@@ -136,6 +140,11 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // tool calls in older, not-yet-loaded messages. Prefer this when present; fall
   // back to client-side derivation (e.g. if the SSE connection failed).
   const [serverTodos, setServerTodos] = useState<TodoItem[] | null>(null);
+
+  // Latest claude.ai subscription usage snapshot for this session, pushed by
+  // the server on the `rate_limit` SSE event (and replayed on connect). Drives
+  // the small usage indicator below the composer. null until the SDK reports.
+  const [rateLimit, setRateLimit] = useState<RateLimitInfoLite | null>(null);
 
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
@@ -208,6 +217,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-session-change + subscribe
     setMessages([]);
     setServerTodos(null);
+    setRateLimit(null);
     setClearedTasks(null);
     setState(session.state);
     setStreamConnected(false);
@@ -261,6 +271,14 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     es.addEventListener("todos", (ev) => {
       try {
         setServerTodos(JSON.parse((ev as MessageEvent).data) as TodoItem[]);
+      } catch { /* ignore */ }
+    });
+
+    // Subscription usage snapshot — replayed on connect and refreshed whenever
+    // the SDK reports new rate-limit info during a turn.
+    es.addEventListener("rate_limit", (ev) => {
+      try {
+        setRateLimit(JSON.parse((ev as MessageEvent).data) as RateLimitInfoLite);
       } catch { /* ignore */ }
     });
 
@@ -548,28 +566,40 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // Upload files and return their server paths
   const uploadFiles = async (files: FileAttachment[]): Promise<UploadedFile[]> => {
     const uploaded: UploadedFile[] = [];
+    const failed: string[] = [];
     for (const att of files) {
       const formData = new FormData();
       formData.append("file", att.file);
-      const res = await fetch(
-        `/api/files/upload?project=${session.projectSlug}&task=${session.taskSlug}`,
-        { method: "POST", body: formData }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        uploaded.push({
-          name: data.name,
-          path: data.path,
-          mimeType: data.mimeType,
-          size: data.size,
-        });
+      try {
+        const res = await fetch(
+          `/api/files/upload?project=${session.projectSlug}&task=${session.taskSlug}`,
+          { method: "POST", body: formData }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          uploaded.push({
+            name: data.name,
+            path: data.path,
+            mimeType: data.mimeType,
+            size: data.size,
+          });
+        } else {
+          const e = await res.json().catch(() => ({}));
+          failed.push(`${att.file.name}: ${e.error ?? `HTTP ${res.status}`}`);
+        }
+      } catch (err) {
+        failed.push(`${att.file.name}: ${String(err)}`);
       }
+    }
+    if (failed.length > 0) {
+      setAttachError(`Couldn't upload ${failed.length} file${failed.length === 1 ? "" : "s"} — ${failed.join("; ")}`);
     }
     return uploaded;
   };
 
   const send = async () => {
     if (!isLive || (!draft.trim() && attachments.length === 0)) return;
+    setAttachError(null);
 
     const text = draft.trim();
     const messageText = text || "(attached files)";
@@ -747,26 +777,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                   <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: stateColor }} />
                 )}
               </span>
-              {(session.model || session.runtime) && (
-                <span className="text-[11px] shrink-0 inline-flex items-center gap-0.5 text-[var(--muted)]">
-                  <span
-                    className="font-mono"
-                    title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                  >
-                    {session.model ?? session.runtime}
-                  </span>
-                  <span
-                    className="font-mono"
-                    title={
-                      session.effort
-                        ? `Thinking effort: ${session.effort}`
-                        : "Thinking effort: high (SDK default)"
-                    }
-                  >
-                    ({session.effort ?? "high"})
-                  </span>
-                </span>
-              )}
             </div>
           ) : (
             <div className="text-[14px] truncate">{session.title || "(empty)"}</div>
@@ -799,27 +809,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                 <span>·</span>
                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10.5px] font-medium uppercase tracking-wide border border-[var(--accent)] text-[var(--accent)]">
                   Plan mode
-                </span>
-              </>
-            )}
-            {(session.model || session.runtime) && (
-              <>
-                <span>·</span>
-                <span
-                  className="font-mono"
-                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                >
-                  {session.model ?? session.runtime}
-                </span>
-                <span
-                  className="font-mono text-[var(--muted)]"
-                  title={
-                    session.effort
-                      ? `Thinking effort: ${session.effort}`
-                      : "Thinking effort: high (SDK default)"
-                  }
-                >
-                  ({session.effort ?? "high"})
                 </span>
               </>
             )}
@@ -1047,12 +1036,31 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               even if they're in the registry (isLive). For truly live sessions
               (running, idle, awaiting_input), show the regular composer. */}
           {isLive && state !== "stopped" && state !== "error" ? (
-            <FileDropZone onFiles={handleFiles} className="rounded-2xl">
+            <FileDropZone onFiles={handleFiles} onError={setAttachError} className="rounded-2xl">
+              {attachError && (
+                <div className="mb-2 rounded-lg bg-[var(--warn-soft)] text-[var(--warn)] text-[12px] px-3 py-2 flex items-start gap-2">
+                  <span className="flex-1">{attachError}</span>
+                  <button onClick={() => setAttachError(null)} title="Dismiss" className="shrink-0 hover:opacity-70">×</button>
+                </div>
+              )}
               {attachments.length > 0 && (
                 <div className="px-3 pt-2">
                   <AttachmentPreview attachments={attachments} onRemove={removeAttachment} />
                 </div>
               )}
+              <input
+                ref={attachInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={async (e) => {
+                  const picked = e.target.files;
+                  if (picked && picked.length > 0) {
+                    handleFiles(await filesToAttachments(picked, undefined, setAttachError));
+                  }
+                  e.target.value = "";
+                }}
+              />
               <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
                 <textarea
                   ref={composerRef}
@@ -1070,12 +1078,22 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                   className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
                 />
                 <button
+                  onClick={() => attachInputRef.current?.click()}
+                  className="rounded-lg border border-[var(--border-strong)] text-[var(--text-soft)] hover:text-[var(--accent)] hover:border-[var(--accent)] w-9 h-9 flex items-center justify-center transition shrink-0"
+                  title="Attach files"
+                  aria-label="Attach files"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+                  </svg>
+                </button>
+                <button
                   onClick={send}
                   disabled={!draft.trim() && attachments.length === 0}
-                  className="rounded-lg bg-[var(--accent)] text-[var(--accent-text)] w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 hover:brightness-110 transition shrink-0"
-                  title="Send message (↵)"
-                  aria-label="Send message"
-                >↑</button>
+                  className={`rounded-lg w-9 h-9 flex items-center justify-center font-semibold disabled:opacity-40 transition shrink-0 ${newlineMod ? "border border-[var(--border-strong)] text-[var(--text-soft)] bg-transparent" : "bg-[var(--accent)] text-[var(--accent-text)] hover:brightness-110"}`}
+                  title={newlineMod ? "Insert a new line (↵ — release the modifier to send)" : "Send message (↵)"}
+                  aria-label={newlineMod ? "Insert a new line" : "Send message"}
+                >{newlineMod ? "↵" : "↑"}</button>
                 {isWorking && (
                   <button
                     onClick={stop}
@@ -1101,6 +1119,41 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               openArtifactPath={openArtifactPath}
               completeButton={!isRenaming ? <CompleteToggleButton session={session} completed={completed} variant="icon" /> : null}
             />
+          )}
+          {/* Footer: model (+ thinking effort) alongside the subscription
+              usage indicator. Model shows even before any usage event lands. */}
+          {(session.model || session.runtime || rateLimit) && (
+            <div
+              className="mt-1.5 px-1 flex items-center gap-2 flex-wrap text-[11px] leading-none select-none"
+              style={{ color: "var(--text-soft)" }}
+            >
+              {(session.model || session.runtime) && (
+                <span
+                  className="inline-flex items-center gap-1 shrink-0"
+                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+                >
+                  <span className="font-mono">{session.model ?? session.runtime}</span>
+                  {session.runtime === "cloud" && (
+                    <span
+                      className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
+                      title="Running on Cloudflare Containers (via /api/agent)"
+                    >
+                      cloud
+                    </span>
+                  )}
+                  <span
+                    className="font-mono opacity-70"
+                    title={session.effort ? `Thinking effort: ${session.effort}` : "Thinking effort: high (SDK default)"}
+                  >
+                    ({session.effort ?? "high"})
+                  </span>
+                </span>
+              )}
+              {(session.model || session.runtime) && rateLimit && (
+                <span className="opacity-40">·</span>
+              )}
+              <UsageIndicator info={rateLimit} />
+            </div>
           )}
         </div>
       </div>

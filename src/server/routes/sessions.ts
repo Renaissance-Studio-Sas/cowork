@@ -161,9 +161,13 @@ sessions.get("/:id/stream", async (c) => {
         sendEvent("completion_request", { requestId, reason: pending.reason ?? null });
       }
       sendEvent("completed_changed", { completed: !!s.completed });
+      // Replay the last known subscription rate-limit snapshot so the usage
+      // indicator renders immediately on load, before the next turn refreshes it.
+      if (s.rateLimit) sendEvent("rate_limit", s.rateLimit);
 
       const onEvent = (msg: unknown) => sendEvent("message", msg);
       const onTodos = (todos: unknown) => sendEvent("todos", todos);
+      const onRateLimit = (info: unknown) => sendEvent("rate_limit", info);
       const onState = (state: string) => sendEvent("state", { state });
       const onFileChanged = (data: { path: string }) => sendEvent("file_changed", data);
       const onPermissionRequest = (data: unknown) => sendEvent("permission_request", data);
@@ -175,6 +179,7 @@ sessions.get("/:id/stream", async (c) => {
       const onCompletedChanged = (data: unknown) => sendEvent("completed_changed", data);
       s.events.on("event", onEvent);
       s.events.on("todos", onTodos);
+      s.events.on("rate_limit", onRateLimit);
       s.events.on("state", onState);
       s.events.on("file_changed", onFileChanged);
       s.events.on("permission_request", onPermissionRequest);
@@ -193,6 +198,7 @@ sessions.get("/:id/stream", async (c) => {
         clearInterval(heartbeat);
         s.events.off("event", onEvent);
         s.events.off("todos", onTodos);
+        s.events.off("rate_limit", onRateLimit);
         s.events.off("state", onState);
         s.events.off("file_changed", onFileChanged);
         s.events.off("permission_request", onPermissionRequest);

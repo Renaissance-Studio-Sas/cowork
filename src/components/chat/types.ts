@@ -21,6 +21,16 @@ export type SDKMessageLite =
   | { type: "system"; subtype: string }
   | Record<string, unknown>;
 
+// claude.ai subscription usage snapshot, mirrored from the SDK's
+// SDKRateLimitInfo (carried on `rate_limit_event`, forwarded over SSE as a
+// `rate_limit` event). Drives the small usage indicator below the composer.
+export interface RateLimitInfoLite {
+  status: "allowed" | "allowed_warning" | "rejected";
+  resetsAt?: number;
+  rateLimitType?: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage";
+  utilization?: number; // 0–1 fraction of the window consumed
+}
+
 export interface PendingQuestionItem {
   question: string;
   header: string;

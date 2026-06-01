@@ -6,7 +6,33 @@
 // not — on macOS, Cmd+Enter is a system shortcut and the browser does NOT
 // insert a newline by default — so we insert one ourselves at the caret.
 
-import type React from "react";
+import React, { useEffect, useState } from "react";
+
+// True while any modifier that turns Enter into "insert newline" is held
+// (Shift / Alt(Option) / Meta(Cmd) / Ctrl). The submit button watches this so
+// it can show a newline glyph instead of the send arrow — making it clear that
+// pressing Enter right now inserts a line break rather than submitting.
+//
+// Modifier-only keydown/keyup events don't always pair up (e.g. the keyup is
+// swallowed when the window loses focus during a Cmd+Tab), so we also reset on
+// blur and re-read each event's modifier state rather than toggling per-key.
+export function useNewlineModifier(): boolean {
+  const [held, setHeld] = useState(false);
+  useEffect(() => {
+    const sync = (e: KeyboardEvent) =>
+      setHeld(e.shiftKey || e.altKey || e.metaKey || e.ctrlKey);
+    const clear = () => setHeld(false);
+    window.addEventListener("keydown", sync);
+    window.addEventListener("keyup", sync);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("keydown", sync);
+      window.removeEventListener("keyup", sync);
+      window.removeEventListener("blur", clear);
+    };
+  }, []);
+  return held;
+}
 
 export function handleComposerEnter(
   e: React.KeyboardEvent<HTMLTextAreaElement>,

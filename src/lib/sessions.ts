@@ -326,7 +326,12 @@ export function subscribeOpenArtifact(
   };
 }
 
-const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — watchdog fallback with error emit
+// "Running" with no recent events isn't enough to call a session stuck —
+// a single Claude turn with extended thinking + web search + multi-step
+// tools can easily go 15 minutes without emitting a visible event. The
+// watchdog only fires the stale check this often; the *decision* to stop
+// also requires a liveness probe (see runWatchdog).
+const STALE_THRESHOLD_MS = 15 * 60 * 1000;
 const IDLE_EVICT_MS = 5 * 60 * 1000;      // idle this long → close streams + transition to stopped
 const WATCHDOG_INTERVAL_MS = 60 * 1000;   // check every minute
 
@@ -388,33 +393,47 @@ function shouldRunBootAutoResume(): boolean {
 
 // Runtime contract: any session whose streams have been closed MUST be in
 // state "stopped". sendInput dispatches by state — "running"/"idle" goes to
-// the live-write path that pushes into the InputChannel and writes to
-// inputLog. If streams are closed but state still says "idle", that write
-// silently no-ops and the agent never sees the message — that's the "session
-// stuck after 5 min" symptom. So the watchdog closes streams AND transitions
-// state to stopped together. resumeSession is responsible for re-opening
-// streams when the user sends another message.
-function runWatchdog() {
+// the live-write path that pushes into the InputChannel; if streams are
+// closed but state says "idle"/"running", the write silently no-ops and the
+// agent never sees the message. So the watchdog closes streams AND
+// transitions state together.
+//
+// Stale-running is a LIVENESS check, not a time check: a Claude turn with
+// extended thinking + web research can legitimately go 15 min without
+// emitting an event. We only kill if `ps` confirms the SDK subprocess is
+// gone. Otherwise we refresh lastActivity and let it keep working.
+async function runWatchdog() {
   const now = Date.now();
   for (const s of registry.values()) {
     // A session blocked on a user decision (ExitPlanMode approval or an
     // AskUserQuestion) is "running" only because the SDK turn is parked
     // awaiting the user — no events flow, so lastActivity goes stale even
-    // though nothing is wrong. Don't let the watchdog kill it out from under
-    // a pending card; the user may take minutes to answer.
+    // though nothing is wrong. Don't probe under a pending card.
     if (
       s.pendingPermissions.size > 0
       || (s.pendingQuestions?.size ?? 0) > 0
       || (s.pendingCompletions?.size ?? 0) > 0
     ) continue;
     const sinceActivity = now - s.lastActivity.getTime();
+
     if (s.state === "running" && sinceActivity > STALE_THRESHOLD_MS) {
-      console.warn(`[watchdog] Session ${s.id} stuck in running state for ${Math.round(sinceActivity / 1000)}s — auto-stopping`);
+      // Probe the SDK subprocess. Fresh sessions (no sdkSessionId yet) and
+      // sessions whose SDK was spawned without `--resume <sid>` in its CLI
+      // args aren't ps-matchable; we conservatively treat those as alive
+      // and let the next watchdog tick re-check.
+      const sdkLikelyAlive = !s.sdkSessionId
+        || (await findResumedSdkSubprocesses(s.sdkSessionId)).length > 0;
+      if (sdkLikelyAlive) {
+        // Refresh activity so we don't reprobe every tick while a long turn runs.
+        s.lastActivity = new Date();
+        continue;
+      }
+      console.warn(`[watchdog] Session ${s.id} SDK subprocess dead — auto-stopping`);
       try {
         const timeoutMsg = {
           type: "system",
           subtype: "error",
-          message: "Session timed out due to inactivity",
+          message: "Session lost its agent subprocess — please send a message to resume.",
         } as unknown as SDKMessage;
         s.history.push(timeoutMsg);
         appendEvent(s.id, s.seq++, timeoutMsg);
@@ -439,7 +458,7 @@ function runWatchdog() {
 
 // Start watchdog if not already running
 if (!globalThis.__wb_watchdog_interval) {
-  globalThis.__wb_watchdog_interval = setInterval(runWatchdog, WATCHDOG_INTERVAL_MS);
+  globalThis.__wb_watchdog_interval = setInterval(() => { void runWatchdog(); }, WATCHDOG_INTERVAL_MS);
   // Don't prevent process exit
   if (globalThis.__wb_watchdog_interval.unref) {
     globalThis.__wb_watchdog_interval.unref();
@@ -636,9 +655,10 @@ export async function relayRemoteRunner(
   body: unknown,
 ): Promise<{ status: number; body: unknown } | null> {
   const s = registry.get(sessionId);
-  if (!s || s.runtime !== "remote" || !s.q) return null;
-  // RemoteAgentQuery exposes relayToRunner(); other AgentQuery shapes don't.
-  // Duck-type the method off the AgentQuery so we don't need a runtime cast.
+  if (!s || (s.runtime !== "remote" && s.runtime !== "cloud") || !s.q) return null;
+  // RemoteAgentQuery + CloudAgentQuery both expose relayToRunner(); other
+  // AgentQuery shapes don't. Duck-type the method off the AgentQuery so we
+  // don't need a runtime cast.
   const q = s.q as unknown as {
     relayToRunner?: (p: string, b: unknown) => Promise<{ status: number; body: unknown }>;
   };
@@ -1060,19 +1080,23 @@ async function findRunningSessionsInDir(
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
       // sdkSessionId is required: resume() needs it to find the SDK's
       // transcript. A session that crashed before the first `init` event has
-      // no transcript to resume against — skip it. Also skip "resuming" state
-      // which means another worker is already handling this session.
-      // Remote (Docker) sessions are also skipped: their container is orphaned
-      // after a cowork restart and auto-resume would spawn a fresh container
-      // per session at boot — slow, noisy, and dependent on Docker being up.
-      // The user resumes them manually by sending a message.
-      // Sessions parked on a user decision (awaiting_input state, or a pending
-      // permission/question/completion at restart time) are also skipped: the
-      // parked tool call lived in-memory only and is gone, so resuming would
-      // just blow away the pending card with a "[Server restarted...]" prompt.
-      // The user resumes them by answering or sending a new message.
+      // no transcript to resume against — skip it.
+      // "running" = the previous worker died mid-turn.
+      // "resuming" = the previous worker died mid-resume (set right before
+      // spawn, cleared on first event). Without this case we'd strand any
+      // session whose autoResume itself was interrupted.
+      // Remote (Docker) sessions are also skipped: their container is
+      // orphaned after a cowork restart and auto-resume would spawn a fresh
+      // container per session at boot — slow, noisy, and dependent on Docker.
+      // Sessions parked on a user decision (pending permission / question /
+      // completion at restart time) are also skipped: the parked tool call
+      // lived in-memory only and is gone, so resuming would just blow away
+      // the pending card with a "[Server restarted...]" prompt.
+      // The actual "another live worker owns this" filter is the per-session
+      // inspectOwnership call in doAutoResume, not this candidate filter.
+      const resumable = meta.finalState === "running" || meta.finalState === "resuming";
       if (
-        meta.finalState === "running"
+        resumable
         && !meta.hasPendingPrompt
         && meta.sdkSessionId
         && meta.runtime !== "remote"
@@ -1189,6 +1213,39 @@ export interface StartSessionParams {
   runtime?: SessionRuntime;       // defaults to "claude"
   /** Artifact path open in the user's workspace when they started the session. */
   openArtifact?: string;
+  /** Files attached to the first message (already uploaded under <folder>/files). */
+  files?: FileAttachmentInfo[];
+}
+
+// Fold first-message attachments into the prompt: non-image files become
+// `[Attached file: <path>]` references prepended to the text; images are read
+// from disk and returned as base64 for an image-bearing user message. Mirrors
+// the per-turn logic in sendInputWithFiles so the first turn behaves the same.
+async function buildAttachmentMessage(
+  baseText: string,
+  files: FileAttachmentInfo[] | undefined,
+  filesDir: string,
+): Promise<{ text: string; images: ImageContent[] }> {
+  if (!files || files.length === 0) return { text: baseText, images: [] };
+  const imageFiles = files.filter((f) => f.mimeType.startsWith("image/"));
+  const otherFiles = files.filter((f) => !f.mimeType.startsWith("image/"));
+
+  let text = baseText;
+  if (otherFiles.length > 0) {
+    const fileRefs = otherFiles.map((f) => `[Attached file: ${f.path}]`).join("\n");
+    text = `${fileRefs}\n\n${baseText}`;
+  }
+
+  const images: ImageContent[] = [];
+  for (const imgFile of imageFiles) {
+    try {
+      const data = await fs.readFile(path.join(filesDir, imgFile.path));
+      images.push({ mimeType: imgFile.mimeType, base64: data.toString("base64") });
+    } catch (err) {
+      console.error(`Failed to read image ${imgFile.path}:`, err);
+    }
+  }
+  return { text, images };
 }
 
 export async function startSession(p: StartSessionParams): Promise<RuntimeSession> {
@@ -1247,11 +1304,18 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // <system-reminder> with its path so the agent knows what the user is
   // looking at from turn 1. Keep `firstMessage` raw in the session record so
   // auto-titling and labels use the user's actual prompt.
+  const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
+    p.firstMessage,
+    p.files,
+    path.join(taskDir(project, task), "files"),
+  );
   const augmentedFirstMessage = p.openArtifact
-    ? withOpenArtifactNote(p.firstMessage, p.openArtifact)
-    : p.firstMessage;
-  const firstMsg = makeUserMessage(augmentedFirstMessage, id);
-  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage }) + "\n");
+    ? withOpenArtifactNote(firstWithFiles, p.openArtifact)
+    : firstWithFiles;
+  const firstMsg = firstImages.length > 0
+    ? makeUserMessageWithImages(augmentedFirstMessage, firstImages, id)
+    : makeUserMessage(augmentedFirstMessage, id);
+  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage, files: p.files }) + "\n");
   input.push(firstMsg);
 
   const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug, name);
@@ -1443,6 +1507,20 @@ async function pumpEvents(s: RuntimeSession) {
       // marker, the final result) still flow through so the log and the
       // "interrupted" note stay correct — they just won't resurrect state below.
       if (s.interrupted && isStreamEvent) continue;
+      // rate_limit_event = claude.ai subscription usage snapshot (the data the
+      // CLI's /usage shows). Keep only the latest on the session and push it to
+      // live clients on a dedicated channel; don't persist to history (like
+      // stream_event, it's transient — persisting bloats the log and it'd
+      // replay as an unrenderable "message"). The SSE route snapshots
+      // s.rateLimit on connect so a fresh client gets the last known value.
+      if ((msg as { type?: string }).type === "rate_limit_event") {
+        const info = (msg as { rate_limit_info?: RuntimeSession["rateLimit"] }).rate_limit_info;
+        if (info) {
+          s.rateLimit = info;
+          s.events.emit("rate_limit", info);
+        }
+        continue;
+      }
       if (!isStreamEvent) {
         appendEvent(s.id, s.seq++, msg);
         s.history.push(msg);
@@ -1863,7 +1941,7 @@ export async function moveSessionToTask(
 // `propose_plan` / `propose_task` MCP tool that the Chat UI watches for.
 // Everything else (persistence, sidebar listing, resume) behaves exactly
 // like a normal session.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task"; openArtifact?: string }): Promise<RuntimeSession> {
+export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task"; openArtifact?: string; files?: FileAttachmentInfo[] }): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
   const project = await getProject(p.projectSlug);
   if (!project) throw new Error("unknown project");
@@ -1905,11 +1983,19 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
 
   // See startSession — augment with the open-artifact hint while keeping the
   // raw user prompt in the session record for auto-titling.
+  const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
+    p.firstMessage,
+    p.files,
+    path.join(PROJECTS_DIR, project.folderName, "files"),
+  );
   const augmentedFirstMessage = p.openArtifact
-    ? withOpenArtifactNote(p.firstMessage, p.openArtifact)
-    : p.firstMessage;
-  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage }) + "\n");
-  input.push(makeUserMessage(augmentedFirstMessage, id));
+    ? withOpenArtifactNote(firstWithFiles, p.openArtifact)
+    : firstWithFiles;
+  const firstMsg = firstImages.length > 0
+    ? makeUserMessageWithImages(augmentedFirstMessage, firstImages, id)
+    : makeUserMessage(augmentedFirstMessage, id);
+  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage, files: p.files }) + "\n");
+  input.push(firstMsg);
 
   // Project-level sessions only get project.md context (no task). Comments
   // and other workbench tools scope to project-level (empty taskSlug); the
@@ -1956,7 +2042,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   });
 
   const now = new Date();
-  const firstUserEcho = makeUserMessage(augmentedFirstMessage, id);
+  const firstUserEcho = firstMsg;
   const session: RuntimeSession = {
     id,
     projectSlug: p.projectSlug,
@@ -2223,8 +2309,14 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   // (events.jsonl) is preserved, only the agent's SDK memory of those turns
   // is lost. Same path covers sessions that never got an sdkSessionId at all
   // (older sessions before tracking, or sessions that crashed before init).
-  const canResume = !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
-  const lostTranscript = !!s.sdkSessionId && !canResume;
+  // The local-transcript check only applies to the Claude runtime (it resumes
+  // from an on-disk SDK transcript). Cloud resumes via the DO (restore +
+  // `resume` server-side) and Gemini from its runtimeStateDir history, so for
+  // those runtimes the on-disk check is a false alarm — skip it (no scary
+  // "couldn't resume" notice, don't clear their session id).
+  const isLocalSdkRuntime = s.runtime === "claude";
+  const canResume = isLocalSdkRuntime && !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
+  const lostTranscript = isLocalSdkRuntime && !!s.sdkSessionId && !canResume;
   if (lostTranscript) {
     s.sdkSessionId = null;
     void updateMeta(s, (meta) => {

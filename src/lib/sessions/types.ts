@@ -7,6 +7,7 @@ import type { WriteStream } from "node:fs";
 import type {
   AgentEvent as SDKMessage,
   AgentPermissionResult as PermissionResult,
+  AgentRateLimitInfo,
   AgentQuery,
 } from "../agent-runtime";
 import type { InputChannel } from "../input-channel";
@@ -14,9 +15,11 @@ import type { SessionState } from "../session-state-machine";
 
 // Which agent runtime drives this session. Claude is the default and is
 // what every session today uses; Gemini runs through gemini-cli-core; remote
-// provisions a container via the cloud-agent-runner controller. Stored in
+// provisions a container via the local cloud-agent-runner controller; cloud
+// talks to the cloud-agent worker on Cloudflare (app.rowads.studio/api/agent/*)
+// and authenticates via the rw CLI's stored session cookie. Stored in
 // meta.json so resume after a server restart picks the same runtime.
-export type SessionRuntime = "claude" | "gemini" | "remote";
+export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
 
 // Thinking effort level. Mirrors the Claude Agent SDK's EffortLevel
 // (see @anthropic-ai/claude-agent-sdk). Passed to query() as `effort` and
@@ -104,6 +107,11 @@ export interface RuntimeSession {
   // @/lib/todos), keeping the task panel correct independent of how much
   // transcript the chat UI has lazily loaded.
   lastTodosJson?: string;
+  // Latest claude.ai subscription rate-limit snapshot, from the SDK's
+  // `rate_limit_event`. Held (not persisted to history) so the SSE route can
+  // replay it to a freshly-connecting client and the chat UI can show a small
+  // usage indicator. Only the Claude runtime ever sets it.
+  rateLimit?: AgentRateLimitInfo;
 }
 
 export interface PendingPermission {

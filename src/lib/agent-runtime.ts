@@ -15,6 +15,7 @@
 import type {
   SDKMessage,
   SDKUserMessage,
+  SDKRateLimitInfo,
   CanUseTool,
   PermissionResult,
   McpServerConfig,
@@ -31,6 +32,13 @@ export type AgentEvent = SDKMessage;
 // What the caller pushes into a runtime as user input. Same story — today
 // this is Claude SDK's SDKUserMessage so InputChannel doesn't need to change.
 export type AgentUserMessage = SDKUserMessage;
+
+// claude.ai subscription rate-limit snapshot. The Claude SDK emits a
+// `rate_limit_event` carrying this whenever usage info changes (the same data
+// the CLI's /usage dialog shows): utilization is 0–1 (% of the window
+// consumed), rateLimitType names the window (5h / weekly / per-model), and
+// resetsAt is when it resets. Non-Claude runtimes never produce it.
+export type AgentRateLimitInfo = SDKRateLimitInfo;
 
 // Permission-flow types (used by ExitPlanMode + future tool approval flows).
 // Re-exported so consumers don't have to know they originated in Claude SDK.

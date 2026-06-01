@@ -14,6 +14,7 @@ import remarkGfm from "remark-gfm";
 import type { SessionSummaryDTO } from "@/lib/types";
 import { taskRoute, projectRoute } from "@/lib/routes";
 import type { PendingQuestionItem } from "./types";
+import { Markdown } from "./Markdown";
 
 // Surface a tool-use approval request from the agent's canUseTool callback.
 // Today the only tool that gets here is ExitPlanMode — the agent has finished
@@ -73,8 +74,8 @@ export function PlanApprovalCard({
   };
 
   return (
-    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-3">
-      <div className="flex items-center justify-between mb-2">
+    <div className="rounded-xl border border-[var(--accent)] bg-[var(--panel)] p-3 flex flex-col max-h-[65vh]">
+      <div className="flex items-center justify-between shrink-0 pb-2.5 mb-2.5 border-b border-[var(--border)]">
         <div className="text-[12px] font-semibold text-[var(--accent)]">
           {isPlan ? "Plan ready for review" : `Approve ${toolName}?`}
         </div>
@@ -95,10 +96,10 @@ export function PlanApprovalCard({
           </button>
         </div>
       </div>
-      <div className="max-h-[240px] overflow-y-auto rounded-md bg-[var(--bg)] px-3 py-2 text-[13px] prose prose-sm max-w-none [&_*]:!my-1">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{planText}</ReactMarkdown>
+      <div className="flex-1 min-h-0 overflow-y-auto rounded-md bg-[var(--bg)] px-4 py-3">
+        <Markdown text={planText} />
       </div>
-      {error && <div className="text-[12px] text-[#dc2626] mt-2">{error}</div>}
+      {error && <div className="text-[12px] text-[#dc2626] shrink-0 pt-2">{error}</div>}
     </div>
   );
 }
