@@ -8,6 +8,7 @@ import { useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { WorkingIndicator } from "@/components/WorkingIndicator";
 import { Markdown } from "@/components/chat/Markdown";
+import { useStickyDraft } from "@/components/chat/useStickyDraft";
 import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachment } from "@/components/FileDropZone";
 import { handleComposerEnter } from "@/lib/composer";
 import { FileViewer } from "@/components/FileViewer";
@@ -527,7 +528,10 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
 
   // ---- New-session composer ----------------------------------------------
 
-  const [draft, setDraft] = useState("");
+  // Persist the new-session draft in localStorage (like the in-session
+  // composer) so typed text survives navigation/reload. Keyed per
+  // project/task scope; "new-" prefix can't collide with real session ids.
+  const [draft, setDraft] = useStickyDraft(`new-${projectSlug}-${taskSlug ?? "project"}`);
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const [effort, setEffort] = useState<EffortLevel | "">("");
