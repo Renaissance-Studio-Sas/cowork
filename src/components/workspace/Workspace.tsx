@@ -925,6 +925,13 @@ function SplitColumns({
       >
         {right}
       </div>
+      {/* While dragging, a transparent full-screen overlay sits above any
+          iframes (e.g. the artifact preview) so the cursor's mousemove/mouseup
+          keep firing in the parent document instead of being swallowed by the
+          iframe — otherwise the resize freezes over the artifact. */}
+      {isDragging && (
+        <div className="fixed inset-0 z-50" style={{ cursor: "col-resize" }} />
+      )}
     </div>
   );
 }
