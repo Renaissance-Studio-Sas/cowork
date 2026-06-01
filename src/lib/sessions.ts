@@ -1513,6 +1513,20 @@ async function pumpEvents(s: RuntimeSession) {
       // marker, the final result) still flow through so the log and the
       // "interrupted" note stay correct — they just won't resurrect state below.
       if (s.interrupted && isStreamEvent) continue;
+      // rate_limit_event = claude.ai subscription usage snapshot (the data the
+      // CLI's /usage shows). Keep only the latest on the session and push it to
+      // live clients on a dedicated channel; don't persist to history (like
+      // stream_event, it's transient — persisting bloats the log and it'd
+      // replay as an unrenderable "message"). The SSE route snapshots
+      // s.rateLimit on connect so a fresh client gets the last known value.
+      if ((msg as { type?: string }).type === "rate_limit_event") {
+        const info = (msg as { rate_limit_info?: RuntimeSession["rateLimit"] }).rate_limit_info;
+        if (info) {
+          s.rateLimit = info;
+          s.events.emit("rate_limit", info);
+        }
+        continue;
+      }
       if (!isStreamEvent) {
         appendEvent(s.id, s.seq++, msg);
         s.history.push(msg);

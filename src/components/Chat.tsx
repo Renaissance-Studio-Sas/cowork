@@ -17,7 +17,8 @@ import {
   CompleteToggleButton,
 } from "./chat/cards";
 import { ContinueComposer } from "./chat/ContinueComposer";
-import type { SDKMessageLite, PendingQuestionItem } from "./chat/types";
+import { UsageIndicator } from "./chat/UsageIndicator";
+import type { SDKMessageLite, PendingQuestionItem, RateLimitInfoLite } from "./chat/types";
 
 interface UploadedFile {
   name: string;
@@ -140,6 +141,11 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // back to client-side derivation (e.g. if the SSE connection failed).
   const [serverTodos, setServerTodos] = useState<TodoItem[] | null>(null);
 
+  // Latest claude.ai subscription usage snapshot for this session, pushed by
+  // the server on the `rate_limit` SSE event (and replayed on connect). Drives
+  // the small usage indicator below the composer. null until the SDK reports.
+  const [rateLimit, setRateLimit] = useState<RateLimitInfoLite | null>(null);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -193,6 +199,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   useEffect(() => {
     setMessages([]);
     setServerTodos(null);
+    setRateLimit(null);
     setClearedTasks(null);
     setState(session.state);
     setStreamConnected(false);
@@ -246,6 +253,14 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     es.addEventListener("todos", (ev) => {
       try {
         setServerTodos(JSON.parse((ev as MessageEvent).data) as TodoItem[]);
+      } catch { /* ignore */ }
+    });
+
+    // Subscription usage snapshot — replayed on connect and refreshed whenever
+    // the SDK reports new rate-limit info during a turn.
+    es.addEventListener("rate_limit", (ev) => {
+      try {
+        setRateLimit(JSON.parse((ev as MessageEvent).data) as RateLimitInfoLite);
       } catch { /* ignore */ }
     });
 
@@ -749,34 +764,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                   <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: stateColor }} />
                 )}
               </span>
-              {(session.model || session.runtime) && (
-                <span className="text-[11px] shrink-0 inline-flex items-center gap-0.5 text-[var(--muted)]">
-                  <span
-                    className="font-mono"
-                    title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                  >
-                    {session.model ?? session.runtime}
-                  </span>
-                  {session.runtime === "cloud" && (
-                    <span
-                      className="ml-1 px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-[var(--muted)]"
-                      title="Running on Cloudflare Containers (via /api/agent)"
-                    >
-                      cloud
-                    </span>
-                  )}
-                  <span
-                    className="font-mono"
-                    title={
-                      session.effort
-                        ? `Thinking effort: ${session.effort}`
-                        : "Thinking effort: high (SDK default)"
-                    }
-                  >
-                    ({session.effort ?? "high"})
-                  </span>
-                </span>
-              )}
             </div>
           ) : (
             <div className="text-[14px] truncate">{session.title || "(empty)"}</div>
@@ -809,35 +796,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                 <span>·</span>
                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10.5px] font-medium uppercase tracking-wide border border-[var(--accent)] text-[var(--accent)]">
                   Plan mode
-                </span>
-              </>
-            )}
-            {(session.model || session.runtime) && (
-              <>
-                <span>·</span>
-                <span
-                  className="font-mono"
-                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                >
-                  {session.model ?? session.runtime}
-                </span>
-                {session.runtime === "cloud" && (
-                  <span
-                    className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-[var(--muted)]"
-                    title="Running on Cloudflare Containers (via /api/agent)"
-                  >
-                    cloud
-                  </span>
-                )}
-                <span
-                  className="font-mono text-[var(--muted)]"
-                  title={
-                    session.effort
-                      ? `Thinking effort: ${session.effort}`
-                      : "Thinking effort: high (SDK default)"
-                  }
-                >
-                  ({session.effort ?? "high"})
                 </span>
               </>
             )}
@@ -1148,6 +1106,41 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               openArtifactPath={openArtifactPath}
               completeButton={!isRenaming ? <CompleteToggleButton session={session} completed={completed} variant="icon" /> : null}
             />
+          )}
+          {/* Footer: model (+ thinking effort) alongside the subscription
+              usage indicator. Model shows even before any usage event lands. */}
+          {(session.model || session.runtime || rateLimit) && (
+            <div
+              className="mt-1.5 px-1 flex items-center gap-2 flex-wrap text-[11px] leading-none select-none"
+              style={{ color: "var(--text-soft)" }}
+            >
+              {(session.model || session.runtime) && (
+                <span
+                  className="inline-flex items-center gap-1 shrink-0"
+                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
+                >
+                  <span className="font-mono">{session.model ?? session.runtime}</span>
+                  {session.runtime === "cloud" && (
+                    <span
+                      className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
+                      title="Running on Cloudflare Containers (via /api/agent)"
+                    >
+                      cloud
+                    </span>
+                  )}
+                  <span
+                    className="font-mono opacity-70"
+                    title={session.effort ? `Thinking effort: ${session.effort}` : "Thinking effort: high (SDK default)"}
+                  >
+                    ({session.effort ?? "high"})
+                  </span>
+                </span>
+              )}
+              {(session.model || session.runtime) && rateLimit && (
+                <span className="opacity-40">·</span>
+              )}
+              <UsageIndicator info={rateLimit} />
+            </div>
           )}
         </div>
       </div>

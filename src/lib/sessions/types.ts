@@ -7,6 +7,7 @@ import type { WriteStream } from "node:fs";
 import type {
   AgentEvent as SDKMessage,
   AgentPermissionResult as PermissionResult,
+  AgentRateLimitInfo,
   AgentQuery,
 } from "../agent-runtime";
 import type { InputChannel } from "../input-channel";
@@ -106,6 +107,11 @@ export interface RuntimeSession {
   // @/lib/todos), keeping the task panel correct independent of how much
   // transcript the chat UI has lazily loaded.
   lastTodosJson?: string;
+  // Latest claude.ai subscription rate-limit snapshot, from the SDK's
+  // `rate_limit_event`. Held (not persisted to history) so the SSE route can
+  // replay it to a freshly-connecting client and the chat UI can show a small
+  // usage indicator. Only the Claude runtime ever sets it.
+  rateLimit?: AgentRateLimitInfo;
 }
 
 export interface PendingPermission {
