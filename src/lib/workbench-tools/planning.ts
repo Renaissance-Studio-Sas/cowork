@@ -4,7 +4,7 @@
 // tool_use with this name and renders the input as an editable "Plan" card.
 //
 // Cowork's data model is recursive: every unit of work is a `workspace`. A
-// root workspace lives directly under `projects/`; a child workspace lives
+// root workspace lives directly under `workspaces/`; a child workspace lives
 // inside its parent. Planning is therefore symmetric — the agent proposes a
 // single child workspace, the parent can be the project root (creating
 // what used to be a top-level project) or any nested workspace (creating
@@ -57,8 +57,8 @@ export function buildWorkspacePlanningSystemPrompt(
   const desc = parentOverview.trim() || "_(parent workspace overview is empty)_";
   const breadcrumb = parentPath.length > 0 ? parentPath.join(" > ") : "(root)";
   const folderHint = parentPath.length > 0
-    ? `\`projects/${parentPath.join("/")}/\``
-    : "`projects/` (top level)";
+    ? `\`workspaces/${parentPath.join("/")}/\``
+    : "`workspaces/` (top level)";
 
   return `You are helping the user define a new workspace under **${breadcrumb}** in their personal task management system "Coworking Space".
 

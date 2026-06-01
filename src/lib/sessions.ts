@@ -1224,7 +1224,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   const name = generateSessionLabel(p.firstMessage);
   // The agent runs with cwd = workspace root so CLAUDE.md / GEMINI.md at the
   // root are picked up by the runtime, and the agent has full access to the
-  // projects/ tree without needing additionalDirectories. The workspace
+  // workspaces/ tree without needing additionalDirectories. The workspace
   // identity + path is supplied via the system prompt (see
   // sessions/prompts.ts). Session persistence (events.jsonl, meta.json) lives
   // in a flat SESSIONS_ROOT (see fs.ts) — meta.json carries the workspace
@@ -1270,11 +1270,11 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // <system-reminder> with its path so the agent knows what the user is
   // looking at from turn 1. Keep `firstMessage` raw in the session record so
   // auto-titling and labels use the user's actual prompt.
-  const filesDir = path.join(workspaceDir(ws), "files");
+  const artifactsDir = workspaceDir(ws);
   const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
     p.firstMessage,
     p.files,
-    filesDir,
+    artifactsDir,
   );
   const augmentedFirstMessage = p.openArtifact
     ? withOpenArtifactNote(firstWithFiles, p.openArtifact)
@@ -2047,10 +2047,10 @@ export async function sendInputWithFiles(
   if (imageFiles.length > 0) {
     const ws = await getWorkspace(workspacePath);
     if (ws) {
-      const filesDir = path.join(workspaceDir(ws), "files");
+      const artifactsDir = workspaceDir(ws);
       for (const imgFile of imageFiles) {
         try {
-          const imgPath = path.join(filesDir, imgFile.path);
+          const imgPath = path.join(artifactsDir, imgFile.path);
           const data = await fs.readFile(imgPath);
           const base64 = data.toString("base64");
           images.push({ mimeType: imgFile.mimeType, base64 });

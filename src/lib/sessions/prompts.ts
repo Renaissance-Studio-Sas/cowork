@@ -20,7 +20,7 @@ import {
 //
 // The agent's working directory is the cowork workspace root (set by the
 // caller — see sessions.ts). That's where CLAUDE.md / GEMINI.md live, and
-// where `projects/<workspace-path>/` is reachable. We tell the agent the
+// where `workspaces/<workspace-path>/` is reachable. We tell the agent the
 // EXPLICIT relative path to the workspace folder so file operations go to
 // the right place.
 export async function buildContextSystemPrompt(
@@ -28,9 +28,8 @@ export async function buildContextSystemPrompt(
   currentTitle?: string,
 ): Promise<{ type: "preset"; preset: "claude_code"; append: string }> {
   // Resolve the workspace folder relative to the project root, plus each
-  // ancestor for the brief chain. Folder names carry " [Archived]" when
-  // archived, so we use them rather than just the slugs in path hints the
-  // agent will reference.
+  // ancestor for the brief chain. Folder names equal slugs now that the
+  // archived state lives inside `workspace.json`.
   const ws = await getWorkspace(workspacePath).catch(() => null);
   const ancestors: Array<{ label: string; relPath: string; brief: Brief | null }> = [];
   let folderRel: string | null = null;
@@ -43,10 +42,10 @@ export async function buildContextSystemPrompt(
       const node = await getWorkspace(partial).catch(() => null);
       if (!node) continue;
       const rel = path.relative(WORKSPACE_ROOT, workspaceDir(node));
-      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, "files", WORKSPACE_BRIEF_FILENAME));
+      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, WORKSPACE_BRIEF_FILENAME));
       ancestors.push({
         label: partial.join(" > "),
-        relPath: path.join(rel, "files", WORKSPACE_BRIEF_FILENAME),
+        relPath: path.join(rel, WORKSPACE_BRIEF_FILENAME),
         brief,
       });
     }
@@ -86,11 +85,13 @@ haven't already.
 
 ${pathLine}
 
-When you write output files for this workspace, put them under the
-workspace's \`files/\` directory using the path above. When you read or
-modify the workspace brief, edit the JSON file shown in the section below —
-it has the shape \`{ "overview": "...", "details": "...", "createdAt": "..." }\`
-where \`overview\` is a one-line summary and \`details\` is markdown.
+When you write output files for this workspace, put them directly in the
+workspace folder shown above. Child workspaces are subdirectories of this
+folder that themselves contain a \`workspace.json\`; their contents belong
+to them, not to this workspace. When you read or modify the workspace brief,
+edit \`workspace.json\` shown in the section below — it has the shape
+\`{ "overview": "...", "details": "...", "createdAt": "..." }\` where
+\`overview\` is a one-line summary and \`details\` is markdown.
 
 ${briefBlocks}${titleBlock}## Inline Media in Chat
 
@@ -111,8 +112,7 @@ You can display images and videos inline in your chat responses using markdown s
 \`\`\`
 
 The \`workspace\` query parameter is the slash-joined slug chain
-(URL-encoded). Files in the workspace's \`files/\` directory are served via
-this API.
+(URL-encoded). Files in the workspace's folder are served via this API.
 `.trim();
 
   return { type: "preset", preset: "claude_code", append };
@@ -126,6 +126,7 @@ async function readBriefIfExists(p: string): Promise<Brief | null> {
       overview: typeof parsed.overview === "string" ? parsed.overview : "",
       details: typeof parsed.details === "string" ? parsed.details : "",
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+      status: parsed.status === "archived" ? "archived" : "active",
     };
   } catch {
     return null;

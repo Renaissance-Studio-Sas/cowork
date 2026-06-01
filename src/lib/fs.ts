@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { relocateSessionsForWorkspace } from "./sessions";
 
-// Workspace root: the user's own repo / folder that contains `projects/` plus any
-// shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get read/write
-// access to this whole tree via `additionalDirectories` so they can pull in
-// context from anywhere in the repo.
+// Workspace root: the user's own repo / folder that contains `workspaces/` plus
+// any shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get
+// read/write access to this whole tree via `additionalDirectories` so they
+// can pull in context from anywhere in the repo.
 //
 // Set WORKSPACE_ROOT in `.env` to point at any directory; defaults to `../..`
 // relative to cwd (the legacy layout where this app lived inside a monorepo).
@@ -14,12 +14,12 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
   ? path.resolve(process.env.WORKSPACE_ROOT)
   : path.resolve(process.cwd(), "..", "..");
 
-// Top-level directory containing all workspaces. The name `projects/` is
-// preserved for backward compatibility with existing user data and to avoid
-// clashing with the `WORKSPACE_ROOT` env-var name — what was the parent of
-// (project, task) on disk is the parent of arbitrarily-nested workspaces now.
-// Convention: <WORKSPACE_ROOT>/projects/<workspace>/{files,workspace.json,<child>/...}
-export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, "projects");
+// Top-level directory containing all workspaces.
+// Convention: <WORKSPACE_ROOT>/workspaces/<workspace>/workspace.json plus the
+// workspace's artifacts directly in the same directory; child workspaces are
+// nested subdirectories that themselves contain a workspace.json. Any other
+// subdirectory is treated as an artifact folder.
+export const WORKSPACES_DIR = path.join(WORKSPACE_ROOT, "workspaces");
 
 // Flat directory holding ALL session data — one folder per session id, no
 // per-workspace nesting. Each session's meta.json records its own workspace
@@ -38,38 +38,38 @@ export function sessionDir(id: string): string {
 
 export type Status = "active" | "archived";
 
-// Suffix that marks a workspace folder as archived. Written with a
-// leading space so the bare slug stays readable in `ls` output.
-export const ARCHIVED_SUFFIX = " [Archived]";
-
-// Each workspace has a JSON brief inside `files/` with shape
-// `{ overview, details, createdAt }`. `overview` is a one-line summary shown
-// at the top of the page; `details` is markdown rendered below it.
+// Each workspace has a JSON brief at the root of its directory with shape
+// `{ overview, details, createdAt, status }`. `overview` is a one-line summary
+// shown at the top of the page; `details` is markdown rendered below it;
+// `status` is "active" or "archived" (the folder name itself no longer
+// encodes this). The brief's presence is also how we identify a directory as
+// a workspace — see `listChildrenAt`.
 export const WORKSPACE_BRIEF_FILENAME = "workspace.json";
 
 export interface Brief {
   overview: string;
   details: string;     // markdown
   createdAt: string;   // ISO timestamp
+  status: Status;
 }
 
 // A unit of work — what used to be a `Project` or a `Task`, unified.
 // Workspaces are nestable: every workspace can hold child workspaces in turn.
-// The on-disk layout mirrors the tree: `projects/A/B/C/` is a workspace `C`
+// The on-disk layout mirrors the tree: `workspaces/A/B/C/` is a workspace `C`
 // whose ancestor chain is `["A", "B"]`. The repo's old 2-level convention
 // (projects → tasks) becomes one of many possible depths.
 export interface Workspace {
-  slug: string;            // bare slug, without any archived suffix
-  folderName: string;      // basename on disk (may carry ARCHIVED_SUFFIX)
+  slug: string;            // bare slug == folder name
+  folderName: string;      // basename on disk (== slug)
   // Full slug-chain from the top-level workspace down to and including this
   // one. `["HR", "pay-contractors"]` identifies the workspace previously
   // known as task `pay-contractors` of project `HR`. Used as the workspace
   // identifier in session metas, URLs, and APIs.
   path: string[];
-  // Filesystem ancestor folder names, one per segment of `path`. Carries the
-  // ` [Archived]` suffix per-segment so a parent's archived state is
-  // distinguishable. `workspaceDir(ws)` reconstructs the on-disk path from
-  // this.
+  // Filesystem ancestor folder names, one per segment of `path`. With status
+  // stored inside `workspace.json`, this equals `path` exactly — kept as a
+  // separate field for forward-compat with any future folder-vs-slug
+  // divergence and so callers don't have to know they're identical.
   folderPath: string[];
   status: Status;
   overview: string;
@@ -80,92 +80,43 @@ export interface Workspace {
 
 // Resolved on-disk directory for a workspace.
 export function workspaceDir(ws: Workspace): string {
-  return path.join(PROJECTS_DIR, ...ws.folderPath);
-}
-
-// Legacy prefix pattern. Folders created before the switch to the
-// archived-suffix scheme still use `wip-<slug>` (active) and
-// `done-<slug>` (archived). We parse them so an unmigrated workspace
-// keeps working; a one-shot rename brings them into the new scheme.
-const LEGACY_PREFIX_RE = /^(wip|done)-(.+)$/;
-
-// Parse a folder name into { status, slug }. Returns null for entries
-// that aren't workspace folders (dotfiles, the bootstrap `files/` dir, etc.).
-// Skipping is the caller's responsibility.
-function parseFolderName(folderName: string): { status: Status; slug: string } {
-  if (folderName.endsWith(ARCHIVED_SUFFIX)) {
-    return { status: "archived", slug: folderName.slice(0, -ARCHIVED_SUFFIX.length) };
-  }
-  const legacy = folderName.match(LEGACY_PREFIX_RE);
-  if (legacy) {
-    return { status: legacy[1] === "done" ? "archived" : "active", slug: legacy[2] };
-  }
-  return { status: "active", slug: folderName };
-}
-
-// Build a folder name from a slug + status.
-function folderNameFor(slug: string, status: Status): string {
-  return status === "archived" ? `${slug}${ARCHIVED_SUFFIX}` : slug;
-}
-
-// Two folders can collapse to the same slug — e.g. a migrated `X` folder next
-// to a leftover legacy `wip-X`, or a stray git worktree whose container dir
-// happens to start with `wip-`/`done-`. Emitting both crashes the sidebar with
-// React duplicate-key warnings and makes /workspace/<slug> routing ambiguous.
-// Keep the most "real" one: a folder with an actual brief beats an empty one,
-// a canonical (un-prefixed, un-suffixed) name beats a legacy/archived variant,
-// and active beats archived. Deterministic, so the UI is stable across reloads.
-type Slugged = Pick<Workspace, "slug" | "folderName" | "status" | "overview" | "details" | "createdAt">;
-
-function realnessScore(x: Slugged): number {
-  let score = 0;
-  if (x.createdAt || x.overview || x.details) score += 4; // has a brief
-  if (x.folderName === x.slug) score += 2;                // canonical folder name
-  if (x.status === "active") score += 1;
-  return score;
-}
-
-function dedupeBySlug<T extends Slugged>(items: T[]): T[] {
-  const best = new Map<string, T>();
-  for (const x of items) {
-    const cur = best.get(x.slug);
-    if (!cur || realnessScore(x) > realnessScore(cur)) best.set(x.slug, x);
-  }
-  return [...best.values()];
+  return path.join(WORKSPACES_DIR, ...ws.folderPath);
 }
 
 // The folder name *is* the display name. Sanitize only what the filesystem
-// genuinely can't handle (path separators + a few illegal chars) and what
-// would clash with our naming scheme. Preserve case, spaces, and most
-// punctuation so renames keep the user's intent intact.
+// genuinely can't handle (path separators + a few illegal chars). Preserve
+// case, spaces, and most punctuation so renames keep the user's intent
+// intact.
 function sanitizeName(s: string): string {
   let out = s.normalize("NFC").trim();
   out = out.replace(/[/\\:*?"<>|]+/g, "-");
   out = out.replace(/\s+/g, " ");
   out = out.replace(/^[.-]+|[.-]+$/g, "");
-  // Reject the legacy wip-/done- prefixes — they would round-trip into the
-  // wrong slug after migration. Reject a trailing archived suffix too, so
-  // archive state is only ever set via setWorkspaceStatus.
-  out = out.replace(/^(wip|done)-+/i, "");
-  while (out.toLowerCase().endsWith(ARCHIVED_SUFFIX.toLowerCase())) {
-    out = out.slice(0, -ARCHIVED_SUFFIX.length).trimEnd();
-  }
   return out.slice(0, 80);
 }
 
-// Folders that exist alongside workspace folders and must never be treated as
-// workspaces themselves.
-const RESERVED_FOLDER_NAMES = new Set(["files", "sessions"]);
-
+// A directory qualifies as a workspace only if it contains a `workspace.json`
+// at its root. Anything else — dotfiles, vendored `node_modules`, the
+// workspace's own artifact subfolders — is invisible to workspace listing.
+// `isWorkspaceFolder` filters out the obviously-not-a-workspace names up
+// front; `hasWorkspaceBrief` confirms by probing the filesystem.
 function isWorkspaceFolder(name: string): boolean {
-  if (name.startsWith(".")) return false;
-  if (RESERVED_FOLDER_NAMES.has(name)) return false;
-  return true;
+  return !name.startsWith(".");
 }
 
-// Read a brief JSON file. Missing/unparseable files return an empty brief
-// so callers don't have to handle the absence case — a workspace with
-// no brief yet just renders blank fields in the UI.
+async function hasWorkspaceBrief(dir: string): Promise<boolean> {
+  try {
+    await fs.access(path.join(dir, WORKSPACE_BRIEF_FILENAME));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Read a brief JSON file. Missing/unparseable files return an empty active
+// brief so callers don't have to handle the absence case — a workspace with
+// no brief yet just renders blank fields in the UI. Briefs from before the
+// status-in-JSON migration may omit `status`; default to "active".
 async function readBrief(filePath: string): Promise<Brief> {
   try {
     const raw = await fs.readFile(filePath, "utf8");
@@ -174,9 +125,10 @@ async function readBrief(filePath: string): Promise<Brief> {
       overview: typeof parsed.overview === "string" ? parsed.overview : "",
       details: typeof parsed.details === "string" ? parsed.details : "",
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+      status: parsed.status === "archived" ? "archived" : "active",
     };
   } catch {
-    return { overview: "", details: "", createdAt: "" };
+    return { overview: "", details: "", createdAt: "", status: "active" };
   }
 }
 
@@ -189,36 +141,43 @@ function nowIso(): string {
 }
 
 export async function ensureWorkspace(): Promise<void> {
-  await fs.mkdir(PROJECTS_DIR, { recursive: true });
+  await fs.mkdir(WORKSPACES_DIR, { recursive: true });
   // Bootstrap a default `Inbox/` catch-all ONLY when the workspace has no
   // workspaces at all (fresh install). Once the user has any workspace, we
   // never auto-create — they're free to rename, delete, or replace the
   // catch-all.
   let hasAny = false;
   try {
-    const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
-    hasAny = entries.some((e) => e.isDirectory() && isWorkspaceFolder(e.name));
+    const entries = await fs.readdir(WORKSPACES_DIR, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory() || !isWorkspaceFolder(e.name)) continue;
+      if (await hasWorkspaceBrief(path.join(WORKSPACES_DIR, e.name))) {
+        hasAny = true;
+        break;
+      }
+    }
   } catch { /* empty or missing — treat as none */ }
   if (hasAny) return;
 
-  const inboxPath = path.join(PROJECTS_DIR, "Inbox");
-  await fs.mkdir(path.join(inboxPath, "files"), { recursive: true });
-  await writeBrief(path.join(inboxPath, "files", WORKSPACE_BRIEF_FILENAME), {
+  const inboxPath = path.join(WORKSPACES_DIR, "Inbox");
+  await fs.mkdir(inboxPath, { recursive: true });
+  await writeBrief(path.join(inboxPath, WORKSPACE_BRIEF_FILENAME), {
     overview: "Default workspace. Anything you don't want to file elsewhere goes here.",
     details: "",
     createdAt: nowIso(),
+    status: "active",
   });
 }
 
 // Recursively list workspaces under a parent folder on disk. `parentFolderPath`
-// is the list of ancestor folder names (with archived suffix preserved where
-// applicable) leading down to the directory whose children we're listing —
-// empty for the top-level.
+// is the list of ancestor folder names leading down to the directory whose
+// children we're listing — empty for the top-level. Slug equals folder name
+// now that status lives in `workspace.json` rather than the folder name.
 async function listChildrenAt(
   parentFolderPath: string[],
   parentSlugPath: string[],
 ): Promise<Workspace[]> {
-  const dir = path.join(PROJECTS_DIR, ...parentFolderPath);
+  const dir = path.join(WORKSPACES_DIR, ...parentFolderPath);
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -229,30 +188,31 @@ async function listChildrenAt(
   for (const e of entries) {
     if (!e.isDirectory()) continue;
     if (!isWorkspaceFolder(e.name)) continue;
-    const parsed = parseFolderName(e.name);
     const folderPath = [...parentFolderPath, e.name];
-    const slugPath = [...parentSlugPath, parsed.slug];
-    const wsDir = path.join(PROJECTS_DIR, ...folderPath);
-    const brief = await readBrief(path.join(wsDir, "files", WORKSPACE_BRIEF_FILENAME));
+    const wsDir = path.join(WORKSPACES_DIR, ...folderPath);
+    // Require workspace.json — directories without one are artifact
+    // subfolders (or unrelated content) and are ignored here.
+    if (!(await hasWorkspaceBrief(wsDir))) continue;
+    const slugPath = [...parentSlugPath, e.name];
+    const brief = await readBrief(path.join(wsDir, WORKSPACE_BRIEF_FILENAME));
     const children = await listChildrenAt(folderPath, slugPath);
     out.push({
-      slug: parsed.slug,
+      slug: e.name,
       folderName: e.name,
       path: slugPath,
       folderPath,
-      status: parsed.status,
+      status: brief.status,
       overview: brief.overview,
       details: brief.details,
       createdAt: brief.createdAt,
       children,
     });
   }
-  const deduped = dedupeBySlug(out);
-  deduped.sort((a, b) => {
+  out.sort((a, b) => {
     if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
-  return deduped;
+  return out;
 }
 
 // All top-level workspaces with their child trees materialized.
@@ -294,20 +254,20 @@ export async function createWorkspace(
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
 
-  let parentDir = PROJECTS_DIR;
+  let parentDir = WORKSPACES_DIR;
   if (parentPath.length > 0) {
     const parent = await getWorkspace(parentPath);
     if (!parent) throw new Error(`unknown parent workspace ${parentPath.join("/")}`);
     parentDir = workspaceDir(parent);
   }
 
-  const folder = folderNameFor(clean, "active");
-  const dir = path.join(parentDir, folder);
-  await fs.mkdir(path.join(dir, "files"), { recursive: true });
-  await writeBrief(path.join(dir, "files", WORKSPACE_BRIEF_FILENAME), {
+  const dir = path.join(parentDir, clean);
+  await fs.mkdir(dir, { recursive: true });
+  await writeBrief(path.join(dir, WORKSPACE_BRIEF_FILENAME), {
     overview: brief.overview ?? "",
     details: brief.details ?? "",
     createdAt: brief.createdAt ?? nowIso(),
+    status: "active",
   });
   const created = await getWorkspace([...parentPath, clean]);
   if (!created) throw new Error("created workspace not found");
@@ -323,22 +283,26 @@ export async function setWorkspaceBrief(
 ): Promise<void> {
   const ws = await getWorkspace(slugPath);
   if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
-  const briefPath = path.join(workspaceDir(ws), "files", WORKSPACE_BRIEF_FILENAME);
+  const briefPath = path.join(workspaceDir(ws), WORKSPACE_BRIEF_FILENAME);
   const current = await readBrief(briefPath);
   await writeBrief(briefPath, {
     overview: patch.overview ?? current.overview,
     details: patch.details ?? current.details,
     createdAt: current.createdAt || nowIso(),
+    status: current.status,
   });
 }
 
+// Archive/unarchive a workspace by flipping the `status` field inside
+// `workspace.json`. The folder name no longer encodes the state, so no
+// rename is needed and the slug stays stable across the transition.
 export async function setWorkspaceStatus(slugPath: string[], status: Status): Promise<void> {
   const ws = await getWorkspace(slugPath);
   if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
   if (ws.status === status) return;
-  const parentDir = path.dirname(workspaceDir(ws));
-  const newFolder = folderNameFor(ws.slug, status);
-  await fs.rename(workspaceDir(ws), path.join(parentDir, newFolder));
+  const briefPath = path.join(workspaceDir(ws), WORKSPACE_BRIEF_FILENAME);
+  const current = await readBrief(briefPath);
+  await writeBrief(briefPath, { ...current, status });
 }
 
 export async function renameWorkspace(slugPath: string[], newSlug: string): Promise<void> {
@@ -352,8 +316,7 @@ export async function renameWorkspace(slugPath: string[], newSlug: string): Prom
   const collision = await getWorkspace([...parentSlugPath, clean]);
   if (collision) throw new Error(`workspace "${clean}" already exists at this level`);
 
-  const newFolder = folderNameFor(clean, ws.status);
-  await fs.rename(workspaceDir(ws), path.join(parentDir, newFolder));
+  await fs.rename(workspaceDir(ws), path.join(parentDir, clean));
   // Note: no SDK-transcript rename needed. Sessions run with cwd=WORKSPACE_ROOT,
   // so all transcripts live in a single workspace-keyed directory regardless of
   // which workspace owns the session — renaming a workspace doesn't change
@@ -390,7 +353,7 @@ export async function moveWorkspace(
     throw new Error("cannot move a workspace under itself");
   }
 
-  let destDir = PROJECTS_DIR;
+  let destDir = WORKSPACES_DIR;
   if (toParentPath.length > 0) {
     const dest = await getWorkspace(toParentPath);
     if (!dest) throw new Error(`unknown destination ${toParentPath.join("/")}`);
@@ -409,15 +372,22 @@ export async function moveWorkspace(
     finalSlug = `${ws.slug}-${i}`;
   }
 
-  const newFolder = folderNameFor(finalSlug, ws.status);
-  await fs.rename(workspaceDir(ws), path.join(destDir, newFolder));
+  await fs.rename(workspaceDir(ws), path.join(destDir, finalSlug));
   const newPath = [...toParentPath, finalSlug];
   await relocateSessionsForWorkspace(slugPath, newPath);
   return newPath;
 }
 
 // ---------------------------------------------------------------------------
-// Files inside a workspace's `files/` folder (artifacts).
+// Files inside a workspace's directory (artifacts).
+//
+// Artifacts live directly in the workspace folder alongside `workspace.json`.
+// Listing walks the tree manually so we can:
+//   - hide the brief itself (`workspace.json` at the root),
+//   - hide macOS metadata,
+//   - skip dot-prefixed entries,
+//   - and prune any subdirectory that is itself a workspace (has its own
+//     `workspace.json`), since those files belong to a child workspace.
 // ---------------------------------------------------------------------------
 
 function ensureSafePath(base: string, rel: string): string {
@@ -431,15 +401,40 @@ function ensureSafePath(base: string, rel: string): string {
 // Files to hide from artifact listings (macOS metadata, etc.)
 const HIDDEN_FILES = new Set([".DS_Store"]);
 
-async function listFilesIn(base: string): Promise<string[]> {
-  try {
-    const entries = await fs.readdir(base, { withFileTypes: true, recursive: true });
-    return entries
-      .filter((e) => e.isFile() && !HIDDEN_FILES.has(e.name))
-      .map((e) => path.relative(base, path.join(e.parentPath, e.name)));
-  } catch {
-    return [];
+// Walk `base` and call `onFile` for every artifact, pruning child workspaces.
+async function walkArtifacts(
+  base: string,
+  onFile: (relPath: string, fullPath: string) => Promise<void>,
+): Promise<void> {
+  async function walk(rel: string): Promise<void> {
+    const dir = path.join(base, rel);
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      if (e.isFile()) {
+        if (HIDDEN_FILES.has(e.name)) continue;
+        // The brief itself isn't an artifact.
+        if (rel === "" && e.name === WORKSPACE_BRIEF_FILENAME) continue;
+        await onFile(path.join(rel, e.name), path.join(dir, e.name));
+      } else if (e.isDirectory()) {
+        const childDir = path.join(dir, e.name);
+        if (await hasWorkspaceBrief(childDir)) continue; // child workspace
+        await walk(path.join(rel, e.name));
+      }
+    }
   }
+  await walk("");
+}
+
+async function listFilesIn(base: string): Promise<string[]> {
+  const out: string[] = [];
+  await walkArtifacts(base, async (rel) => { out.push(rel); });
+  return out;
 }
 
 export interface FileMeta {
@@ -451,49 +446,42 @@ export interface FileMeta {
 // Same listing as listFilesIn but carries each file's mtime so callers can
 // sort artifacts by recency.
 async function listFilesMetaIn(base: string): Promise<FileMeta[]> {
-  try {
-    const entries = await fs.readdir(base, { withFileTypes: true, recursive: true });
-    const files = entries.filter((e) => e.isFile() && !HIDDEN_FILES.has(e.name));
-    return Promise.all(
-      files.map(async (e) => {
-        const full = path.join(e.parentPath, e.name);
-        let mtime = 0;
-        try { mtime = (await fs.stat(full)).mtimeMs; } catch { /* ignore */ }
-        return { path: path.relative(base, full), mtime };
-      }),
-    );
-  } catch {
-    return [];
-  }
+  const out: FileMeta[] = [];
+  await walkArtifacts(base, async (rel, full) => {
+    let mtime = 0;
+    try { mtime = (await fs.stat(full)).mtimeMs; } catch { /* ignore */ }
+    out.push({ path: rel, mtime });
+  });
+  return out;
 }
 
-async function workspaceFilesDir(slugPath: string[]): Promise<string | null> {
+async function workspaceArtifactsDir(slugPath: string[]): Promise<string | null> {
   const ws = await getWorkspace(slugPath);
   if (!ws) return null;
-  return path.join(workspaceDir(ws), "files");
+  return workspaceDir(ws);
 }
 
 export async function listFiles(slugPath: string[]): Promise<string[]> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) return [];
   return listFilesIn(base);
 }
 
 export async function listFilesMeta(slugPath: string[]): Promise<FileMeta[]> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) return [];
   return listFilesMetaIn(base);
 }
 
 export async function readFileText(slugPath: string[], rel: string): Promise<string> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   return fs.readFile(full, "utf8");
 }
 
 export async function writeFileText(slugPath: string[], rel: string, content: string): Promise<void> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   await fs.mkdir(path.dirname(full), { recursive: true });
@@ -501,7 +489,7 @@ export async function writeFileText(slugPath: string[], rel: string, content: st
 }
 
 export async function readFileBytes(slugPath: string[], rel: string): Promise<Uint8Array> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   const buf = await fs.readFile(full);
@@ -522,7 +510,7 @@ export async function workspaceDirFor(slugPath: string[]): Promise<string> {
 }
 
 export async function renameFile(slugPath: string[], from: string, to: string): Promise<void> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) throw new Error("not found");
   if (from === WORKSPACE_BRIEF_FILENAME) throw new Error(`${WORKSPACE_BRIEF_FILENAME} cannot be renamed`);
   if (!to.trim()) throw new Error("destination required");
@@ -539,7 +527,7 @@ export async function renameFile(slugPath: string[], from: string, to: string): 
 }
 
 export async function deleteFile(slugPath: string[], rel: string): Promise<void> {
-  const base = await workspaceFilesDir(slugPath);
+  const base = await workspaceArtifactsDir(slugPath);
   if (!base) throw new Error("not found");
   if (rel === WORKSPACE_BRIEF_FILENAME) throw new Error(`${WORKSPACE_BRIEF_FILENAME} cannot be deleted`);
   const full = ensureSafePath(base, rel);

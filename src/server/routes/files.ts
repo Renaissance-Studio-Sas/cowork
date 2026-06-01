@@ -54,7 +54,7 @@ function mimeFor(p: string): string {
   }
 }
 
-// Stream a file's raw bytes out of a workspace's `files/` directory.
+// Stream a file's raw bytes out of a workspace's directory.
 // Identification is `workspace=<slug-chain>&path=<relative path>`. With the
 // project/task split gone there's only one shape — no second viewer code
 // path.
@@ -67,7 +67,7 @@ files.get("/raw", async (c) => {
 
   const ws = await getWorkspace(workspacePath);
   if (!ws) return c.json({ error: "not found" }, 404);
-  const base = path.join(workspaceDir(ws), "files");
+  const base = workspaceDir(ws);
 
   const full = path.resolve(base, file);
   if (!full.startsWith(base + path.sep) && full !== base) {
@@ -112,8 +112,8 @@ function sanitizeFilename(name: string): string {
 
 files.post("/upload", async (c) => {
   const workspacePath = workspacePathFromQuery(c);
-  // Default to the artifacts root (files/). Callers can still pass an explicit
-  // subdir (e.g. the artifacts list passes the folder currently being viewed).
+  // Default to the workspace root. Callers can still pass an explicit subdir
+  // (e.g. the artifacts list passes the folder currently being viewed).
   const subdir = c.req.query("subdir") || "";
 
   if (!workspacePath) {
@@ -139,7 +139,7 @@ files.post("/upload", async (c) => {
   if (!ws) {
     return c.json({ error: "workspace not found" }, 404);
   }
-  const base = path.join(workspaceDir(ws), "files");
+  const base = workspaceDir(ws);
 
   // Generate unique filename with timestamp
   const timestamp = Date.now();
