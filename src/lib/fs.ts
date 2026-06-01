@@ -17,8 +17,25 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
 // Directory holding project folders. Active projects have a bare folder
 // name (`<slug>/`); archived projects carry a ` [Archived]` suffix
 // (`<slug> [Archived]/`). Same convention nests recursively for tasks.
-// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,sessions,task.json}
+// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,task.json}
 export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, "projects");
+
+// Flat directory holding ALL session data — one folder per session id, no
+// per-project or per-task nesting. Each session's meta.json records its own
+// (project, task) so the directory name doesn't need to encode them. Keeping
+// sessions out of the project tree lets the workspace stay clean and survive
+// project/task renames without on-disk moves.
+//
+// Defaults to `~/git/cowork-sessions`; override with COWORK_SESSIONS_ROOT.
+export const SESSIONS_ROOT = process.env.COWORK_SESSIONS_ROOT
+  ? path.resolve(process.env.COWORK_SESSIONS_ROOT)
+  : path.join(process.env.HOME || os.homedir(), "git", "cowork-sessions");
+
+// Path to a single session's directory (where meta.json, events.jsonl, and
+// input.jsonl live). No project/task in the path — the meta carries those.
+export function sessionDir(id: string): string {
+  return path.join(SESSIONS_ROOT, id);
+}
 
 export type Status = "active" | "archived";
 
@@ -272,7 +289,6 @@ export async function createProject(slug: string, brief: Partial<Brief> = {}): P
   const folder = folderNameFor(clean, "active");
   const dir = path.join(PROJECTS_DIR, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
-  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
   await writeBrief(path.join(dir, "files", PROJECT_BRIEF_FILENAME), {
     overview: brief.overview ?? "",
     details: brief.details ?? "",
@@ -293,7 +309,6 @@ export async function createTask(
   const folder = folderNameFor(clean, "active");
   const dir = path.join(PROJECTS_DIR, project.folderName, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
-  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
   await writeBrief(path.join(dir, "files", TASK_BRIEF_FILENAME), {
     overview: brief.overview ?? "",
     details: brief.details ?? "",
@@ -367,7 +382,7 @@ export async function renameProject(slug: string, newSlug: string): Promise<void
   // which project/task owns the session — renaming a project doesn't change
   // that path. (Earlier versions did rename per-project transcript dirs but
   // the prefix-match was buggy and corrupted directory names on every boot.)
-  relocateSessionsForProject(slug, clean);
+  await relocateSessionsForProject(slug, clean);
 }
 
 export async function deleteProject(slug: string): Promise<void> {
@@ -413,7 +428,7 @@ export async function moveTask(projectSlug: string, taskSlug: string, toProjectS
   const newPath = path.join(PROJECTS_DIR, dest.folderName, newFolder);
   await fs.rename(oldPath, newPath);
   // No SDK-transcript rename needed — see renameProject for rationale.
-  relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
+  await relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
   return { project: toProjectSlug, task: finalSlug };
 }
 
@@ -431,7 +446,7 @@ export async function renameTask(projectSlug: string, taskSlug: string, newSlug:
   const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
   await fs.rename(oldPath, newPath);
   // No SDK-transcript rename needed — see renameProject for rationale.
-  relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
+  await relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
 }
 
 // File CRUD inside a task's files/ folder
@@ -621,81 +636,49 @@ export async function deleteFile(projectSlug: string, taskSlug: string, rel: str
   await fs.rm(full, { recursive: true, force: true });
 }
 
-// Walk every session folder on disk and fix any meta.json whose
-// `project`/`task`/`cwd` drifted from the actual location it lives in.
-// This happens when a user renames/moves a project or task folder outside the
-// rename API (e.g. directly in Finder). Without this, sendInput → resumeSession
-// → getProject(staleSlug) returns null and the session is silently broken.
+// Walk every session folder under SESSIONS_ROOT and fix any meta.json whose
+// `cwd` drifted from the current WORKSPACE_ROOT (e.g. the user pointed cowork
+// at a different workspace path between runs). Without this, resume({ cwd })
+// would look in the wrong `~/.claude/projects/<encoded-cwd>/` and miss the
+// SDK transcript.
 //
-// The agent's runtime cwd is always WORKSPACE_ROOT (see startSession) — this
-// is independent of the project/task the session belongs to. So every
-// session's meta.cwd should equal WORKSPACE_ROOT, no matter where its folder
-// lives. There is nothing to relocate at the SDK transcript level because
-// every session's transcript lives in the same `~/.claude/projects/<encode(WORKSPACE_ROOT)>/`
-// directory regardless of project/task.
+// With flat session storage the directory no longer encodes project/task, so
+// no project/task drift is possible: meta.json IS the source of truth for
+// (project, task). Only meta.cwd can drift from configuration.
 //
-// History: this used to set meta.cwd = taskCwd and call relocateSdkTranscripts
-// on every drift. After the WORKSPACE_ROOT cwd refactor, every session was
-// flagged as drifted on every boot, and the relocate call's prefix matcher
-// `name.startsWith(oldPrefix + "-")` would match the workspace transcript dir
-// itself plus every previously-mangled dir. So each task iteration appended
-// another `-projects-wip-X-wip-Y` segment to every transcript dir, leaving
-// SDK transcripts at increasingly absurd nested paths that resume() couldn't
-// find. The current implementation only writes meta.json and skips the
-// rename entirely — the SDK transcript dir for any new session is always
-// the correct one, and the in-place rename was the source of the corruption.
+// History: this used to walk projects/<P>/[<T>/]sessions/ and rewrite
+// meta.project/meta.task to match the path. After the move to a flat
+// SESSIONS_ROOT (one folder per id, project/task in meta.json only) that
+// rewrite is gone — paths no longer carry the (project, task) tuple.
 //
 // Called once on module load with a globalThis guard for HMR. Best effort —
 // failures are logged but never throw.
 export async function reconcileSessionsOnDisk(): Promise<void> {
-  try {
-    const projects = await listProjects();
-    for (const p of projects) {
-      await reconcileSessionDir(
-        path.join(PROJECTS_DIR, p.folderName, "sessions"),
-        p.slug, "",
-      );
-      for (const t of p.tasks) {
-        await reconcileSessionDir(
-          path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-          p.slug, t.slug,
-        );
-      }
-    }
-  } catch (err) {
-    const e = err as Error;
-    console.warn(`[reconcile] sessions reconciliation failed:`, e.message);
-  }
-}
-
-async function reconcileSessionDir(
-  sessDir: string,
-  expectedProject: string,
-  expectedTask: string,
-): Promise<void> {
   let entries: import("node:fs").Dirent[];
   try {
-    entries = await fs.readdir(sessDir, { withFileTypes: true }) as import("node:fs").Dirent[];
-  } catch { return; }
+    entries = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true }) as import("node:fs").Dirent[];
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    // First boot before any sessions exist — fine. Anything else, log.
+    if (e.code !== "ENOENT") {
+      console.warn(`[reconcile] could not read ${SESSIONS_ROOT}:`, e.message);
+    }
+    return;
+  }
   for (const d of entries) {
     if (!d.isDirectory()) continue;
-    const metaPath = path.join(sessDir, String(d.name), "meta.json");
+    const metaPath = path.join(SESSIONS_ROOT, String(d.name), "meta.json");
     let meta: { project?: string; task?: string; cwd?: string; sdkSessionId?: string; [k: string]: unknown };
     try {
       meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
     } catch { continue; }
-    const projectDrift = meta.project !== expectedProject;
-    const taskDrift = (meta.task ?? "") !== expectedTask;
-    const cwdDrift = meta.cwd !== WORKSPACE_ROOT;
-    if (!projectDrift && !taskDrift && !cwdDrift) continue;
+    if (meta.cwd === WORKSPACE_ROOT) continue;
 
     const oldCwd = typeof meta.cwd === "string" ? meta.cwd : null;
     const sdkSessionId = typeof meta.sdkSessionId === "string" ? meta.sdkSessionId : null;
     console.log(
-      `[reconcile] session ${String(d.name)}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
+      `[reconcile] session ${String(d.name)}: cwd ${meta.cwd ?? "?"} → ${WORKSPACE_ROOT}`,
     );
-    meta.project = expectedProject;
-    meta.task = expectedTask;
     meta.cwd = WORKSPACE_ROOT;
     try {
       await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
@@ -705,13 +688,11 @@ async function reconcileSessionDir(
       continue;
     }
 
-    // Legacy sessions had meta.cwd = task folder, and their SDK transcript
-    // lives in the task-folder-encoded directory. Move just that session's
-    // jsonl to the WORKSPACE_ROOT-encoded directory so `resume({ cwd })` can
-    // find it. We intentionally do NOT rename the encoded directory itself:
-    // that's what produced the concatenated-path corruption in the old
-    // implementation — see reconcileSessionsOnDisk's comment for details.
-    if (oldCwd && oldCwd !== WORKSPACE_ROOT && sdkSessionId) {
+    // Move the SDK transcript jsonl from the old cwd's encoded directory to
+    // the new one so `resume({ cwd })` finds it. We intentionally do NOT
+    // rename the encoded directory itself — see git history for the
+    // concatenated-path corruption that approach produced.
+    if (oldCwd && sdkSessionId) {
       await moveSdkTranscriptFile(sdkSessionId, oldCwd, WORKSPACE_ROOT);
     }
   }

@@ -33,7 +33,7 @@ import {
   readSessionEvents,
   registerSessionLog,
 } from "./cloud-events";
-import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, reconcileSessionsOnDisk } from "./fs";
+import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
 import {
@@ -751,19 +751,33 @@ export function listLiveSessions(): SessionSummary[] {
   });
 }
 
-async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: string, liveIds: Set<string>): Promise<SessionSummary[]> {
-  const out: SessionSummary[] = [];
+// Walk SESSIONS_ROOT flat — every direct subdirectory is a session, and each
+// session's meta.json carries its (project, task) slugs. Sessions in the live
+// registry are skipped to avoid double-listing.
+export async function listAllSessions(): Promise<SessionSummary[]> {
+  const live = listLiveSessions();
+  const liveIds = new Set(live.map((s) => s.id));
+  const out: SessionSummary[] = [...live];
+
   let dirents: import("node:fs").Dirent[];
-  try { dirents = await fs.readdir(sessDir, { withFileTypes: true }); }
-  catch { return out; }
+  try { dirents = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true }); }
+  catch (err) {
+    // First boot before any sessions exist — fine. Anything else, log.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[listAllSessions] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
+    return out.sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1));
+  }
+
   for (const d of dirents) {
     if (!d.isDirectory() || liveIds.has(d.name)) continue;
     const id = d.name;
-    const metaPath = path.join(sessDir, id, "meta.json");
-    const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
-    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
-    // Prefer generated name from meta.json; fall back to first message for legacy sessions
+    const sessDir = path.join(SESSIONS_ROOT, id);
+    const metaPath = path.join(sessDir, "meta.json");
+    const inputPath = path.join(sessDir, "input.jsonl");
+    let meta: { project?: string; task?: string; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
+    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { continue; /* no meta → not a session */ }
+    // Prefer generated name from meta.json; fall back to first message for legacy sessions.
     let title = meta.name ?? "(no message)";
     if (!meta.name) {
       try {
@@ -781,12 +795,12 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const completedAt = meta.completedAt ?? lastActivity;
     const unread = meta.completed === true ? false : (!meta.seenAt || meta.seenAt < completedAt);
     // Use persisted finalState if available (idle = done, error = error),
-    // otherwise fall back to "idle" (assume completed) for historical sessions
+    // otherwise fall back to "idle" (assume completed) for historical sessions.
     const state: SessionState = meta.finalState ?? "idle";
     out.push({
       id,
-      projectSlug,
-      taskSlug,
+      projectSlug: meta.project ?? "",
+      taskSlug: meta.task ?? "",
       state,
       title,
       startedAt: meta.startedAt ?? lastActivity,
@@ -799,31 +813,6 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       model: meta.model ?? null,
       effort: meta.effort ?? null,
     });
-  }
-  return out;
-}
-
-// Walk workspace for session folders so they persist across restarts.
-// Includes project-level sessions (`projects/<project>/sessions/`) and
-// task-level sessions (`projects/<project>/<task>/sessions/`).
-export async function listAllSessions(): Promise<SessionSummary[]> {
-  const live = listLiveSessions();
-  const liveIds = new Set(live.map((s) => s.id));
-  const projects = await listProjects();
-  const out: SessionSummary[] = [...live];
-
-  for (const p of projects) {
-    // Project-level sessions
-    out.push(...await discoverFromDir(
-      path.join(PROJECTS_DIR, p.folderName, "sessions"),
-      p.slug, "", liveIds,
-    ));
-    for (const t of p.tasks) {
-      out.push(...await discoverFromDir(
-        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-        p.slug, t.slug, liveIds,
-      ));
-    }
   }
 
   out.sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1));
@@ -845,14 +834,8 @@ export async function readSessionHistory(
 ): Promise<{ events: unknown[]; total: number; hasMore: boolean } | null> {
   const project = await getProject(projectSlug);
   if (!project) return null;
-  let eventsPath: string;
-  if (!taskSlug) {
-    eventsPath = path.join(PROJECTS_DIR, project.folderName, "sessions", id, "events.jsonl");
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return null;
-    eventsPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id, "events.jsonl");
-  }
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return null;
+  const eventsPath = path.join(sessionDir(id), "events.jsonl");
   // Tell the file backend where this stopped session's log lives, then read.
   registerSessionLog(id, eventsPath);
   try {
@@ -904,21 +887,17 @@ async function doRestoreSession(
 
   const project = await getProject(projectSlug);
   if (!project) return null;
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return null;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return null;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
-  }
+  // Sessions live flat in SESSIONS_ROOT — the directory no longer encodes
+  // (project, task), only the session id. (project, task) come from meta.
+  const dir = sessionDir(id);
   // The agent's runtime cwd is always the workspace root (see startSession
   // comment). Stored on the RuntimeSession so resume keeps it consistent.
   const cwd = WORKSPACE_ROOT;
 
   // Read meta.json
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(dir, "meta.json");
   let meta: {
     name?: string;
     startedAt?: string;
@@ -944,7 +923,7 @@ async function doRestoreSession(
   // cloud-events.ts). Empty (file missing or backend unreachable) is fine —
   // the UI just won't have a replay buffer, and resume will pick up via the
   // SDK's own transcript anyway.
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
+  registerSessionLog(id, path.join(dir, "events.jsonl"));
   let history: SDKMessage[] = [];
   try {
     const { events } = await readSessionEvents(id);
@@ -1058,16 +1037,20 @@ function findPendingToolUses(history: SDKMessage[]): string[] {
   return [];
 }
 
-async function findRunningSessionsInDir(
-  sessDir: string,
-  projectSlug: string,
-  taskSlug: string,
-): Promise<Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }>> {
+// Scan SESSIONS_ROOT for candidates the boot-time auto-resume pass should
+// pick up: sessions whose previous worker died mid-turn (`running`) or
+// mid-resume (`resuming`), excluding remote (Docker) sessions and any whose
+// in-memory pending-prompt state would be lost. (project, task) are read
+// from each meta.json — no path traversal needed.
+async function findRunningSessions(): Promise<Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }>> {
   const out: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
   let dirents: import("node:fs").Dirent[];
   try {
-    dirents = await fs.readdir(sessDir, { withFileTypes: true });
-  } catch {
+    dirents = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[auto-resume] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
     return out;
   }
   for (const d of dirents) {
@@ -1075,7 +1058,7 @@ async function findRunningSessionsInDir(
     // Skip sessions already in the registry — they're still live (preserved
     // via globalThis during HMR) and don't need resume.
     if (registry.has(d.name)) continue;
-    const metaPath = path.join(sessDir, d.name, "meta.json");
+    const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
     try {
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
       // sdkSessionId is required: resume() needs it to find the SDK's
@@ -1100,8 +1083,14 @@ async function findRunningSessionsInDir(
         && !meta.hasPendingPrompt
         && meta.sdkSessionId
         && meta.runtime !== "remote"
+        && typeof meta.project === "string"
       ) {
-        out.push({ projectSlug, taskSlug, id: d.name, sdkSessionId: meta.sdkSessionId });
+        out.push({
+          projectSlug: meta.project,
+          taskSlug: typeof meta.task === "string" ? meta.task : "",
+          id: d.name,
+          sdkSessionId: meta.sdkSessionId,
+        });
       }
     } catch { /* skip unreadable meta */ }
   }
@@ -1145,28 +1134,7 @@ export async function autoResumeRunningSessions(): Promise<{ resumed: number; fa
 }
 
 async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
-  let projects;
-  try {
-    projects = await listProjects();
-  } catch (err) {
-    console.warn(`[auto-resume] could not list projects:`, (err as Error).message);
-    return { resumed: 0, failed: 0 };
-  }
-
-  const candidates: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
-  for (const p of projects) {
-    candidates.push(...await findRunningSessionsInDir(
-      path.join(PROJECTS_DIR, p.folderName, "sessions"),
-      p.slug, "",
-    ));
-    for (const t of p.tasks) {
-      candidates.push(...await findRunningSessionsInDir(
-        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-        p.slug, t.slug,
-      ));
-    }
-  }
-
+  const candidates = await findRunningSessions();
   if (candidates.length === 0) return { resumed: 0, failed: 0 };
   console.log(`[auto-resume] Found ${candidates.length} session(s) to resume`);
 
@@ -1260,14 +1228,15 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // the root are picked up by the runtime, and the agent has full access
   // to the projects/ tree without needing additionalDirectories. The
   // task identity + path is supplied via the system prompt (see
-  // sessions/prompts.ts). Session persistence (events.jsonl, meta.json)
-  // still lives under the task folder.
+  // sessions/prompts.ts). Session persistence (events.jsonl, meta.json) lives
+  // in a flat SESSIONS_ROOT (see fs.ts) — meta.json carries the (project,
+  // task) tuple so the directory name doesn't need to encode it.
   const cwd = WORKSPACE_ROOT;
-  const sessionDir = path.join(taskDir(project, task), "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
+  const dir = sessionDir(id);
+  await fs.mkdir(dir, { recursive: true });
 
   await fs.writeFile(
-    path.join(sessionDir, "meta.json"),
+    path.join(dir, "meta.json"),
     JSON.stringify(
       {
         id,
@@ -1290,8 +1259,8 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     ),
   );
 
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
-  const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+  registerSessionLog(id, path.join(dir, "events.jsonl"));
+  const inputLog = createWriteStream(path.join(dir, "input.jsonl"), { flags: "a" });
 
   const input = new InputChannel();
   const events = new EventEmitter();
@@ -1335,7 +1304,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // into gemini-cli-core's ToolRegistry.
       mcpServers: await buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
-      runtimeStateDir: sessionDir,
+      runtimeStateDir: dir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
@@ -1869,35 +1838,82 @@ function setState(s: RuntimeSession, state: SessionState) {
   }
 }
 
-// Called from fs.ts after a task or project is moved/renamed. Keeps the
-// in-memory session entries' (projectSlug, taskSlug) labels in sync with the
-// new folder names so the UI continues to find them.
-export function relocateSessionsForTask(
+// Called from fs.ts after a task or project is moved/renamed. With flat
+// session storage, meta.json is the source of truth for (project, task) — so
+// the in-memory registry update is no longer enough on its own; we also walk
+// every session meta on disk and rewrite the matching slugs.
+export async function relocateSessionsForTask(
   oldProject: string,
   oldTask: string,
   newProject: string,
   newTask: string,
-): void {
+): Promise<void> {
   for (const s of registry.values()) {
     if (s.projectSlug === oldProject && s.taskSlug === oldTask) {
       s.projectSlug = newProject;
       s.taskSlug = newTask;
     }
   }
+  await rewriteSessionMetas((meta) => {
+    if (meta.project === oldProject && (meta.task ?? "") === oldTask) {
+      meta.project = newProject;
+      meta.task = newTask;
+      return true;
+    }
+    return false;
+  });
 }
 
-export function relocateSessionsForProject(oldProject: string, newProject: string): void {
+export async function relocateSessionsForProject(oldProject: string, newProject: string): Promise<void> {
   for (const s of registry.values()) {
     if (s.projectSlug === oldProject) s.projectSlug = newProject;
   }
+  await rewriteSessionMetas((meta) => {
+    if (meta.project === oldProject) {
+      meta.project = newProject;
+      return true;
+    }
+    return false;
+  });
 }
 
-// Move a project-level session into a task's sessions folder. Used by the
-// "New task" planning flow: when the user accepts the proposed task, the
-// session that produced the plan moves from `projects/<p>/sessions/<id>/` to
-// `projects/<p>/<task>/sessions/<id>/` so it lives with the task it created.
-// Open log fd's survive the directory rename on POSIX, so streams keep
-// writing to the moved location without needing to be reopened.
+// Iterate every session on disk, hand its meta to `mutate`, and persist if
+// `mutate` returned true. Best effort — individual failures are logged but
+// don't abort the walk so a single corrupted meta.json can't strand all the
+// others mid-rename.
+async function rewriteSessionMetas(
+  mutate: (meta: { project?: string; task?: string; [k: string]: unknown }) => boolean,
+): Promise<void> {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[relocate] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
+    return;
+  }
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
+    let meta: { project?: string; task?: string; [k: string]: unknown };
+    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); }
+    catch { continue; }
+    if (!mutate(meta)) continue;
+    try { await fs.writeFile(metaPath, JSON.stringify(meta, null, 2)); }
+    catch (err) {
+      console.warn(`[relocate] could not rewrite ${metaPath}:`, (err as Error).message);
+    }
+  }
+}
+
+// Move a project-level session under a task. Used by the "New task" planning
+// flow: when the user accepts the proposed task, the session that produced the
+// plan adopts that task so it lives with the task it created.
+//
+// With flat session storage the on-disk directory doesn't change — only the
+// `task` field in meta.json (and the in-memory registry entry) needs to be
+// updated. The agent's open log fds keep writing to the same path either way.
 export async function moveSessionToTask(
   sessionId: string,
   newTaskSlug: string,
@@ -1908,21 +1924,7 @@ export async function moveSessionToTask(
 
   const project = await getProject(s.projectSlug);
   if (!project) return false;
-  const newTask = project.tasks.find((t) => t.slug === newTaskSlug);
-  if (!newTask) return false;
-
-  const oldDir = s.taskSlug
-    ? path.join(PROJECTS_DIR, project.folderName, project.tasks.find((t) => t.slug === s.taskSlug)?.folderName ?? "", "sessions", sessionId)
-    : path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  const newDir = path.join(PROJECTS_DIR, project.folderName, newTask.folderName, "sessions", sessionId);
-
-  try {
-    await fs.mkdir(path.dirname(newDir), { recursive: true });
-    await fs.rename(oldDir, newDir);
-  } catch (err) {
-    console.warn(`[moveSessionToTask] failed to move ${oldDir} → ${newDir}:`, (err as Error).message);
-    return false;
-  }
+  if (!project.tasks.find((t) => t.slug === newTaskSlug)) return false;
 
   s.taskSlug = newTaskSlug;
   await updateMeta(s, (meta) => {
@@ -1951,11 +1953,11 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
   // Agent runs at workspace root; project identity + path comes via the
   // system prompt. See startSession comment.
   const cwd = WORKSPACE_ROOT;
-  const sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
+  const dir = sessionDir(id);
+  await fs.mkdir(dir, { recursive: true });
 
   await fs.writeFile(
-    path.join(sessionDir, "meta.json"),
+    path.join(dir, "meta.json"),
     JSON.stringify({
       id,
       name,
@@ -1971,8 +1973,8 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
     }, null, 2),
   );
 
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
-  const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+  registerSessionLog(id, path.join(dir, "events.jsonl"));
+  const inputLog = createWriteStream(path.join(dir, "input.jsonl"), { flags: "a" });
 
   const input = new InputChannel();
   const events = new EventEmitter();
@@ -2033,7 +2035,7 @@ export async function startProjectSession(p: { projectSlug: string; firstMessage
       toolAliases: STATIC_TOOL_ALIASES,
       mcpServers: { ...(await buildStaticWorkbenchMcps(id, p.projectSlug, "")), ...planningMcps },
       workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
-      runtimeStateDir: sessionDir,
+      runtimeStateDir: dir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
@@ -2344,22 +2346,20 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   }
 
   try {
-    // Re-open the log files for appending
+    // Re-open the log files for appending. Project/task lookup is still
+    // performed for validation (they're used downstream for prompts/MCPs)
+    // but no longer determines the on-disk session location.
     const project = await getProject(s.projectSlug);
     if (!project) throw new Error("Project not found");
-
-    let sessionDir: string;
-    if (!s.taskSlug) {
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-    } else {
-      const task = project.tasks.find((t) => t.slug === s.taskSlug);
-      if (!task) throw new Error("Task not found");
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
+    if (s.taskSlug && !project.tasks.find((t) => t.slug === s.taskSlug)) {
+      throw new Error("Task not found");
     }
 
+    const dir = sessionDir(s.id);
+
     // Re-create log streams
-    registerSessionLog(s.id, path.join(sessionDir, "events.jsonl"));
-    s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+    registerSessionLog(s.id, path.join(dir, "events.jsonl"));
+    s.inputLog = createWriteStream(path.join(dir, "input.jsonl"), { flags: "a" });
 
     // Create a new input channel
     s.input = new InputChannel();
@@ -2401,7 +2401,7 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
         toolAliases: STATIC_TOOL_ALIASES,
         mcpServers: await buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
         workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
-        runtimeStateDir: sessionDir,
+        runtimeStateDir: dir,
         systemPrompt,
         ...(s.model ? { model: s.model } : {}),
         ...(s.effort ? { effort: s.effort } : {}),
@@ -2593,17 +2593,9 @@ export async function markSessionSeen(
   // Dead session (not in registry): no other writer can race, direct write is fine.
   const project = await getProject(projectSlug);
   if (!project) return false;
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2650,17 +2642,9 @@ export async function markSessionCompleted(
   // Dead session (not in registry): no other writer can race, direct write is fine.
   const project = await getProject(projectSlug);
   if (!project) return false;
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2693,17 +2677,9 @@ export async function renameSession(
 
   const project = await getProject(projectSlug);
   if (!project) return !!liveSession; // Return true if we at least updated in-memory
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2742,20 +2718,13 @@ export async function deleteSession(
 
   const project = await getProject(projectSlug);
   if (!project) return false;
+  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
+  const dir = sessionDir(sessionId);
   try {
     // Check directory exists before attempting delete
-    await fs.access(sessionDir);
-    await fs.rm(sessionDir, { recursive: true, force: true });
+    await fs.access(dir);
+    await fs.rm(dir, { recursive: true, force: true });
     return true;
   } catch {
     return false;
