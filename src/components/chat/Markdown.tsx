@@ -74,6 +74,11 @@ const markdownComponents = {
   img: ({ src, alt }: { src?: string | Blob; alt?: string }) => (
     <MarkdownMedia src={typeof src === "string" ? src : undefined} alt={alt} />
   ),
+  a: ({ href, children, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+      {children}
+    </a>
+  ),
 };
 
 export function Markdown({ text }: { text: string }) {
