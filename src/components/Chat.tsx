@@ -223,7 +223,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     // Reset all per-session UI state and (re)open the SSE stream whenever the
     // session changes — an intentional reset-on-prop-change paired with the
     // subscription this effect owns.
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset-on-session-change + subscribe
     setMessages([]);
     setServerTodos(null);
     setRateLimit(null);
@@ -537,7 +536,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
       const raw = localStorage.getItem(clearedTasksKey);
       if (raw) {
         const arr = JSON.parse(raw) as string[];
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage hydration on key change
         setClearedTasks(Array.isArray(arr) ? new Set(arr) : null);
       } else {
         setClearedTasks(null);
@@ -554,7 +552,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     if (clearedTasks === null) return;
     const hasNew = todos.some((t) => !clearedTasks.has(t.content));
     if (hasNew) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset coupled with the localStorage write below
       setClearedTasks(null);
       try { localStorage.removeItem(clearedTasksKey); } catch {}
     }

@@ -204,7 +204,6 @@ export function Workspace({ workspacePath }: WorkspaceProps) {
   useEffect(() => {
     // Initial load of the artifact list + comment counts; both set state from
     // the fetch — the intended data-fetch-on-mount pattern.
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data fetch
     refreshFiles();
     refreshCommentCounts();
   }, [refreshFiles, refreshCommentCounts]);

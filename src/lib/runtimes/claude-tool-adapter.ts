@@ -26,12 +26,10 @@ export function workbenchToolsAsClaudeMcp(
         t.description,
         // Claude SDK's tool() expects a zod RAW shape — same shape we
         // accept on WorkbenchTool.schema, so this is identity.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         t.schema as any,
         // The MCP SDK's CallToolResult has a `[key: string]: unknown` index
         // signature that our ToolCallResult deliberately doesn't (cleaner
         // public type); cast at the boundary.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         async (args: Record<string, unknown>) => (await t.handler(args)) as any,
         t.alwaysLoad ? { alwaysLoad: true } : undefined,
       ),
