@@ -1086,19 +1086,23 @@ async function findRunningSessionsInDir(
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
       // sdkSessionId is required: resume() needs it to find the SDK's
       // transcript. A session that crashed before the first `init` event has
-      // no transcript to resume against — skip it. Also skip "resuming" state
-      // which means another worker is already handling this session.
-      // Remote (Docker) sessions are also skipped: their container is orphaned
-      // after a cowork restart and auto-resume would spawn a fresh container
-      // per session at boot — slow, noisy, and dependent on Docker being up.
-      // The user resumes them manually by sending a message.
-      // Sessions parked on a user decision (awaiting_input state, or a pending
-      // permission/question/completion at restart time) are also skipped: the
-      // parked tool call lived in-memory only and is gone, so resuming would
-      // just blow away the pending card with a "[Server restarted...]" prompt.
-      // The user resumes them by answering or sending a new message.
+      // no transcript to resume against — skip it.
+      // "running" = the previous worker died mid-turn.
+      // "resuming" = the previous worker died mid-resume (set right before
+      // spawn, cleared on first event). Without this case we'd strand any
+      // session whose autoResume itself was interrupted.
+      // Remote (Docker) sessions are also skipped: their container is
+      // orphaned after a cowork restart and auto-resume would spawn a fresh
+      // container per session at boot — slow, noisy, and dependent on Docker.
+      // Sessions parked on a user decision (pending permission / question /
+      // completion at restart time) are also skipped: the parked tool call
+      // lived in-memory only and is gone, so resuming would just blow away
+      // the pending card with a "[Server restarted...]" prompt.
+      // The actual "another live worker owns this" filter is the per-session
+      // inspectOwnership call in doAutoResume, not this candidate filter.
+      const resumable = meta.finalState === "running" || meta.finalState === "resuming";
       if (
-        meta.finalState === "running"
+        resumable
         && !meta.hasPendingPrompt
         && meta.sdkSessionId
         && meta.runtime !== "remote"
