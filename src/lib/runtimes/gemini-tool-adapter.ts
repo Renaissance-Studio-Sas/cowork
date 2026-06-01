@@ -108,11 +108,9 @@ export function registerWorkbenchToolsInGemini(config: Config, tools: WorkbenchT
 // constructs like $schema, additionalProperties, oneOf/anyOf/allOf at root,
 // or schemas wrapped in $ref/definitions. We recurse so nested properties
 // (e.g. array items) are also sanitized.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function stripJsonSchemaWrapper(schema: any): any {
   if (!schema || typeof schema !== "object") return schema;
   // Resolve top-level $ref into definitions if present.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let resolved: any = schema;
   if (schema.$ref && schema.definitions) {
     const refPath = String(schema.$ref).replace(/^#\/definitions\//, "");
@@ -123,11 +121,9 @@ function stripJsonSchemaWrapper(schema: any): any {
   return sanitizeForGemini(resolved);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function sanitizeForGemini(schema: any): any {
   if (Array.isArray(schema)) return schema.map(sanitizeForGemini);
   if (!schema || typeof schema !== "object") return schema;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(schema)) {
     // Drop fields Gemini's function-call parser doesn't accept.

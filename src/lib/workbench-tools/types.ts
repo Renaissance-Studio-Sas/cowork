@@ -50,7 +50,6 @@ export interface WorkbenchTool {
   name: string;
   description: string;
   schema: ToolSchema;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   handler: (args: any) => Promise<ToolCallResult>;
   // When true, the Claude SDK includes this tool's schema in the prompt at
   // turn 1 (defer_loading: false) instead of hiding it behind ToolSearch.
@@ -78,7 +77,6 @@ export function defineTool<S extends ToolSchema>(
     name,
     description,
     schema,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     handler: handler as (args: any) => Promise<ToolCallResult>,
     alwaysLoad: opts?.alwaysLoad,
   };

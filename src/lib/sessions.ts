@@ -33,7 +33,7 @@ import {
   readSessionEvents,
   registerSessionLog,
 } from "./cloud-events";
-import { getProject, getTask, taskDir, WORKSPACE_ROOT, PROJECTS_DIR, listProjects, reconcileSessionsOnDisk } from "./fs";
+import { getWorkspace, workspaceDir, WORKSPACE_ROOT, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
 import {
@@ -45,10 +45,8 @@ import {
   readMetaRaw,
 } from "./sessions/meta";
 import {
-  buildPlanningTools,
-  buildTaskPlanningTools,
-  buildTaskPlanningSystemPrompt,
-  PLANNING_SYSTEM_PROMPT,
+  buildWorkspacePlanningTools,
+  buildWorkspacePlanningSystemPrompt,
 } from "./workbench-tools/planning";
 import { buildCommentsTools } from "./workbench-tools/comments";
 import { buildSessionTools } from "./workbench-tools/session";
@@ -64,12 +62,11 @@ import type { WorkbenchTool } from "./workbench-tools/types";
 // from the same underlying tool definitions.
 function buildStaticWorkbenchToolGroups(
   sessionId: string,
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
 ): Array<{ name: string; tools: WorkbenchTool[] }> {
   return [
-    { name: "workbench-comments", tools: buildCommentsTools(projectSlug, taskSlug) },
-    { name: "workbench-session", tools: buildSessionTools(sessionId, projectSlug, taskSlug) },
+    { name: "workbench-comments", tools: buildCommentsTools(workspacePath) },
+    { name: "workbench-session", tools: buildSessionTools(sessionId, workspacePath) },
     { name: "workbench-user-input", tools: buildUserInputTools(sessionId) },
   ];
 }
@@ -197,12 +194,11 @@ async function findResumedSdkSubprocesses(sdkSessionId: string): Promise<SdkProc
 // worker" (caller should bail) or a list of reclaimable SDKs (caller should
 // SIGKILL them, then spawn a fresh SDK).
 async function inspectOwnership(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
   sdkSessionId: string | null,
 ): Promise<{ ownedByOther: boolean; reclaimable: SdkProc[] }> {
-  const meta = await readMetaRaw(projectSlug, taskSlug, sessionId);
+  const meta = await readMetaRaw(workspacePath, sessionId);
   const ownerPid = typeof meta?.ownerPid === "number" ? meta.ownerPid : null;
   if (ownerPid && ownerPid !== process.pid && isPidAlive(ownerPid)) {
     return { ownedByOther: true, reclaimable: [] };
@@ -263,18 +259,22 @@ function registerSession(s: RuntimeSession): void {
   sessionRegistryEvents.emit("added", s);
 }
 
-// Subscribe to file_changed events from every live session matching
-// (projectSlug, taskSlug), including sessions added after this call. Returns
-// an unsubscribe function. Used by the multiplexed /api/file-events/stream
-// endpoint so one browser connection covers all sessions on a task.
+// Compare two workspace paths for equality.
+function samePath(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((s, i) => s === b[i]);
+}
+
+// Subscribe to file_changed events from every live session in the given
+// workspace, including sessions added after this call. Returns an unsubscribe
+// function. Used by the multiplexed /api/file-events/stream endpoint so one
+// browser connection covers all sessions on a workspace.
 export function subscribeFileChanges(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   listener: (data: { path: string; sessionId: string }) => void,
 ): () => void {
   const attached = new Map<string, (data: { path: string }) => void>();
   const attach = (s: RuntimeSession) => {
-    if (s.projectSlug !== projectSlug || s.taskSlug !== taskSlug) return;
+    if (!samePath(s.workspacePath, workspacePath)) return;
     if (attached.has(s.id)) return;
     const wrapper = (data: { path: string }) =>
       listener({ ...data, sessionId: s.id });
@@ -294,19 +294,18 @@ export function subscribeFileChanges(
   };
 }
 
-// Subscribe to open_artifact events from every live session matching
-// (projectSlug, taskSlug), including sessions added after this call. These are
-// emitted by the workbench-session.open_artifact tool so an agent can push a
+// Subscribe to open_artifact events from every live session in the given
+// workspace, including sessions added after this call. These are emitted by
+// the workbench-session.open_artifact tool so an agent can push a
 // freshly-saved artifact into the user's artifact panel. Returns an unsubscribe
 // function. Multiplexed by /api/file-events/stream alongside file_changed.
 export function subscribeOpenArtifact(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   listener: (data: { path: string; sessionId: string }) => void,
 ): () => void {
   const attached = new Map<string, (data: { path: string }) => void>();
   const attach = (s: RuntimeSession) => {
-    if (s.projectSlug !== projectSlug || s.taskSlug !== taskSlug) return;
+    if (!samePath(s.workspacePath, workspacePath)) return;
     if (attached.has(s.id)) return;
     const wrapper = (data: { path: string }) =>
       listener({ ...data, sessionId: s.id });
@@ -469,7 +468,7 @@ if (!globalThis.__wb_watchdog_interval) {
 // a real cold start — resume sessions that were mid-turn when the prior
 // server died. Deferred via setImmediate because sessions.ts ↔ fs.ts is a
 // circular import; calling reconcileSessionsOnDisk synchronously here can
-// TDZ-trip on PROJECTS_DIR depending on which module the loader entered first.
+// TDZ-trip on SESSIONS_ROOT depending on which module the loader entered first.
 //
 // Two guards:
 //   - globalThis.__wb_reconciled — per-VM-context dedupe (cheap)
@@ -683,14 +682,14 @@ export async function relayRemoteRunner(
 function createAgentQuery(
   runtime: SessionRuntime,
   opts: Record<string, unknown>,
-  context?: { projectSlug: string; taskSlug: string },
+  context?: { workspacePath: string[] },
 ): AgentQuery {
-  // The remote runtime needs project/task identity to forward to the
+  // The remote runtime needs the workspace identity to forward to the
   // controller (the cwd alone is just the workspace root). Inject here so
   // callers don't have to remember which runtimes need which extras.
   const withRemote =
     runtime === "remote" && context
-      ? { ...opts, remote: { project: context.projectSlug, task: context.taskSlug } }
+      ? { ...opts, remote: { workspacePath: context.workspacePath } }
       : opts;
   return getRuntime(runtime).query(withRemote as unknown as AgentQueryOptions);
 }
@@ -734,8 +733,7 @@ export function listLiveSessions(): SessionSummary[] {
       || (s.pendingCompletions?.size ?? 0) > 0;
     return {
       id: s.id,
-      projectSlug: s.projectSlug,
-      taskSlug: s.taskSlug,
+      workspacePath: s.workspacePath,
       state: s.state,
       title: s.title,
       startedAt: s.startedAt.toISOString(),
@@ -751,19 +749,34 @@ export function listLiveSessions(): SessionSummary[] {
   });
 }
 
-async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: string, liveIds: Set<string>): Promise<SessionSummary[]> {
-  const out: SessionSummary[] = [];
+// Walk SESSIONS_ROOT flat — every direct subdirectory is a session, and each
+// session's meta.json carries its workspace path. Sessions in the live
+// registry are skipped to avoid double-listing.
+export async function listAllSessions(): Promise<SessionSummary[]> {
+  const live = listLiveSessions();
+  const liveIds = new Set(live.map((s) => s.id));
+  const out: SessionSummary[] = [...live];
+
   let dirents: import("node:fs").Dirent[];
-  try { dirents = await fs.readdir(sessDir, { withFileTypes: true }); }
-  catch { return out; }
+  try { dirents = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true }); }
+  catch (err) {
+    // First boot before any sessions exist — fine. Anything else, log.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[listAllSessions] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
+    return out.sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1));
+  }
+
   for (const d of dirents) {
     if (!d.isDirectory() || liveIds.has(d.name)) continue;
     const id = d.name;
-    const metaPath = path.join(sessDir, id, "meta.json");
-    const inputPath = path.join(sessDir, id, "input.jsonl");
-    let meta: { startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
-    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { /* missing */ }
-    // Prefer generated name from meta.json; fall back to first message for legacy sessions
+    const sessDir = path.join(SESSIONS_ROOT, id);
+    const metaPath = path.join(sessDir, "meta.json");
+    const inputPath = path.join(sessDir, "input.jsonl");
+    let meta: { workspace?: string[]; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
+    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { continue; /* no meta → not a session */ }
+    const workspacePath = Array.isArray(meta.workspace) ? meta.workspace : [];
+    // Prefer generated name from meta.json; fall back to first message for legacy sessions.
     let title = meta.name ?? "(no message)";
     if (!meta.name) {
       try {
@@ -781,12 +794,11 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
     const completedAt = meta.completedAt ?? lastActivity;
     const unread = meta.completed === true ? false : (!meta.seenAt || meta.seenAt < completedAt);
     // Use persisted finalState if available (idle = done, error = error),
-    // otherwise fall back to "idle" (assume completed) for historical sessions
+    // otherwise fall back to "idle" (assume completed) for historical sessions.
     const state: SessionState = meta.finalState ?? "idle";
     out.push({
       id,
-      projectSlug,
-      taskSlug,
+      workspacePath,
       state,
       title,
       startedAt: meta.startedAt ?? lastActivity,
@@ -800,59 +812,25 @@ async function discoverFromDir(sessDir: string, projectSlug: string, taskSlug: s
       effort: meta.effort ?? null,
     });
   }
-  return out;
-}
-
-// Walk workspace for session folders so they persist across restarts.
-// Includes project-level sessions (`projects/<project>/sessions/`) and
-// task-level sessions (`projects/<project>/<task>/sessions/`).
-export async function listAllSessions(): Promise<SessionSummary[]> {
-  const live = listLiveSessions();
-  const liveIds = new Set(live.map((s) => s.id));
-  const projects = await listProjects();
-  const out: SessionSummary[] = [...live];
-
-  for (const p of projects) {
-    // Project-level sessions
-    out.push(...await discoverFromDir(
-      path.join(PROJECTS_DIR, p.folderName, "sessions"),
-      p.slug, "", liveIds,
-    ));
-    for (const t of p.tasks) {
-      out.push(...await discoverFromDir(
-        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-        p.slug, t.slug, liveIds,
-      ));
-    }
-  }
 
   out.sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1));
   return out;
 }
 
 // Read a historical session's events from the D1 cowork-sessions-marco table.
-// The projectSlug/taskSlug args remain for parity with the rest of the API but
-// are only used for the project/task existence check — events themselves are
-// keyed solely by session id.
+// The workspacePath arg is used only for the workspace existence check —
+// events themselves are keyed solely by session id.
 //
 // Pagination: offset is from the END (offset=0 = most recent `limit` events).
 export async function readSessionHistory(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   id: string,
   limit?: number,
   offset: number = 0,
 ): Promise<{ events: unknown[]; total: number; hasMore: boolean } | null> {
-  const project = await getProject(projectSlug);
-  if (!project) return null;
-  let eventsPath: string;
-  if (!taskSlug) {
-    eventsPath = path.join(PROJECTS_DIR, project.folderName, "sessions", id, "events.jsonl");
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return null;
-    eventsPath = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id, "events.jsonl");
-  }
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return null;
+  const eventsPath = path.join(sessionDir(id), "events.jsonl");
   // Tell the file backend where this stopped session's log lives, then read.
   registerSessionLog(id, eventsPath);
   try {
@@ -866,8 +844,7 @@ export async function readSessionHistory(
 // Restore a historical session from disk into the registry so it can be resumed.
 // Returns the restored session if successful, or null if not found.
 export async function restoreSession(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   id: string,
 ): Promise<RuntimeSession | null> {
   // Check if already in registry — fast path, no lock needed.
@@ -883,7 +860,7 @@ export async function restoreSession(
   const inflight = restoreInFlight.get(id);
   if (inflight) return inflight;
 
-  const promise = doRestoreSession(projectSlug, taskSlug, id);
+  const promise = doRestoreSession(workspacePath, id);
   restoreInFlight.set(id, promise);
   try {
     return await promise;
@@ -893,8 +870,7 @@ export async function restoreSession(
 }
 
 async function doRestoreSession(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   id: string,
 ): Promise<RuntimeSession | null> {
   // Re-check inside the lock — another caller may have populated the
@@ -902,23 +878,18 @@ async function doRestoreSession(
   const existing = registry.get(id);
   if (existing) return existing;
 
-  const project = await getProject(projectSlug);
-  if (!project) return null;
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return null;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return null;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", id);
-  }
+  // Sessions live flat in SESSIONS_ROOT — the directory no longer encodes
+  // the workspace, only the session id. The workspace path comes from meta.
+  const dir = sessionDir(id);
   // The agent's runtime cwd is always the workspace root (see startSession
   // comment). Stored on the RuntimeSession so resume keeps it consistent.
   const cwd = WORKSPACE_ROOT;
 
   // Read meta.json
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(dir, "meta.json");
   let meta: {
     name?: string;
     startedAt?: string;
@@ -944,7 +915,7 @@ async function doRestoreSession(
   // cloud-events.ts). Empty (file missing or backend unreachable) is fine —
   // the UI just won't have a replay buffer, and resume will pick up via the
   // SDK's own transcript anyway.
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
+  registerSessionLog(id, path.join(dir, "events.jsonl"));
   let history: SDKMessage[] = [];
   try {
     const { events } = await readSessionEvents(id);
@@ -967,8 +938,7 @@ async function doRestoreSession(
 
   const session: RuntimeSession = {
     id,
-    projectSlug,
-    taskSlug,
+    workspacePath,
     cwd,
     title: meta.name ?? "(untitled)",
     startedAt: meta.startedAt ? new Date(meta.startedAt) : new Date(),
@@ -1058,16 +1028,20 @@ function findPendingToolUses(history: SDKMessage[]): string[] {
   return [];
 }
 
-async function findRunningSessionsInDir(
-  sessDir: string,
-  projectSlug: string,
-  taskSlug: string,
-): Promise<Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }>> {
-  const out: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
+// Scan SESSIONS_ROOT for candidates the boot-time auto-resume pass should
+// pick up: sessions whose previous worker died mid-turn (`running`) or
+// mid-resume (`resuming`), excluding remote (Docker) sessions and any whose
+// in-memory pending-prompt state would be lost. The workspace path is read
+// from each meta.json — no path traversal needed.
+async function findRunningSessions(): Promise<Array<{ workspacePath: string[]; id: string; sdkSessionId: string }>> {
+  const out: Array<{ workspacePath: string[]; id: string; sdkSessionId: string }> = [];
   let dirents: import("node:fs").Dirent[];
   try {
-    dirents = await fs.readdir(sessDir, { withFileTypes: true });
-  } catch {
+    dirents = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[auto-resume] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
     return out;
   }
   for (const d of dirents) {
@@ -1075,7 +1049,7 @@ async function findRunningSessionsInDir(
     // Skip sessions already in the registry — they're still live (preserved
     // via globalThis during HMR) and don't need resume.
     if (registry.has(d.name)) continue;
-    const metaPath = path.join(sessDir, d.name, "meta.json");
+    const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
     try {
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
       // sdkSessionId is required: resume() needs it to find the SDK's
@@ -1100,8 +1074,14 @@ async function findRunningSessionsInDir(
         && !meta.hasPendingPrompt
         && meta.sdkSessionId
         && meta.runtime !== "remote"
+        && Array.isArray(meta.workspace)
+        && meta.workspace.length > 0
       ) {
-        out.push({ projectSlug, taskSlug, id: d.name, sdkSessionId: meta.sdkSessionId });
+        out.push({
+          workspacePath: meta.workspace,
+          id: d.name,
+          sdkSessionId: meta.sdkSessionId,
+        });
       }
     } catch { /* skip unreadable meta */ }
   }
@@ -1145,28 +1125,7 @@ export async function autoResumeRunningSessions(): Promise<{ resumed: number; fa
 }
 
 async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
-  let projects;
-  try {
-    projects = await listProjects();
-  } catch (err) {
-    console.warn(`[auto-resume] could not list projects:`, (err as Error).message);
-    return { resumed: 0, failed: 0 };
-  }
-
-  const candidates: Array<{ projectSlug: string; taskSlug: string; id: string; sdkSessionId: string }> = [];
-  for (const p of projects) {
-    candidates.push(...await findRunningSessionsInDir(
-      path.join(PROJECTS_DIR, p.folderName, "sessions"),
-      p.slug, "",
-    ));
-    for (const t of p.tasks) {
-      candidates.push(...await findRunningSessionsInDir(
-        path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-        p.slug, t.slug,
-      ));
-    }
-  }
-
+  const candidates = await findRunningSessions();
   if (candidates.length === 0) return { resumed: 0, failed: 0 };
   console.log(`[auto-resume] Found ${candidates.length} session(s) to resume`);
 
@@ -1175,13 +1134,13 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
   let skipped = 0;
   for (const c of candidates) {
     try {
-      const own = await inspectOwnership(c.projectSlug, c.taskSlug, c.id, c.sdkSessionId);
+      const own = await inspectOwnership(c.workspacePath, c.id, c.sdkSessionId);
       if (own.ownedByOther) {
         skipped++;
         console.log(`[auto-resume] ${c.id}: owned by another worker — skip`);
         continue;
       }
-      const s = await restoreSession(c.projectSlug, c.taskSlug, c.id);
+      const s = await restoreSession(c.workspacePath, c.id);
       if (!s) { failed++; continue; }
       // Belt-and-braces: clear finalState so a concurrent worker that hasn't
       // seen our ownerPid yet doesn't double-claim this candidate.
@@ -1190,7 +1149,7 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
       const ok = await resumeSession(s, RESUME_PROMPT, "autoResume");
       if (ok) {
         resumed++;
-        console.log(`[auto-resume] Resumed session ${c.id} (${c.projectSlug}/${c.taskSlug})`);
+        console.log(`[auto-resume] Resumed session ${c.id} (${c.workspacePath.join("/")})`);
       } else {
         failed++;
       }
@@ -1204,8 +1163,8 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
 }
 
 export interface StartSessionParams {
-  projectSlug: string;
-  taskSlug: string;
+  /** Slug-chain identifying the workspace this session lives in. */
+  workspacePath: string[];
   firstMessage: string;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model?: string;
@@ -1215,6 +1174,14 @@ export interface StartSessionParams {
   openArtifact?: string;
   /** Files attached to the first message (already uploaded under <folder>/files). */
   files?: FileAttachmentInfo[];
+  /**
+   * When true, the session is the planning chat for a NEW child workspace
+   * under `workspacePath`. The agent gets the planning system prompt plus the
+   * `propose_workspace` MCP tool that the Chat UI watches for. The workspace
+   * the session belongs to is the parent — the child being planned doesn't
+   * exist yet.
+   */
+  planning?: boolean;
 }
 
 // Fold first-message attachments into the prompt: non-image files become
@@ -1250,30 +1217,29 @@ async function buildAttachmentMessage(
 
 export async function startSession(p: StartSessionParams): Promise<RuntimeSession> {
   const runtime: SessionRuntime = p.runtime ?? "claude";
-  const project = await getProject(p.projectSlug);
-  const task = await getTask(p.projectSlug, p.taskSlug);
-  if (!project || !task) throw new Error("unknown project/task");
+  const ws = await getWorkspace(p.workspacePath);
+  if (!ws) throw new Error(`unknown workspace ${p.workspacePath.join("/")}`);
 
   const id = `${new Date().toISOString().replace(/[:.]/g, "-")}--${randomUUID().slice(0, 6)}`;
   const name = generateSessionLabel(p.firstMessage);
-  // The agent runs with cwd = workspace root so CLAUDE.md / GEMINI.md at
-  // the root are picked up by the runtime, and the agent has full access
-  // to the projects/ tree without needing additionalDirectories. The
-  // task identity + path is supplied via the system prompt (see
-  // sessions/prompts.ts). Session persistence (events.jsonl, meta.json)
-  // still lives under the task folder.
+  // The agent runs with cwd = workspace root so CLAUDE.md / GEMINI.md at the
+  // root are picked up by the runtime, and the agent has full access to the
+  // projects/ tree without needing additionalDirectories. The workspace
+  // identity + path is supplied via the system prompt (see
+  // sessions/prompts.ts). Session persistence (events.jsonl, meta.json) lives
+  // in a flat SESSIONS_ROOT (see fs.ts) — meta.json carries the workspace
+  // path so the directory name doesn't need to encode it.
   const cwd = WORKSPACE_ROOT;
-  const sessionDir = path.join(taskDir(project, task), "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
+  const dir = sessionDir(id);
+  await fs.mkdir(dir, { recursive: true });
 
   await fs.writeFile(
-    path.join(sessionDir, "meta.json"),
+    path.join(dir, "meta.json"),
     JSON.stringify(
       {
         id,
         name,
-        project: p.projectSlug,
-        task: p.taskSlug,
+        workspace: p.workspacePath,
         cwd,
         startedAt: new Date().toISOString(),
         permissionMode: p.permissionMode ?? "bypassPermissions",
@@ -1290,8 +1256,8 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     ),
   );
 
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
-  const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+  registerSessionLog(id, path.join(dir, "events.jsonl"));
+  const inputLog = createWriteStream(path.join(dir, "input.jsonl"), { flags: "a" });
 
   const input = new InputChannel();
   const events = new EventEmitter();
@@ -1304,10 +1270,11 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // <system-reminder> with its path so the agent knows what the user is
   // looking at from turn 1. Keep `firstMessage` raw in the session record so
   // auto-titling and labels use the user's actual prompt.
+  const filesDir = path.join(workspaceDir(ws), "files");
   const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
     p.firstMessage,
     p.files,
-    path.join(taskDir(project, task), "files"),
+    filesDir,
   );
   const augmentedFirstMessage = p.openArtifact
     ? withOpenArtifactNote(firstWithFiles, p.openArtifact)
@@ -1318,7 +1285,24 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage, files: p.files }) + "\n");
   input.push(firstMsg);
 
-  const systemPrompt = await buildContextSystemPrompt(p.projectSlug, p.taskSlug, name);
+  // Planning mode swaps the regular context prompt for the claude_code preset
+  // with the planning instructions appended, and merges the planning MCP
+  // (propose_workspace) into the static workbench MCPs so the chat UI can
+  // render the proposal as an inline card.
+  const planningAppend = p.planning
+    ? buildWorkspacePlanningSystemPrompt(
+        ws.path,
+        ws.overview,
+        ws.children.map((c) => c.slug),
+      )
+    : null;
+  const systemPrompt = planningAppend
+    ? { type: "preset" as const, preset: "claude_code" as const, append: planningAppend }
+    : await buildContextSystemPrompt(p.workspacePath, name);
+  const planningMcps = p.planning
+    ? { "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildWorkspacePlanningTools()) }
+    : {};
+
   const q = createAgentQuery(runtime, {
     prompt: input,
     options: {
@@ -1333,23 +1317,21 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       // connect/disconnect) wrapped for Claude here. Gemini's runtime
       // adapter consumes workbenchToolGroups instead, registering them
       // into gemini-cli-core's ToolRegistry.
-      mcpServers: await buildStaticWorkbenchMcps(id, p.projectSlug, p.taskSlug),
-      workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, p.taskSlug),
-      runtimeStateDir: sessionDir,
+      mcpServers: { ...(await buildStaticWorkbenchMcps(id, p.workspacePath)), ...planningMcps },
+      workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.workspacePath),
+      runtimeStateDir: dir,
       systemPrompt,
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
     },
-    // RemoteRuntime needs project/task to provision a container against the
-    // right task folder. Other runtimes ignore this block.
-    remote: { project: p.projectSlug, task: p.taskSlug },
-  });
+    // RemoteRuntime needs the workspace to provision a container against the
+    // right folder. Other runtimes ignore this block.
+  }, { workspacePath: p.workspacePath });
 
   const now = new Date();
   const session: RuntimeSession = {
     id,
-    projectSlug: p.projectSlug,
-    taskSlug: p.taskSlug,
+    workspacePath: p.workspacePath,
     cwd,
     title: name,
     startedAt: now,
@@ -1869,216 +1851,98 @@ function setState(s: RuntimeSession, state: SessionState) {
   }
 }
 
-// Called from fs.ts after a task or project is moved/renamed. Keeps the
-// in-memory session entries' (projectSlug, taskSlug) labels in sync with the
-// new folder names so the UI continues to find them.
-export function relocateSessionsForTask(
-  oldProject: string,
-  oldTask: string,
-  newProject: string,
-  newTask: string,
-): void {
+// Called from fs.ts after a workspace is moved/renamed. With flat session
+// storage, meta.json is the source of truth for which workspace a session
+// belongs to — so the in-memory registry update is no longer enough on its
+// own; we also walk every session meta on disk and rewrite paths whose first
+// `oldPath.length` segments match `oldPath`, splicing the new prefix in.
+// That handles both renames at depth and moves of an entire subtree (every
+// session under the moved workspace, including grand-children, gets fixed).
+export async function relocateSessionsForWorkspace(
+  oldPath: string[],
+  newPath: string[],
+): Promise<void> {
+  // In-memory registry first — live sessions need their workspacePath fixed
+  // before any subsequent registry walks (subscribeFileChanges, listLiveSessions)
+  // would emit a stale path.
   for (const s of registry.values()) {
-    if (s.projectSlug === oldProject && s.taskSlug === oldTask) {
-      s.projectSlug = newProject;
-      s.taskSlug = newTask;
+    const m = matchPrefix(s.workspacePath, oldPath);
+    if (m) s.workspacePath = [...newPath, ...m];
+  }
+  await rewriteSessionMetas((meta) => {
+    if (!Array.isArray(meta.workspace)) return false;
+    const m = matchPrefix(meta.workspace, oldPath);
+    if (!m) return false;
+    meta.workspace = [...newPath, ...m];
+    return true;
+  });
+}
+
+// Returns the suffix `path` has after `prefix`, or null when path doesn't
+// start with prefix.
+function matchPrefix(path: string[], prefix: string[]): string[] | null {
+  if (path.length < prefix.length) return null;
+  for (let i = 0; i < prefix.length; i++) {
+    if (path[i] !== prefix[i]) return null;
+  }
+  return path.slice(prefix.length);
+}
+
+// Iterate every session on disk, hand its meta to `mutate`, and persist if
+// `mutate` returned true. Best effort — individual failures are logged but
+// don't abort the walk so a single corrupted meta.json can't strand all the
+// others mid-rename.
+async function rewriteSessionMetas(
+  mutate: (meta: { workspace?: string[]; [k: string]: unknown }) => boolean,
+): Promise<void> {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[relocate] could not read ${SESSIONS_ROOT}:`, (err as Error).message);
+    }
+    return;
+  }
+  for (const d of entries) {
+    if (!d.isDirectory()) continue;
+    const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
+    let meta: { workspace?: string[]; [k: string]: unknown };
+    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); }
+    catch { continue; }
+    if (!mutate(meta)) continue;
+    try { await fs.writeFile(metaPath, JSON.stringify(meta, null, 2)); }
+    catch (err) {
+      console.warn(`[relocate] could not rewrite ${metaPath}:`, (err as Error).message);
     }
   }
 }
 
-export function relocateSessionsForProject(oldProject: string, newProject: string): void {
-  for (const s of registry.values()) {
-    if (s.projectSlug === oldProject) s.projectSlug = newProject;
-  }
-}
-
-// Move a project-level session into a task's sessions folder. Used by the
-// "New task" planning flow: when the user accepts the proposed task, the
-// session that produced the plan moves from `projects/<p>/sessions/<id>/` to
-// `projects/<p>/<task>/sessions/<id>/` so it lives with the task it created.
-// Open log fd's survive the directory rename on POSIX, so streams keep
-// writing to the moved location without needing to be reopened.
-export async function moveSessionToTask(
+// Move a session into a different workspace. Used by the New-Workspace
+// planning flow: when the user accepts the proposed child, the session that
+// produced the plan adopts that child so it lives with the workspace it
+// created.
+//
+// With flat session storage the on-disk directory doesn't change — only the
+// `workspace` field in meta.json (and the in-memory registry entry) needs to
+// be updated. The agent's open log fds keep writing to the same path either
+// way.
+export async function moveSessionToWorkspace(
   sessionId: string,
-  newTaskSlug: string,
+  newWorkspacePath: string[],
 ): Promise<boolean> {
   const s = registry.get(sessionId);
   if (!s) return false;
-  if (s.taskSlug === newTaskSlug) return true;
+  if (samePath(s.workspacePath, newWorkspacePath)) return true;
 
-  const project = await getProject(s.projectSlug);
-  if (!project) return false;
-  const newTask = project.tasks.find((t) => t.slug === newTaskSlug);
-  if (!newTask) return false;
+  const target = await getWorkspace(newWorkspacePath);
+  if (!target) return false;
 
-  const oldDir = s.taskSlug
-    ? path.join(PROJECTS_DIR, project.folderName, project.tasks.find((t) => t.slug === s.taskSlug)?.folderName ?? "", "sessions", sessionId)
-    : path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  const newDir = path.join(PROJECTS_DIR, project.folderName, newTask.folderName, "sessions", sessionId);
-
-  try {
-    await fs.mkdir(path.dirname(newDir), { recursive: true });
-    await fs.rename(oldDir, newDir);
-  } catch (err) {
-    console.warn(`[moveSessionToTask] failed to move ${oldDir} → ${newDir}:`, (err as Error).message);
-    return false;
-  }
-
-  s.taskSlug = newTaskSlug;
+  s.workspacePath = newWorkspacePath;
   await updateMeta(s, (meta) => {
-    meta.task = newTaskSlug;
+    meta.workspace = newWorkspacePath;
   });
   return true;
-}
-
-// Project-level session — cwd is the project folder, sessions persist to
-// `projects/<project>/sessions/<id>/`. Uses the same on-disk layout as task
-// sessions but at one level up.
-//
-// `planning` opts the session into the create-project / create-task chat
-// flow: instead of the standard project-context system prompt + static
-// workbench tools, the agent gets the planning system prompt and the
-// `propose_plan` / `propose_task` MCP tool that the Chat UI watches for.
-// Everything else (persistence, sidebar listing, resume) behaves exactly
-// like a normal session.
-export async function startProjectSession(p: { projectSlug: string; firstMessage: string; permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan"; model?: string; effort?: EffortLevel; runtime?: SessionRuntime; planning?: "project" | "task"; openArtifact?: string; files?: FileAttachmentInfo[] }): Promise<RuntimeSession> {
-  const runtime: SessionRuntime = p.runtime ?? "claude";
-  const project = await getProject(p.projectSlug);
-  if (!project) throw new Error("unknown project");
-
-  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}--${randomUUID().slice(0, 6)}`;
-  const name = generateSessionLabel(p.firstMessage);
-  // Agent runs at workspace root; project identity + path comes via the
-  // system prompt. See startSession comment.
-  const cwd = WORKSPACE_ROOT;
-  const sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", id);
-  await fs.mkdir(sessionDir, { recursive: true });
-
-  await fs.writeFile(
-    path.join(sessionDir, "meta.json"),
-    JSON.stringify({
-      id,
-      name,
-      project: p.projectSlug,
-      task: "",
-      cwd,
-      startedAt: new Date().toISOString(),
-      permissionMode: p.permissionMode ?? "bypassPermissions",
-      model: p.model ?? null,
-      effort: p.effort ?? null,
-      runtime,
-      finalState: "running",
-    }, null, 2),
-  );
-
-  registerSessionLog(id, path.join(sessionDir, "events.jsonl"));
-  const inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
-
-  const input = new InputChannel();
-  const events = new EventEmitter();
-  events.setMaxListeners(0);
-  const pendingPermissions = new Map<string, PendingPermission>();
-  const pendingQuestions = new Map<string, PendingQuestion>();
-  const pendingCompletions = new Map<string, PendingCompletion>();
-
-  // See startSession — augment with the open-artifact hint while keeping the
-  // raw user prompt in the session record for auto-titling.
-  const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
-    p.firstMessage,
-    p.files,
-    path.join(PROJECTS_DIR, project.folderName, "files"),
-  );
-  const augmentedFirstMessage = p.openArtifact
-    ? withOpenArtifactNote(firstWithFiles, p.openArtifact)
-    : firstWithFiles;
-  const firstMsg = firstImages.length > 0
-    ? makeUserMessageWithImages(augmentedFirstMessage, firstImages, id)
-    : makeUserMessage(augmentedFirstMessage, id);
-  inputLog.write(JSON.stringify({ at: new Date().toISOString(), text: augmentedFirstMessage, files: p.files }) + "\n");
-  input.push(firstMsg);
-
-  // Project-level sessions only get project.md context (no task). Comments
-  // and other workbench tools scope to project-level (empty taskSlug); the
-  // comments tool operates on project-level .comments.json in that case.
-  //
-  // Planning mode swaps the project-context prompt for the claude_code preset
-  // with the planning instructions appended, and merges the planning MCP
-  // (propose_plan / propose_task) into the static workbench MCPs so the chat
-  // UI can render the proposal as an inline card.
-  const planningAppend = p.planning === "task"
-    ? buildTaskPlanningSystemPrompt(
-        project.slug,
-        project.folderName,
-        project.overview,
-        project.tasks.map((t) => t.slug),
-      )
-    : p.planning === "project"
-      ? PLANNING_SYSTEM_PROMPT
-      : null;
-  const systemPrompt = planningAppend
-    ? { type: "preset" as const, preset: "claude_code" as const, append: planningAppend }
-    : await buildContextSystemPrompt(p.projectSlug, "", name);
-  const planningMcps = p.planning === "task"
-    ? { "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildTaskPlanningTools()) }
-    : p.planning === "project"
-      ? { "workbench-planning": workbenchToolsAsClaudeMcp("workbench-planning", buildPlanningTools()) }
-      : {};
-  const q = createAgentQuery(runtime, {
-    prompt: input,
-    options: {
-      cwd,
-      permissionMode: p.permissionMode ?? "bypassPermissions",
-      settingSources: ["project", "user"],
-      canUseTool: buildCanUseTool(pendingPermissions, events),
-      toolAliases: STATIC_TOOL_ALIASES,
-      mcpServers: { ...(await buildStaticWorkbenchMcps(id, p.projectSlug, "")), ...planningMcps },
-      workbenchToolGroups: buildStaticWorkbenchToolGroups(id, p.projectSlug, ""),
-      runtimeStateDir: sessionDir,
-      systemPrompt,
-      ...(p.model ? { model: p.model } : {}),
-      ...(p.effort ? { effort: p.effort } : {}),
-    },
-    remote: { project: p.projectSlug, task: "" },
-  });
-
-  const now = new Date();
-  const firstUserEcho = firstMsg;
-  const session: RuntimeSession = {
-    id,
-    projectSlug: p.projectSlug,
-    taskSlug: "",
-    cwd,
-    title: name,
-    startedAt: now,
-    lastActivity: now,
-    seenAt: null, // New session — never seen
-    completedAt: null, // Not completed yet
-    q,
-    input,
-    events,
-    inputLog,
-    history: [firstUserEcho],
-    seq: 0,
-    streamingText: "",
-    state: "running",
-    pendingPermissions,
-    pendingQuestions,
-    pendingCompletions,
-    completed: false,
-    sdkSessionId: null,
-    permissionMode: p.permissionMode ?? "bypassPermissions",
-    model: p.model ?? null,
-    effort: p.effort ?? null,
-    runtime,
-    firstMessage: p.firstMessage,
-    autoTitleAttempted: false,
-  };
-  registerSession(session);
-  void persistOwnerPid(session);
-  appendEvent(session.id, session.seq++, firstUserEcho);
-  session.events.emit("event", firstUserEcho);
-  void pumpEvents(session);
-  return session;
 }
 
 // Wrap the user's text with a hidden <system-reminder> note about the artifact
@@ -2148,8 +2012,7 @@ export async function sendInputWithFiles(
   id: string,
   text: string,
   files: FileAttachmentInfo[],
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   openArtifact?: string
 ): Promise<boolean> {
   const s = registry.get(id);
@@ -2182,20 +2045,17 @@ export async function sendInputWithFiles(
   // Read images and convert to base64
   const images: ImageContent[] = [];
   if (imageFiles.length > 0) {
-    const project = await getProject(projectSlug);
-    if (project) {
-      const task = project.tasks.find((t) => t.slug === taskSlug);
-      if (task) {
-        const filesDir = path.join(taskDir(project, task), "files");
-        for (const imgFile of imageFiles) {
-          try {
-            const imgPath = path.join(filesDir, imgFile.path);
-            const data = await fs.readFile(imgPath);
-            const base64 = data.toString("base64");
-            images.push({ mimeType: imgFile.mimeType, base64 });
-          } catch (err) {
-            console.error(`Failed to read image ${imgFile.path}:`, err);
-          }
+    const ws = await getWorkspace(workspacePath);
+    if (ws) {
+      const filesDir = path.join(workspaceDir(ws), "files");
+      for (const imgFile of imageFiles) {
+        try {
+          const imgPath = path.join(filesDir, imgFile.path);
+          const data = await fs.readFile(imgPath);
+          const base64 = data.toString("base64");
+          images.push({ mimeType: imgFile.mimeType, base64 });
+        } catch (err) {
+          console.error(`Failed to read image ${imgFile.path}:`, err);
         }
       }
     }
@@ -2283,7 +2143,7 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   // transcript (the bug that produced 8 drafts from one "make 4 calendar
   // holds" request). Bail with a user-visible error. Otherwise reclaim
   // any leftover SDK subprocesses before we spawn the replacement.
-  const own = await inspectOwnership(s.projectSlug, s.taskSlug, s.id, s.sdkSessionId);
+  const own = await inspectOwnership(s.workspacePath, s.id, s.sdkSessionId);
   if (own.ownedByOther) {
     console.warn(`[resumeSession] ${s.id} aborting — owned by another worker`);
     const errMsg = {
@@ -2344,22 +2204,17 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   }
 
   try {
-    // Re-open the log files for appending
-    const project = await getProject(s.projectSlug);
-    if (!project) throw new Error("Project not found");
+    // Re-open the log files for appending. Workspace lookup is still
+    // performed for validation (it's used downstream for prompts/MCPs) but
+    // no longer determines the on-disk session location.
+    const ws = await getWorkspace(s.workspacePath);
+    if (!ws) throw new Error("Workspace not found");
 
-    let sessionDir: string;
-    if (!s.taskSlug) {
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-    } else {
-      const task = project.tasks.find((t) => t.slug === s.taskSlug);
-      if (!task) throw new Error("Task not found");
-      sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
-    }
+    const dir = sessionDir(s.id);
 
     // Re-create log streams
-    registerSessionLog(s.id, path.join(sessionDir, "events.jsonl"));
-    s.inputLog = createWriteStream(path.join(sessionDir, "input.jsonl"), { flags: "a" });
+    registerSessionLog(s.id, path.join(dir, "events.jsonl"));
+    s.inputLog = createWriteStream(path.join(dir, "input.jsonl"), { flags: "a" });
 
     // Create a new input channel
     s.input = new InputChannel();
@@ -2380,7 +2235,7 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
       s.events.emit("event", notice);
     }
 
-    const systemPrompt = await buildContextSystemPrompt(s.projectSlug, s.taskSlug);
+    const systemPrompt = await buildContextSystemPrompt(s.workspacePath);
 
     // Create new query, re-using the session's existing pendingPermissions
     // map + events emitter so a permission request emitted mid-resume reaches
@@ -2392,22 +2247,21 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
       options: {
         // s.cwd is set to WORKSPACE_ROOT for new sessions; for old
         // sessions resumed from disk, force-override since their stored
-        // cwd may be the task folder (pre-refactor).
+        // cwd may be the workspace folder (pre-refactor).
         cwd: WORKSPACE_ROOT,
         ...(canResume ? { resume: s.sdkSessionId! } : {}),
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],
         canUseTool: buildCanUseTool(s.pendingPermissions, s.events),
         toolAliases: STATIC_TOOL_ALIASES,
-        mcpServers: await buildStaticWorkbenchMcps(s.id, s.projectSlug, s.taskSlug),
-        workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.projectSlug, s.taskSlug),
-        runtimeStateDir: sessionDir,
+        mcpServers: await buildStaticWorkbenchMcps(s.id, s.workspacePath),
+        workbenchToolGroups: buildStaticWorkbenchToolGroups(s.id, s.workspacePath),
+        runtimeStateDir: dir,
         systemPrompt,
         ...(s.model ? { model: s.model } : {}),
         ...(s.effort ? { effort: s.effort } : {}),
       },
-      remote: { project: s.projectSlug, task: s.taskSlug },
-    });
+    }, { workspacePath: s.workspacePath });
 
     // Check if there are pending tool_uses without tool_results.
     // If so, inject synthetic tool_results first so the conversation is valid.
@@ -2572,8 +2426,7 @@ export async function retrySession(id: string): Promise<boolean> {
 // Also updates the in-memory seenAt for live sessions.
 // Returns true if successful, false if session not found.
 export async function markSessionSeen(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<boolean> {
   const now = new Date();
@@ -2591,19 +2444,10 @@ export async function markSessionSeen(
   }
 
   // Dead session (not in registry): no other writer can race, direct write is fine.
-  const project = await getProject(projectSlug);
-  if (!project) return false;
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2622,8 +2466,7 @@ export async function markSessionSeen(
 // and completed, in which case the UI offers Reopen; sending another message
 // auto-unmarks (see sendInput / sendInputWithFiles / resumeSession).
 export async function markSessionCompleted(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
   value: boolean,
 ): Promise<boolean> {
@@ -2648,19 +2491,10 @@ export async function markSessionCompleted(
   }
 
   // Dead session (not in registry): no other writer can race, direct write is fine.
-  const project = await getProject(projectSlug);
-  if (!project) return false;
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2678,8 +2512,7 @@ export async function markSessionCompleted(
 // Rename a session by updating its meta.json `name` field.
 // Also updates the in-memory title for live sessions.
 export async function renameSession(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
   newName: string,
 ): Promise<boolean> {
@@ -2691,19 +2524,10 @@ export async function renameSession(
     liveSession.title = trimmedName;
   }
 
-  const project = await getProject(projectSlug);
-  if (!project) return !!liveSession; // Return true if we at least updated in-memory
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return !!liveSession; // Return true if we at least updated in-memory
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
-  const metaPath = path.join(sessionDir, "meta.json");
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
@@ -2718,8 +2542,7 @@ export async function renameSession(
 // Delete a session by removing its entire directory.
 // Returns true if successful, false if session not found or still running.
 export async function deleteSession(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<boolean> {
   // Check if session is in registry
@@ -2740,22 +2563,14 @@ export async function deleteSession(
     registry.delete(sessionId);
   }
 
-  const project = await getProject(projectSlug);
-  if (!project) return false;
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return false;
 
-  let sessionDir: string;
-  if (!taskSlug) {
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  } else {
-    const task = project.tasks.find((t) => t.slug === taskSlug);
-    if (!task) return false;
-    sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
-  }
-
+  const dir = sessionDir(sessionId);
   try {
     // Check directory exists before attempting delete
-    await fs.access(sessionDir);
-    await fs.rm(sessionDir, { recursive: true, force: true });
+    await fs.access(dir);
+    await fs.rm(dir, { recursive: true, force: true });
     return true;
   } catch {
     return false;

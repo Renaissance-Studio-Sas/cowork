@@ -4,7 +4,7 @@ import { workspace } from "./routes/workspace";
 import { files } from "./routes/files";
 import { plan } from "./routes/plan";
 import { fileEvents } from "./routes/file-events";
-import { projects } from "./routes/projects";
+import { workspaces } from "./routes/workspaces";
 import { sessions } from "./routes/sessions";
 
 // Builds the Node Hono app with the API mounted under /api/*. Kept separate from
@@ -23,7 +23,10 @@ export function api(): Hono {
   app.route("/api/files", files);
   app.route("/api/plan", plan);
   app.route("/api/file-events", fileEvents);
-  app.route("/api/projects", projects);
+  // The recursive workspace model replaces the old (project, task) pair. The
+  // routes accept the slug-chain as a splat (URL-encoded segments joined with
+  // `/`), so e.g. POST /api/workspaces/HR creates a child under HR.
+  app.route("/api/workspaces", workspaces);
   app.route("/api/sessions", sessions);
 
   // Unknown /api path → 404 (don't fall through to the SPA shell, which would

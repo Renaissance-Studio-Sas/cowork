@@ -9,10 +9,8 @@
 
 import { useState } from "react";
 import { useRouter } from "@/lib/navigation";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import type { SessionSummaryDTO } from "@/lib/types";
-import { taskRoute, projectRoute } from "@/lib/routes";
+import { workspaceRoute } from "@/lib/routes";
 import type { PendingQuestionItem } from "./types";
 import { Markdown } from "./Markdown";
 
@@ -310,21 +308,17 @@ export function CompleteToggleButton({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
           completed: nextCompleted,
         }),
       });
       // The SSE `completed_changed` event will flip the local state.
-      // After marking complete, drop the user back at the task/project view —
+      // After marking complete, drop the user back at the workspace view —
       // the session is closed, so the session page is no longer the right
       // place to be. Reopen stays on the session page so the user can keep
       // working.
-      if (nextCompleted) {
-        const base = session.taskSlug
-          ? taskRoute(session.projectSlug, session.taskSlug)
-          : projectRoute(session.projectSlug);
-        router.push(base);
+      if (nextCompleted && session.workspacePath.length > 0) {
+        router.push(workspaceRoute(session.workspacePath));
       }
     } finally {
       setBusy(false);
@@ -394,8 +388,7 @@ export function CompletionSuggestionCard({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
           completed: approved,
           requestId,
         }),
@@ -406,13 +399,10 @@ export function CompletionSuggestionCard({
         return;
       }
       // SSE completion_resolved clears the card; completed_changed flips the badge.
-      // On approval, navigate to the base view — the session is wrapped up.
+      // On approval, navigate to the workspace view — the session is wrapped up.
       // Dismiss keeps the user on the session so they can keep iterating.
-      if (approved) {
-        const base = session.taskSlug
-          ? taskRoute(session.projectSlug, session.taskSlug)
-          : projectRoute(session.projectSlug);
-        router.push(base);
+      if (approved && session.workspacePath.length > 0) {
+        router.push(workspaceRoute(session.workspacePath));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

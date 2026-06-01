@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { relocateSessionsForProject, relocateSessionsForTask } from "./sessions";
+import { relocateSessionsForWorkspace } from "./sessions";
 
 // Workspace root: the user's own repo / folder that contains `projects/` plus any
 // shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get read/write
@@ -14,24 +14,38 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
   ? path.resolve(process.env.WORKSPACE_ROOT)
   : path.resolve(process.cwd(), "..", "..");
 
-// Directory holding project folders. Active projects have a bare folder
-// name (`<slug>/`); archived projects carry a ` [Archived]` suffix
-// (`<slug> [Archived]/`). Same convention nests recursively for tasks.
-// Convention: <WORKSPACE_ROOT>/projects/<project>/<task>/{files,sessions,task.json}
+// Top-level directory containing all workspaces. The name `projects/` is
+// preserved for backward compatibility with existing user data and to avoid
+// clashing with the `WORKSPACE_ROOT` env-var name — what was the parent of
+// (project, task) on disk is the parent of arbitrarily-nested workspaces now.
+// Convention: <WORKSPACE_ROOT>/projects/<workspace>/{files,workspace.json,<child>/...}
 export const PROJECTS_DIR = path.join(WORKSPACE_ROOT, "projects");
+
+// Flat directory holding ALL session data — one folder per session id, no
+// per-workspace nesting. Each session's meta.json records its own workspace
+// path so the directory name doesn't need to encode it.
+//
+// Defaults to `~/git/cowork-sessions`; override with COWORK_SESSIONS_ROOT.
+export const SESSIONS_ROOT = process.env.COWORK_SESSIONS_ROOT
+  ? path.resolve(process.env.COWORK_SESSIONS_ROOT)
+  : path.join(process.env.HOME || os.homedir(), "git", "cowork-sessions");
+
+// Path to a single session's directory (where meta.json, events.jsonl, and
+// input.jsonl live).
+export function sessionDir(id: string): string {
+  return path.join(SESSIONS_ROOT, id);
+}
 
 export type Status = "active" | "archived";
 
-// Suffix that marks a project/task folder as archived. Written with a
+// Suffix that marks a workspace folder as archived. Written with a
 // leading space so the bare slug stays readable in `ls` output.
 export const ARCHIVED_SUFFIX = " [Archived]";
 
-// Brief filenames. Projects/tasks each have a JSON brief inside `files/`
-// with shape `{ overview, details, createdAt }`. `overview` is a one-line
-// summary shown at the top of the page; `details` is markdown rendered
-// below it.
-export const PROJECT_BRIEF_FILENAME = "project.json";
-export const TASK_BRIEF_FILENAME = "task.json";
+// Each workspace has a JSON brief inside `files/` with shape
+// `{ overview, details, createdAt }`. `overview` is a one-line summary shown
+// at the top of the page; `details` is markdown rendered below it.
+export const WORKSPACE_BRIEF_FILENAME = "workspace.json";
 
 export interface Brief {
   overview: string;
@@ -39,24 +53,34 @@ export interface Brief {
   createdAt: string;   // ISO timestamp
 }
 
-export interface Project {
-  slug: string;            // bare slug, without archived suffix
-  folderName: string;      // e.g. "Buy in Paris" or "Buy in Paris [Archived]"
+// A unit of work — what used to be a `Project` or a `Task`, unified.
+// Workspaces are nestable: every workspace can hold child workspaces in turn.
+// The on-disk layout mirrors the tree: `projects/A/B/C/` is a workspace `C`
+// whose ancestor chain is `["A", "B"]`. The repo's old 2-level convention
+// (projects → tasks) becomes one of many possible depths.
+export interface Workspace {
+  slug: string;            // bare slug, without any archived suffix
+  folderName: string;      // basename on disk (may carry ARCHIVED_SUFFIX)
+  // Full slug-chain from the top-level workspace down to and including this
+  // one. `["HR", "pay-contractors"]` identifies the workspace previously
+  // known as task `pay-contractors` of project `HR`. Used as the workspace
+  // identifier in session metas, URLs, and APIs.
+  path: string[];
+  // Filesystem ancestor folder names, one per segment of `path`. Carries the
+  // ` [Archived]` suffix per-segment so a parent's archived state is
+  // distinguishable. `workspaceDir(ws)` reconstructs the on-disk path from
+  // this.
+  folderPath: string[];
   status: Status;
   overview: string;
   details: string;
   createdAt: string;
-  tasks: Task[];
+  children: Workspace[];
 }
 
-export interface Task {
-  slug: string;
-  folderName: string;
-  projectSlug: string;
-  status: Status;
-  overview: string;
-  details: string;
-  createdAt: string;
+// Resolved on-disk directory for a workspace.
+export function workspaceDir(ws: Workspace): string {
+  return path.join(PROJECTS_DIR, ...ws.folderPath);
 }
 
 // Legacy prefix pattern. Folders created before the switch to the
@@ -66,8 +90,8 @@ export interface Task {
 const LEGACY_PREFIX_RE = /^(wip|done)-(.+)$/;
 
 // Parse a folder name into { status, slug }. Returns null for entries
-// that aren't project/task folders (dotfiles, the bootstrap `files/` /
-// `sessions/` dirs, etc.). Skipping is the caller's responsibility.
+// that aren't workspace folders (dotfiles, the bootstrap `files/` dir, etc.).
+// Skipping is the caller's responsibility.
 function parseFolderName(folderName: string): { status: Status; slug: string } {
   if (folderName.endsWith(ARCHIVED_SUFFIX)) {
     return { status: "archived", slug: folderName.slice(0, -ARCHIVED_SUFFIX.length) };
@@ -87,11 +111,11 @@ function folderNameFor(slug: string, status: Status): string {
 // Two folders can collapse to the same slug — e.g. a migrated `X` folder next
 // to a leftover legacy `wip-X`, or a stray git worktree whose container dir
 // happens to start with `wip-`/`done-`. Emitting both crashes the sidebar with
-// React duplicate-key warnings and makes /project/<slug> routing ambiguous.
+// React duplicate-key warnings and makes /workspace/<slug> routing ambiguous.
 // Keep the most "real" one: a folder with an actual brief beats an empty one,
 // a canonical (un-prefixed, un-suffixed) name beats a legacy/archived variant,
 // and active beats archived. Deterministic, so the UI is stable across reloads.
-type Slugged = Pick<Project, "slug" | "folderName" | "status" | "overview" | "details" | "createdAt">;
+type Slugged = Pick<Workspace, "slug" | "folderName" | "status" | "overview" | "details" | "createdAt">;
 
 function realnessScore(x: Slugged): number {
   let score = 0;
@@ -121,7 +145,7 @@ function sanitizeName(s: string): string {
   out = out.replace(/^[.-]+|[.-]+$/g, "");
   // Reject the legacy wip-/done- prefixes — they would round-trip into the
   // wrong slug after migration. Reject a trailing archived suffix too, so
-  // archive state is only ever set via setProjectStatus/setTaskStatus.
+  // archive state is only ever set via setWorkspaceStatus.
   out = out.replace(/^(wip|done)-+/i, "");
   while (out.toLowerCase().endsWith(ARCHIVED_SUFFIX.toLowerCase())) {
     out = out.slice(0, -ARCHIVED_SUFFIX.length).trimEnd();
@@ -129,18 +153,18 @@ function sanitizeName(s: string): string {
   return out.slice(0, 80);
 }
 
-// Folders that exist alongside project/task folders and must never be
-// treated as projects/tasks themselves.
+// Folders that exist alongside workspace folders and must never be treated as
+// workspaces themselves.
 const RESERVED_FOLDER_NAMES = new Set(["files", "sessions"]);
 
-function isProjectFolder(name: string): boolean {
+function isWorkspaceFolder(name: string): boolean {
   if (name.startsWith(".")) return false;
   if (RESERVED_FOLDER_NAMES.has(name)) return false;
   return true;
 }
 
 // Read a brief JSON file. Missing/unparseable files return an empty brief
-// so callers don't have to handle the absence case — a project/task with
+// so callers don't have to handle the absence case — a workspace with
 // no brief yet just renders blank fields in the UI.
 async function readBrief(filePath: string): Promise<Brief> {
   try {
@@ -167,77 +191,60 @@ function nowIso(): string {
 export async function ensureWorkspace(): Promise<void> {
   await fs.mkdir(PROJECTS_DIR, { recursive: true });
   // Bootstrap a default `Inbox/` catch-all ONLY when the workspace has no
-  // projects at all (fresh install). Once the user has any project, we never
-  // auto-create — they're free to rename, delete, or replace the catch-all.
-  let hasAnyProject = false;
+  // workspaces at all (fresh install). Once the user has any workspace, we
+  // never auto-create — they're free to rename, delete, or replace the
+  // catch-all.
+  let hasAny = false;
   try {
     const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
-    hasAnyProject = entries.some((e) => e.isDirectory() && isProjectFolder(e.name));
-  } catch { /* empty or missing — treat as no projects */ }
-  if (hasAnyProject) return;
+    hasAny = entries.some((e) => e.isDirectory() && isWorkspaceFolder(e.name));
+  } catch { /* empty or missing — treat as none */ }
+  if (hasAny) return;
 
   const inboxPath = path.join(PROJECTS_DIR, "Inbox");
   await fs.mkdir(path.join(inboxPath, "files"), { recursive: true });
-  await writeBrief(path.join(inboxPath, "files", PROJECT_BRIEF_FILENAME), {
-    overview: "Default project. Tasks that don't belong to a larger project go here.",
+  await writeBrief(path.join(inboxPath, "files", WORKSPACE_BRIEF_FILENAME), {
+    overview: "Default workspace. Anything you don't want to file elsewhere goes here.",
     details: "",
     createdAt: nowIso(),
   });
 }
 
-export async function listProjects(): Promise<Project[]> {
-  await ensureWorkspace();
-  const entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true });
-  const projects: Project[] = [];
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    if (!isProjectFolder(e.name)) continue;
-    const parsed = parseFolderName(e.name);
-    const projectDir = path.join(PROJECTS_DIR, e.name);
-    const brief = await readBrief(path.join(projectDir, "files", PROJECT_BRIEF_FILENAME));
-    const tasks = await listTasks(e.name);
-    projects.push({
-      slug: parsed.slug,
-      folderName: e.name,
-      status: parsed.status,
-      overview: brief.overview,
-      details: brief.details,
-      createdAt: brief.createdAt,
-      tasks,
-    });
-  }
-  const deduped = dedupeBySlug(projects);
-  deduped.sort((a, b) => {
-    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
-    return a.slug.localeCompare(b.slug);
-  });
-  return deduped;
-}
-
-async function listTasks(projectFolder: string): Promise<Task[]> {
-  const projectDir = path.join(PROJECTS_DIR, projectFolder);
-  const projectSlug = parseFolderName(projectFolder).slug;
-  const out: Task[] = [];
+// Recursively list workspaces under a parent folder on disk. `parentFolderPath`
+// is the list of ancestor folder names (with archived suffix preserved where
+// applicable) leading down to the directory whose children we're listing —
+// empty for the top-level.
+async function listChildrenAt(
+  parentFolderPath: string[],
+  parentSlugPath: string[],
+): Promise<Workspace[]> {
+  const dir = path.join(PROJECTS_DIR, ...parentFolderPath);
   let entries: import("node:fs").Dirent[];
   try {
-    entries = await fs.readdir(projectDir, { withFileTypes: true });
+    entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
-    return out;
+    return [];
   }
+  const out: Workspace[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    if (!isProjectFolder(e.name)) continue;
+    if (!isWorkspaceFolder(e.name)) continue;
     const parsed = parseFolderName(e.name);
-    const taskDir = path.join(projectDir, e.name);
-    const brief = await readBrief(path.join(taskDir, "files", TASK_BRIEF_FILENAME));
+    const folderPath = [...parentFolderPath, e.name];
+    const slugPath = [...parentSlugPath, parsed.slug];
+    const wsDir = path.join(PROJECTS_DIR, ...folderPath);
+    const brief = await readBrief(path.join(wsDir, "files", WORKSPACE_BRIEF_FILENAME));
+    const children = await listChildrenAt(folderPath, slugPath);
     out.push({
       slug: parsed.slug,
       folderName: e.name,
-      projectSlug,
+      path: slugPath,
+      folderPath,
       status: parsed.status,
       overview: brief.overview,
       details: brief.details,
       createdAt: brief.createdAt,
+      children,
     });
   }
   const deduped = dedupeBySlug(out);
@@ -248,70 +255,75 @@ async function listTasks(projectFolder: string): Promise<Task[]> {
   return deduped;
 }
 
-export async function getProject(slug: string): Promise<Project | null> {
-  const projects = await listProjects();
-  return projects.find((p) => p.slug === slug) ?? null;
+// All top-level workspaces with their child trees materialized.
+export async function listWorkspaces(): Promise<Workspace[]> {
+  await ensureWorkspace();
+  return listChildrenAt([], []);
 }
 
-export async function getTask(projectSlug: string, taskSlug: string): Promise<Task | null> {
-  const project = await getProject(projectSlug);
-  if (!project) return null;
-  return project.tasks.find((t) => t.slug === taskSlug) ?? null;
+// Walk a workspace tree looking for the workspace at `slugPath`. Slug
+// segments are matched exactly. Returns null if any segment is missing.
+function findInTree(tree: Workspace[], slugPath: string[]): Workspace | null {
+  if (slugPath.length === 0) return null;
+  let level = tree;
+  let current: Workspace | null = null;
+  for (const segment of slugPath) {
+    const next = level.find((w) => w.slug === segment);
+    if (!next) return null;
+    current = next;
+    level = next.children;
+  }
+  return current;
 }
 
-export function projectDir(project: Project): string {
-  return path.join(PROJECTS_DIR, project.folderName);
-}
-export function taskDir(project: Project, task: Task): string {
-  return path.join(PROJECTS_DIR, project.folderName, task.folderName);
-}
-
-export async function createProject(slug: string, brief: Partial<Brief> = {}): Promise<Project> {
-  const clean = sanitizeName(slug);
-  if (!clean) throw new Error("invalid name");
-  const folder = folderNameFor(clean, "active");
-  const dir = path.join(PROJECTS_DIR, folder);
-  await fs.mkdir(path.join(dir, "files"), { recursive: true });
-  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
-  await writeBrief(path.join(dir, "files", PROJECT_BRIEF_FILENAME), {
-    overview: brief.overview ?? "",
-    details: brief.details ?? "",
-    createdAt: brief.createdAt ?? nowIso(),
-  });
-  return (await getProject(clean))!;
+// Resolve a workspace by its slug-chain — e.g. `["HR", "pay-contractors"]`
+// returns what used to be task `pay-contractors` of project `HR`. A single-
+// element path returns a top-level workspace.
+export async function getWorkspace(slugPath: string[]): Promise<Workspace | null> {
+  const tree = await listWorkspaces();
+  return findInTree(tree, slugPath);
 }
 
-export async function createTask(
-  projectSlug: string,
+// Create a workspace at `parentPath` (empty for a top-level workspace) with
+// the given slug.
+export async function createWorkspace(
+  parentPath: string[],
   slug: string,
   brief: Partial<Brief> = {},
-): Promise<Task> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error(`unknown project ${projectSlug}`);
+): Promise<Workspace> {
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
+
+  let parentDir = PROJECTS_DIR;
+  if (parentPath.length > 0) {
+    const parent = await getWorkspace(parentPath);
+    if (!parent) throw new Error(`unknown parent workspace ${parentPath.join("/")}`);
+    parentDir = workspaceDir(parent);
+  }
+
   const folder = folderNameFor(clean, "active");
-  const dir = path.join(PROJECTS_DIR, project.folderName, folder);
+  const dir = path.join(parentDir, folder);
   await fs.mkdir(path.join(dir, "files"), { recursive: true });
-  await fs.mkdir(path.join(dir, "sessions"), { recursive: true });
-  await writeBrief(path.join(dir, "files", TASK_BRIEF_FILENAME), {
+  await writeBrief(path.join(dir, "files", WORKSPACE_BRIEF_FILENAME), {
     overview: brief.overview ?? "",
     details: brief.details ?? "",
     createdAt: brief.createdAt ?? nowIso(),
   });
-  return (await getTask(projectSlug, clean))!;
+  const created = await getWorkspace([...parentPath, clean]);
+  if (!created) throw new Error("created workspace not found");
+  return created;
 }
 
-// Overwrite a project's brief (overview + details), preserving createdAt.
-// Used by the New-Project planning flow when the user accepts the plan:
-// the project was created as a stub, and accepting fills in the real brief.
-export async function setProjectBrief(
-  slug: string,
+// Overwrite a workspace's brief (overview + details), preserving createdAt.
+// Used by the New-Workspace planning flow when the user accepts the plan:
+// the workspace was created as a stub, and accepting fills in the real brief.
+export async function setWorkspaceBrief(
+  slugPath: string[],
   patch: { overview?: string; details?: string },
 ): Promise<void> {
-  const project = await getProject(slug);
-  if (!project) throw new Error(`unknown project ${slug}`);
-  const briefPath = path.join(PROJECTS_DIR, project.folderName, "files", PROJECT_BRIEF_FILENAME);
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
+  const briefPath = path.join(workspaceDir(ws), "files", WORKSPACE_BRIEF_FILENAME);
   const current = await readBrief(briefPath);
   await writeBrief(briefPath, {
     overview: patch.overview ?? current.overview,
@@ -320,125 +332,98 @@ export async function setProjectBrief(
   });
 }
 
-export async function setTaskBrief(
-  projectSlug: string,
-  taskSlug: string,
-  patch: { overview?: string; details?: string },
-): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
-  const briefPath = path.join(
-    PROJECTS_DIR, project.folderName, task.folderName, "files", TASK_BRIEF_FILENAME,
-  );
-  const current = await readBrief(briefPath);
-  await writeBrief(briefPath, {
-    overview: patch.overview ?? current.overview,
-    details: patch.details ?? current.details,
-    createdAt: current.createdAt || nowIso(),
-  });
+export async function setWorkspaceStatus(slugPath: string[], status: Status): Promise<void> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
+  if (ws.status === status) return;
+  const parentDir = path.dirname(workspaceDir(ws));
+  const newFolder = folderNameFor(ws.slug, status);
+  await fs.rename(workspaceDir(ws), path.join(parentDir, newFolder));
 }
 
-export async function setProjectStatus(slug: string, status: Status): Promise<void> {
-  const project = await getProject(slug);
-  if (!project) throw new Error(`unknown project ${slug}`);
-  if (project.status === status) return;
-  const newFolder = folderNameFor(slug, status);
-  await fs.rename(
-    path.join(PROJECTS_DIR, project.folderName),
-    path.join(PROJECTS_DIR, newFolder),
-  );
-}
-
-export async function renameProject(slug: string, newSlug: string): Promise<void> {
-  const project = await getProject(slug);
-  if (!project) throw new Error(`unknown project ${slug}`);
+export async function renameWorkspace(slugPath: string[], newSlug: string): Promise<void> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
   const clean = sanitizeName(newSlug);
   if (!clean) throw new Error("invalid name");
-  if (clean === slug) return;
-  const existing = await getProject(clean);
-  if (existing) throw new Error(`project "${clean}" already exists`);
-  const newFolder = folderNameFor(clean, project.status);
-  const oldPath = path.join(PROJECTS_DIR, project.folderName);
-  const newPath = path.join(PROJECTS_DIR, newFolder);
-  await fs.rename(oldPath, newPath);
+  if (clean === ws.slug) return;
+  const parentSlugPath = slugPath.slice(0, -1);
+  const parentDir = path.dirname(workspaceDir(ws));
+  const collision = await getWorkspace([...parentSlugPath, clean]);
+  if (collision) throw new Error(`workspace "${clean}" already exists at this level`);
+
+  const newFolder = folderNameFor(clean, ws.status);
+  await fs.rename(workspaceDir(ws), path.join(parentDir, newFolder));
   // Note: no SDK-transcript rename needed. Sessions run with cwd=WORKSPACE_ROOT,
   // so all transcripts live in a single workspace-keyed directory regardless of
-  // which project/task owns the session — renaming a project doesn't change
-  // that path. (Earlier versions did rename per-project transcript dirs but
-  // the prefix-match was buggy and corrupted directory names on every boot.)
-  relocateSessionsForProject(slug, clean);
+  // which workspace owns the session — renaming a workspace doesn't change
+  // that path.
+  await relocateSessionsForWorkspace(slugPath, [...parentSlugPath, clean]);
 }
 
-export async function deleteProject(slug: string): Promise<void> {
-  const project = await getProject(slug);
-  if (!project) throw new Error(`unknown project ${slug}`);
-  await fs.rm(path.join(PROJECTS_DIR, project.folderName), { recursive: true, force: true });
+export async function deleteWorkspace(slugPath: string[]): Promise<void> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
+  await fs.rm(workspaceDir(ws), { recursive: true, force: true });
 }
 
-export async function deleteTask(projectSlug: string, taskSlug: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error("not found");
-  await fs.rm(path.join(PROJECTS_DIR, project.folderName, task.folderName), { recursive: true, force: true });
-}
+// Move a workspace to a new parent (or to the top level if `toParentPath` is
+// empty). The slug is preserved unless it would collide at the destination,
+// in which case `-2`, `-3`, … is appended. Returns the new slug-chain.
+export async function moveWorkspace(
+  slugPath: string[],
+  toParentPath: string[],
+): Promise<string[]> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error(`unknown workspace ${slugPath.join("/")}`);
 
-export async function setTaskStatus(projectSlug: string, taskSlug: string, status: Status): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project ? project.tasks.find((t) => t.slug === taskSlug) : null;
-  if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
-  if (task.status === status) return;
-  const newFolder = folderNameFor(taskSlug, status);
-  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
-  const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
-  await fs.rename(oldPath, newPath);
-  // No SDK-transcript rename needed — see renameProject for rationale.
-}
+  // No-op if already at this parent.
+  const currentParent = slugPath.slice(0, -1);
+  const sameParent =
+    currentParent.length === toParentPath.length
+    && currentParent.every((s, i) => s === toParentPath[i]);
+  if (sameParent) return slugPath;
 
-export async function moveTask(projectSlug: string, taskSlug: string, toProjectSlug: string): Promise<{ project: string; task: string }> {
-  const project = await getProject(projectSlug);
-  const task = project ? project.tasks.find((t) => t.slug === taskSlug) : null;
-  const dest = await getProject(toProjectSlug);
-  if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
-  if (!dest) throw new Error(`unknown destination ${toProjectSlug}`);
-  if (toProjectSlug === projectSlug) return { project: projectSlug, task: taskSlug };
-  let finalSlug = taskSlug;
-  if (dest.tasks.find((t) => t.slug === finalSlug)) {
-    let i = 2;
-    while (dest.tasks.find((t) => t.slug === `${taskSlug}-${i}`)) i++;
-    finalSlug = `${taskSlug}-${i}`;
+  // Prevent moving a workspace under itself or its own descendant.
+  if (toParentPath.length >= slugPath.length
+      && slugPath.every((s, i) => toParentPath[i] === s)) {
+    throw new Error("cannot move a workspace under itself");
   }
-  const newFolder = folderNameFor(finalSlug, task.status);
-  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
-  const newPath = path.join(PROJECTS_DIR, dest.folderName, newFolder);
-  await fs.rename(oldPath, newPath);
-  // No SDK-transcript rename needed — see renameProject for rationale.
-  relocateSessionsForTask(projectSlug, taskSlug, toProjectSlug, finalSlug);
-  return { project: toProjectSlug, task: finalSlug };
+
+  let destDir = PROJECTS_DIR;
+  if (toParentPath.length > 0) {
+    const dest = await getWorkspace(toParentPath);
+    if (!dest) throw new Error(`unknown destination ${toParentPath.join("/")}`);
+    destDir = workspaceDir(dest);
+  }
+
+  // Slug collision resolution — sibling workspaces (any status) at the
+  // destination define the namespace.
+  let finalSlug = ws.slug;
+  const siblings = toParentPath.length === 0
+    ? await listWorkspaces()
+    : (await getWorkspace(toParentPath))!.children;
+  if (siblings.find((s) => s.slug === finalSlug)) {
+    let i = 2;
+    while (siblings.find((s) => s.slug === `${ws.slug}-${i}`)) i++;
+    finalSlug = `${ws.slug}-${i}`;
+  }
+
+  const newFolder = folderNameFor(finalSlug, ws.status);
+  await fs.rename(workspaceDir(ws), path.join(destDir, newFolder));
+  const newPath = [...toParentPath, finalSlug];
+  await relocateSessionsForWorkspace(slugPath, newPath);
+  return newPath;
 }
 
-export async function renameTask(projectSlug: string, taskSlug: string, newSlug: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project ? project.tasks.find((t) => t.slug === taskSlug) : null;
-  if (!project || !task) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
-  const clean = sanitizeName(newSlug);
-  if (!clean) throw new Error("invalid name");
-  if (clean === taskSlug) return;
-  const collision = project.tasks.find((t) => t.slug === clean);
-  if (collision) throw new Error(`task "${clean}" already exists`);
-  const newFolder = folderNameFor(clean, task.status);
-  const oldPath = path.join(PROJECTS_DIR, project.folderName, task.folderName);
-  const newPath = path.join(PROJECTS_DIR, project.folderName, newFolder);
-  await fs.rename(oldPath, newPath);
-  // No SDK-transcript rename needed — see renameProject for rationale.
-  relocateSessionsForTask(projectSlug, taskSlug, projectSlug, clean);
-}
+// ---------------------------------------------------------------------------
+// Files inside a workspace's `files/` folder (artifacts).
+// ---------------------------------------------------------------------------
 
-// File CRUD inside a task's files/ folder
 function ensureSafePath(base: string, rel: string): string {
   const target = path.resolve(base, rel);
   if (!target.startsWith(base + path.sep) && target !== base) {
-    throw new Error("path escapes task directory");
+    throw new Error("path escapes workspace directory");
   }
   return target;
 }
@@ -482,98 +467,68 @@ async function listFilesMetaIn(base: string): Promise<FileMeta[]> {
   }
 }
 
-export async function listFiles(projectSlug: string, taskSlug: string): Promise<string[]> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) return [];
-  const base = path.join(taskDir(project, task), "files");
+async function workspaceFilesDir(slugPath: string[]): Promise<string | null> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) return null;
+  return path.join(workspaceDir(ws), "files");
+}
+
+export async function listFiles(slugPath: string[]): Promise<string[]> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) return [];
   return listFilesIn(base);
 }
 
-export async function listFilesMeta(projectSlug: string, taskSlug: string): Promise<FileMeta[]> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) return [];
-  const base = path.join(taskDir(project, task), "files");
+export async function listFilesMeta(slugPath: string[]): Promise<FileMeta[]> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) return [];
   return listFilesMetaIn(base);
 }
 
-export async function readFileText(projectSlug: string, taskSlug: string, rel: string): Promise<string> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error("not found");
-  const base = path.join(taskDir(project, task), "files");
+export async function readFileText(slugPath: string[], rel: string): Promise<string> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   return fs.readFile(full, "utf8");
 }
 
-export async function writeFileText(projectSlug: string, taskSlug: string, rel: string, content: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error("not found");
-  const base = path.join(taskDir(project, task), "files");
+export async function writeFileText(slugPath: string[], rel: string, content: string): Promise<void> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   await fs.mkdir(path.dirname(full), { recursive: true });
   await fs.writeFile(full, content, "utf8");
 }
 
-// ---------------------------------------------------------------------------
-// Project-level files (artifacts attached to the project itself, distinct
-// from any one task). They live in `projects/<project>/files/`.
-// ---------------------------------------------------------------------------
-
-export async function listProjectFiles(projectSlug: string): Promise<string[]> {
-  const project = await getProject(projectSlug);
-  if (!project) return [];
-  const base = path.join(projectDir(project), "files");
-  return listFilesIn(base);
-}
-
-export async function listProjectFilesMeta(projectSlug: string): Promise<FileMeta[]> {
-  const project = await getProject(projectSlug);
-  if (!project) return [];
-  const base = path.join(projectDir(project), "files");
-  return listFilesMetaIn(base);
-}
-
-export async function readProjectFileText(projectSlug: string, rel: string): Promise<string> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error("not found");
-  const base = path.join(projectDir(project), "files");
-  const full = ensureSafePath(base, rel);
-  return fs.readFile(full, "utf8");
-}
-
-export async function projectFileExists(projectSlug: string, rel: string): Promise<boolean> {
-  try {
-    await readProjectFileText(projectSlug, rel);
-    return true;
-  } catch { return false; }
-}
-
-export async function readProjectFileBytes(projectSlug: string, rel: string): Promise<Uint8Array> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error("not found");
-  const base = path.join(projectDir(project), "files");
+export async function readFileBytes(slugPath: string[], rel: string): Promise<Uint8Array> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) throw new Error("not found");
   const full = ensureSafePath(base, rel);
   const buf = await fs.readFile(full);
   return new Uint8Array(buf);
 }
 
-export async function projectDirFor(projectSlug: string): Promise<string> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error("not found");
-  return projectDir(project);
+export async function workspaceFileExists(slugPath: string[], rel: string): Promise<boolean> {
+  try {
+    await readFileText(slugPath, rel);
+    return true;
+  } catch { return false; }
 }
 
-export async function renameProjectFile(projectSlug: string, from: string, to: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error("not found");
-  if (from === PROJECT_BRIEF_FILENAME) throw new Error(`${PROJECT_BRIEF_FILENAME} cannot be renamed`);
+export async function workspaceDirFor(slugPath: string[]): Promise<string> {
+  const ws = await getWorkspace(slugPath);
+  if (!ws) throw new Error("not found");
+  return workspaceDir(ws);
+}
+
+export async function renameFile(slugPath: string[], from: string, to: string): Promise<void> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) throw new Error("not found");
+  if (from === WORKSPACE_BRIEF_FILENAME) throw new Error(`${WORKSPACE_BRIEF_FILENAME} cannot be renamed`);
   if (!to.trim()) throw new Error("destination required");
-  const base = path.join(projectDir(project), "files");
   const src = ensureSafePath(base, from);
   const dst = ensureSafePath(base, to);
+  // Don't allow overwriting existing files.
   try { await fs.access(dst); throw new Error(`${to} already exists`); } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
       if ((err as Error).message?.includes("already exists")) throw err;
@@ -583,119 +538,53 @@ export async function renameProjectFile(projectSlug: string, from: string, to: s
   await fs.rename(src, dst);
 }
 
-export async function deleteProjectFile(projectSlug: string, rel: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  if (!project) throw new Error("not found");
-  if (rel === PROJECT_BRIEF_FILENAME) throw new Error(`${PROJECT_BRIEF_FILENAME} cannot be deleted`);
-  const base = path.join(projectDir(project), "files");
+export async function deleteFile(slugPath: string[], rel: string): Promise<void> {
+  const base = await workspaceFilesDir(slugPath);
+  if (!base) throw new Error("not found");
+  if (rel === WORKSPACE_BRIEF_FILENAME) throw new Error(`${WORKSPACE_BRIEF_FILENAME} cannot be deleted`);
   const full = ensureSafePath(base, rel);
   await fs.rm(full, { recursive: true, force: true });
 }
 
-export async function renameFile(projectSlug: string, taskSlug: string, from: string, to: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error("not found");
-  if (from === TASK_BRIEF_FILENAME) throw new Error(`${TASK_BRIEF_FILENAME} cannot be renamed`);
-  if (!to.trim()) throw new Error("destination required");
-  const base = path.join(taskDir(project, task), "files");
-  const src = ensureSafePath(base, from);
-  const dst = ensureSafePath(base, to);
-  // Don't allow overwriting existing files
-  try { await fs.access(dst); throw new Error(`${to} already exists`); } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      if ((err as Error).message?.includes("already exists")) throw err;
-    }
-  }
-  await fs.mkdir(path.dirname(dst), { recursive: true });
-  await fs.rename(src, dst);
-}
-
-export async function deleteFile(projectSlug: string, taskSlug: string, rel: string): Promise<void> {
-  const project = await getProject(projectSlug);
-  const task = project?.tasks.find((t) => t.slug === taskSlug);
-  if (!project || !task) throw new Error("not found");
-  if (rel === TASK_BRIEF_FILENAME) throw new Error(`${TASK_BRIEF_FILENAME} cannot be deleted`);
-  const base = path.join(taskDir(project, task), "files");
-  const full = ensureSafePath(base, rel);
-  await fs.rm(full, { recursive: true, force: true });
-}
-
-// Walk every session folder on disk and fix any meta.json whose
-// `project`/`task`/`cwd` drifted from the actual location it lives in.
-// This happens when a user renames/moves a project or task folder outside the
-// rename API (e.g. directly in Finder). Without this, sendInput → resumeSession
-// → getProject(staleSlug) returns null and the session is silently broken.
+// Walk every session folder under SESSIONS_ROOT and fix any meta.json whose
+// `cwd` drifted from the current WORKSPACE_ROOT (e.g. the user pointed cowork
+// at a different workspace path between runs). Without this, resume({ cwd })
+// would look in the wrong `~/.claude/projects/<encoded-cwd>/` and miss the
+// SDK transcript.
 //
-// The agent's runtime cwd is always WORKSPACE_ROOT (see startSession) — this
-// is independent of the project/task the session belongs to. So every
-// session's meta.cwd should equal WORKSPACE_ROOT, no matter where its folder
-// lives. There is nothing to relocate at the SDK transcript level because
-// every session's transcript lives in the same `~/.claude/projects/<encode(WORKSPACE_ROOT)>/`
-// directory regardless of project/task.
-//
-// History: this used to set meta.cwd = taskCwd and call relocateSdkTranscripts
-// on every drift. After the WORKSPACE_ROOT cwd refactor, every session was
-// flagged as drifted on every boot, and the relocate call's prefix matcher
-// `name.startsWith(oldPrefix + "-")` would match the workspace transcript dir
-// itself plus every previously-mangled dir. So each task iteration appended
-// another `-projects-wip-X-wip-Y` segment to every transcript dir, leaving
-// SDK transcripts at increasingly absurd nested paths that resume() couldn't
-// find. The current implementation only writes meta.json and skips the
-// rename entirely — the SDK transcript dir for any new session is always
-// the correct one, and the in-place rename was the source of the corruption.
+// With flat session storage the directory no longer encodes the workspace
+// path, so no workspace drift is possible: meta.json IS the source of truth
+// for which workspace a session belongs to. Only meta.cwd can drift from
+// configuration.
 //
 // Called once on module load with a globalThis guard for HMR. Best effort —
 // failures are logged but never throw.
 export async function reconcileSessionsOnDisk(): Promise<void> {
-  try {
-    const projects = await listProjects();
-    for (const p of projects) {
-      await reconcileSessionDir(
-        path.join(PROJECTS_DIR, p.folderName, "sessions"),
-        p.slug, "",
-      );
-      for (const t of p.tasks) {
-        await reconcileSessionDir(
-          path.join(PROJECTS_DIR, p.folderName, t.folderName, "sessions"),
-          p.slug, t.slug,
-        );
-      }
-    }
-  } catch (err) {
-    const e = err as Error;
-    console.warn(`[reconcile] sessions reconciliation failed:`, e.message);
-  }
-}
-
-async function reconcileSessionDir(
-  sessDir: string,
-  expectedProject: string,
-  expectedTask: string,
-): Promise<void> {
   let entries: import("node:fs").Dirent[];
   try {
-    entries = await fs.readdir(sessDir, { withFileTypes: true }) as import("node:fs").Dirent[];
-  } catch { return; }
+    entries = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true }) as import("node:fs").Dirent[];
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    // First boot before any sessions exist — fine. Anything else, log.
+    if (e.code !== "ENOENT") {
+      console.warn(`[reconcile] could not read ${SESSIONS_ROOT}:`, e.message);
+    }
+    return;
+  }
   for (const d of entries) {
     if (!d.isDirectory()) continue;
-    const metaPath = path.join(sessDir, String(d.name), "meta.json");
-    let meta: { project?: string; task?: string; cwd?: string; sdkSessionId?: string; [k: string]: unknown };
+    const metaPath = path.join(SESSIONS_ROOT, String(d.name), "meta.json");
+    let meta: { workspace?: string[]; cwd?: string; sdkSessionId?: string; [k: string]: unknown };
     try {
       meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
     } catch { continue; }
-    const projectDrift = meta.project !== expectedProject;
-    const taskDrift = (meta.task ?? "") !== expectedTask;
-    const cwdDrift = meta.cwd !== WORKSPACE_ROOT;
-    if (!projectDrift && !taskDrift && !cwdDrift) continue;
+    if (meta.cwd === WORKSPACE_ROOT) continue;
 
     const oldCwd = typeof meta.cwd === "string" ? meta.cwd : null;
     const sdkSessionId = typeof meta.sdkSessionId === "string" ? meta.sdkSessionId : null;
     console.log(
-      `[reconcile] session ${String(d.name)}: ${meta.project ?? "?"}/${meta.task ?? ""} → ${expectedProject}/${expectedTask}`,
+      `[reconcile] session ${String(d.name)}: cwd ${meta.cwd ?? "?"} → ${WORKSPACE_ROOT}`,
     );
-    meta.project = expectedProject;
-    meta.task = expectedTask;
     meta.cwd = WORKSPACE_ROOT;
     try {
       await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
@@ -705,13 +594,11 @@ async function reconcileSessionDir(
       continue;
     }
 
-    // Legacy sessions had meta.cwd = task folder, and their SDK transcript
-    // lives in the task-folder-encoded directory. Move just that session's
-    // jsonl to the WORKSPACE_ROOT-encoded directory so `resume({ cwd })` can
-    // find it. We intentionally do NOT rename the encoded directory itself:
-    // that's what produced the concatenated-path corruption in the old
-    // implementation — see reconcileSessionsOnDisk's comment for details.
-    if (oldCwd && oldCwd !== WORKSPACE_ROOT && sdkSessionId) {
+    // Move the SDK transcript jsonl from the old cwd's encoded directory to
+    // the new one so `resume({ cwd })` finds it. We intentionally do NOT
+    // rename the encoded directory itself — see git history for the
+    // concatenated-path corruption that approach produced.
+    if (oldCwd && sdkSessionId) {
       await moveSdkTranscriptFile(sdkSessionId, oldCwd, WORKSPACE_ROOT);
     }
   }
@@ -738,3 +625,4 @@ async function moveSdkTranscriptFile(
     }
   }
 }
+

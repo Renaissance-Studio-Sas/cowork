@@ -1,8 +1,11 @@
 import { Hono } from "hono";
 import { proxy, type ProxyBindings } from "../lib/proxy";
 
-// Mirrors src/app/api/comments/** — comment storage lives in the cloud backend
-// (per-task .comments.json files), so every endpoint is forwarded.
+// Mirrors src/server/routes/comments.ts. Comment storage lives in the cloud
+// backend (per-workspace `.comments.json` files), so every endpoint is
+// forwarded. The workspace identifier travels as a `workspace=` query param —
+// the proxy preserves the query string verbatim, so no Worker-side logic is
+// needed beyond the static method/path mapping.
 export const comments = new Hono<{ Bindings: ProxyBindings }>();
 
 // Static path before the param route so `/counts` never matches `/:id`.

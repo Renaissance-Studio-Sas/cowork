@@ -5,26 +5,21 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, PROJECTS_DIR } from "../fs";
+import { getWorkspace, sessionDir } from "../fs";
 import type { SessionState } from "../session-state-machine";
 import type { RuntimeSession } from "./types";
 
-// Resolve the directory holding meta.json for (project, task, session).
-// Shared between updateMeta() (the locked read-modify-write path) and
-// readMetaRaw() (the lock-free probe).
+// Resolve the directory holding meta.json for a session. With flat session
+// storage the path doesn't depend on workspace; the workspace lookup is kept
+// for existence-validation only so the API surface matches the rest of the
+// session module.
 async function resolveSessionDir(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<string | null> {
-  const project = await getProject(projectSlug);
-  if (!project) return null;
-  if (!taskSlug) {
-    return path.join(PROJECTS_DIR, project.folderName, "sessions", sessionId);
-  }
-  const task = project.tasks.find((t) => t.slug === taskSlug);
-  if (!task) return null;
-  return path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", sessionId);
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return null;
+  return sessionDir(sessionId);
 }
 
 // Per-session mutex queue for meta.json updates. Without this, two
@@ -49,19 +44,12 @@ export async function updateMeta(
   const prev = metaWriteQueue.get(s.id) ?? Promise.resolve();
   const next = prev.then(async () => {
     try {
-      const project = await getProject(s.projectSlug);
-      if (!project) return;
+      // Workspace lookup is retained for validation; with flat session storage
+      // the on-disk path doesn't depend on the workspace folder names.
+      const ws = await getWorkspace(s.workspacePath);
+      if (!ws) return;
 
-      let sessionDir: string;
-      if (!s.taskSlug) {
-        sessionDir = path.join(PROJECTS_DIR, project.folderName, "sessions", s.id);
-      } else {
-        const task = project.tasks.find((t) => t.slug === s.taskSlug);
-        if (!task) return;
-        sessionDir = path.join(PROJECTS_DIR, project.folderName, task.folderName, "sessions", s.id);
-      }
-
-      const metaPath = path.join(sessionDir, "meta.json");
+      const metaPath = path.join(sessionDir(s.id), "meta.json");
       const tmpPath = metaPath + ".tmp";
       const raw = await fs.readFile(metaPath, "utf8");
       const meta = JSON.parse(raw) as Record<string, unknown>;
@@ -105,14 +93,13 @@ export async function persistOwnerPid(s: RuntimeSession): Promise<void> {
 // ownerPid); going through updateMeta would deadlock against an in-flight
 // write.
 export async function readMetaRaw(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<Record<string, unknown> | null> {
-  const sessionDir = await resolveSessionDir(projectSlug, taskSlug, sessionId);
-  if (!sessionDir) return null;
+  const dir = await resolveSessionDir(workspacePath, sessionId);
+  if (!dir) return null;
   try {
-    return JSON.parse(await fs.readFile(path.join(sessionDir, "meta.json"), "utf8"));
+    return JSON.parse(await fs.readFile(path.join(dir, "meta.json"), "utf8"));
   } catch {
     return null;
   }

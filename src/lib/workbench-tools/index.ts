@@ -11,6 +11,6 @@
 
 export { defineTool, type WorkbenchTool, type ToolCallResult, type ToolCallContent, type ToolSchema } from "./types";
 export { buildCommentsTools } from "./comments";
-export { buildPlanningTools, PLANNING_SYSTEM_PROMPT } from "./planning";
+export { buildWorkspacePlanningTools, buildWorkspacePlanningSystemPrompt } from "./planning";
 export { buildSessionTools } from "./session";
 export { buildUserInputTools } from "./user-input";

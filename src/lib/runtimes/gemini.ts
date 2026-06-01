@@ -94,7 +94,6 @@ class GeminiAgentQuery implements AgentQuery {
     // model, workbenchToolGroups, systemPrompt, … } }. Read from the nested
     // `options` first, fall back to top-level for direct AgentQueryOptions
     // callers.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const nested = (opts as any).options as Record<string, unknown> | undefined;
     const get = <T>(key: string): T | undefined =>
       (nested?.[key] as T | undefined) ?? (opts as unknown as Record<string, T>)[key];
@@ -172,7 +171,6 @@ class GeminiAgentQuery implements AgentQuery {
     if (priorHistory && priorHistory.length > 0) {
       // gemini-cli-core 0.44 dropped setHistory's `{ silent }` option; it now
       // takes the history array only.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       this.chat.setHistory(priorHistory as any);
     }
 
@@ -227,7 +225,6 @@ class GeminiAgentQuery implements AgentQuery {
       const MAX_TOOL_ROUNDS = 1000;
 
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let request: any = [{ text }];
         let rounds = 0;
 
@@ -238,7 +235,6 @@ class GeminiAgentQuery implements AgentQuery {
               type: "system",
               subtype: "error",
               message: `Exceeded ${MAX_TOOL_ROUNDS} tool-execution rounds in one turn — aborting`,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
             } as any;
             break;
           }
@@ -261,7 +257,6 @@ class GeminiAgentQuery implements AgentQuery {
           // replacement text content — the user sees the agent's text
           // appear briefly then vanish.
           let turnText = "";
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const turnToolUses: Array<{ type: "tool_use"; id: string; name: string; input: any }> = [];
 
           while (true) {
@@ -288,7 +283,6 @@ class GeminiAgentQuery implements AgentQuery {
                     index: 0,
                     delta: { type: "text_delta", text },
                   },
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any;
               }
               continue;
@@ -297,7 +291,6 @@ class GeminiAgentQuery implements AgentQuery {
             // assistant message with [text, tool_uses...] when the stream
             // ends.
             if (ev.type === GeminiEventType.ToolCallRequest) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const req = (ev as any).value as { callId: string; name: string; args: Record<string, unknown> };
               const toolUseId = `toolu_${randomUUID().slice(0, 12)}`;
               callIdToToolUseId.set(req.callId, toolUseId);
@@ -306,7 +299,6 @@ class GeminiAgentQuery implements AgentQuery {
             }
             // Track error events so we can emit resultErrorEvent at the end.
             if (ev.type === GeminiEventType.Error) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const v = (ev as any).value as { error?: unknown };
               if (v?.error) {
                 if (v.error instanceof Error) {
@@ -340,7 +332,6 @@ class GeminiAgentQuery implements AgentQuery {
           // UI's streaming bubble cleanly. Skip if no text and no tools
           // (rare — the model emitted nothing this round).
           if (turnText || turnToolUses.length > 0) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const content: any[] = [];
             if (turnText) content.push({ type: "text", text: turnText });
             for (const tu of turnToolUses) content.push(tu);
@@ -358,7 +349,6 @@ class GeminiAgentQuery implements AgentQuery {
                 stop_sequence: null,
                 usage: {},
               },
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
             } as any;
           }
 
@@ -371,7 +361,6 @@ class GeminiAgentQuery implements AgentQuery {
           // and never reach the scheduler. Calls that get allowed (with
           // possibly updated input) get passed through.
           const toSchedule: ToolCallRequestInfo[] = [];
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const synthesizedResults: any[] = [];
           for (const call of pending) {
             const c = call as ToolCallRequestInfo;
@@ -402,12 +391,10 @@ class GeminiAgentQuery implements AgentQuery {
                     is_error: true,
                   }],
                 },
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
               } as any;
               continue;
             }
             // allow — possibly with modified input
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const args = (decision as any).updatedInput ?? c.args;
             toSchedule.push({ ...c, args });
           }
@@ -427,7 +414,6 @@ class GeminiAgentQuery implements AgentQuery {
           // Build the next request from each completed call's responseParts.
           // cli-core expects the conversation to alternate functionCall
           // (already in chat history from the prior Turn) ↔ functionResponse.
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const nextRequest: any[] = [];
           for (const c of completed) {
             const parts = (c as { response?: { responseParts?: unknown[] } }).response?.responseParts ?? [];
@@ -503,7 +489,6 @@ class GeminiAgentQuery implements AgentQuery {
     try {
       // Claude SDK's options has more fields (sessionId, etc.); cowork's
       // buildCanUseTool only reads toolUseID, so a minimal object suffices.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return await this.canUseTool(toolName, args, { toolUseID: toolUseId } as any);
     } catch (err) {
       console.warn("[gemini-runtime] canUseTool threw:", err);
@@ -516,7 +501,6 @@ class GeminiAgentQuery implements AgentQuery {
   // unparseable. Errors are intentionally swallowed: an unrecoverable
   // history file shouldn't block the session from starting — the agent
   // just begins fresh.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async loadHistory(): Promise<any[] | undefined> {
     if (!this.runtimeStateDir) return undefined;
     try {
@@ -704,11 +688,9 @@ function translateEvent(
           index: 0,
           delta: { type: "text_delta", text },
         },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any];
     }
     case GeminiEventType.ToolCallRequest: {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const req = (ev as any).value as { callId: string; name: string; args: Record<string, unknown> };
       const toolUseId = `toolu_${randomUUID().slice(0, 12)}`;
       callIdToToolUseId.set(req.callId, toolUseId);
@@ -726,11 +708,9 @@ function translateEvent(
           stop_sequence: null,
           usage: {},
         },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any];
     }
     case GeminiEventType.ToolCallResponse: {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const resp = (ev as any).value as {
         callId: string;
         responseParts?: Array<{ text?: string; functionResponse?: { response?: unknown } }>;
@@ -761,7 +741,6 @@ function translateEvent(
             is_error: !!resp.error,
           }],
         },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any];
     }
     case GeminiEventType.Thought:
@@ -774,7 +753,6 @@ function translateEvent(
       // internally. Could be surfaced as system events in the future.
       return [];
     case GeminiEventType.Error: {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const v = (ev as any).value as { error?: unknown };
       let message = "Unknown error";
       if (v?.error) {
@@ -801,7 +779,6 @@ function translateEvent(
         subtype: "error",
         message,
         session_id: sessionId,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any];
     }
     default:
@@ -819,7 +796,6 @@ function toolResultEventFromCompleted(
 ): AgentEvent {
   const callId = c.request?.callId;
   const toolUseId = (callId && callIdToToolUseId.get(callId)) ?? `toolu_${randomUUID().slice(0, 12)}`;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const resp = (c as any).response as { responseParts?: Array<{ text?: string; functionResponse?: { response?: unknown } }>; error?: Error } | undefined;
   let text = resp?.responseParts
     ?.map((p) => {
@@ -845,7 +821,6 @@ function toolResultEventFromCompleted(
         is_error: !!resp?.error,
       }],
     },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
 }
 
@@ -861,7 +836,6 @@ function initEvent(sessionId: string, cwd: string, model: string): AgentEvent {
     slash_commands: [],
     permissionMode: "bypassPermissions",
     apiKeySource: "env",
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
 }
 
@@ -879,7 +853,6 @@ function resultSuccessEvent(sessionId: string, text: string): AgentEvent {
     usage: {},
     modelUsage: {},
     permission_denials: [],
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
 }
 
@@ -891,7 +864,6 @@ function resultErrorEvent(sessionId: string, errorMsg: string): AgentEvent {
     is_error: true,
     error: errorMsg,
     result: errorMsg,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
 }
 
