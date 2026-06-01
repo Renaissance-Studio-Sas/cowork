@@ -23,8 +23,7 @@ import { defineTool, type WorkbenchTool } from "./types";
 
 export function buildSessionTools(
   sessionId: string,
-  _projectSlug: string,
-  _taskSlug: string,
+  _workspacePath: string[],
 ): WorkbenchTool[] {
   return [
     defineTool(
@@ -399,7 +398,7 @@ the user to click anything; the handshake is automatic.`,
           // then add (static + claude-in-chrome). A single setMcpServers
           // with the same config is a no-op — the SDK doesn't retry the
           // spawn — so we need this two-step.
-          const baseMcps = await buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug);
+          const baseMcps = await buildStaticWorkbenchMcps(sessionId, _workspacePath);
           await q.setMcpServers(baseMcps);
           const result = await q.setMcpServers({
             ...baseMcps,
@@ -458,7 +457,7 @@ Use this to release the Chrome connection, for example before switching to a dif
         }
 
         try {
-          const result = await q.setMcpServers(await buildStaticWorkbenchMcps(sessionId, _projectSlug, _taskSlug));
+          const result = await q.setMcpServers(await buildStaticWorkbenchMcps(sessionId, _workspacePath));
 
           if (result.removed.includes("claude-in-chrome")) {
             return { content: [{ type: "text", text: "Chrome MCP disconnected." }] };

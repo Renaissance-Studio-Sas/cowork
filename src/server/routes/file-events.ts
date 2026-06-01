@@ -1,18 +1,22 @@
 import { Hono } from "hono";
 import { subscribeFileChanges, subscribeOpenArtifact } from "@/lib/sessions";
+import { decodeWorkspacePath } from "@/lib/routes";
 
 export const fileEvents = new Hono();
 
-// Multiplexed file_changed stream. One connection per (project, task) instead
-// of one per live session — browsers cap concurrent HTTP/1.1 connections at
-// ~6, so opening an SSE per session exhausted the pool when a task had
-// multiple live sessions.
+// Multiplexed file_changed + open_artifact stream. One connection per workspace
+// instead of one per live session — browsers cap concurrent HTTP/1.1
+// connections at ~6, so opening an SSE per session exhausted the pool when a
+// workspace had multiple live sessions.
+//
+// Workspace is passed as `workspace=` query param (slug-chain, URI-encoded
+// per segment, joined with `/`).
 fileEvents.get("/stream", async (c) => {
   const req = c.req.raw;
   const url = new URL(req.url);
-  const project = url.searchParams.get("project") ?? "";
-  const task = url.searchParams.get("task") ?? "";
-  if (!project) return new Response("missing project", { status: 400 });
+  const workspaceRaw = url.searchParams.get("workspace") ?? "";
+  if (!workspaceRaw) return new Response("missing workspace", { status: 400 });
+  const workspacePath = decodeWorkspacePath(workspaceRaw);
 
   const encoder = new TextEncoder();
   let cleanup: () => void = () => {};
@@ -26,10 +30,10 @@ fileEvents.get("/stream", async (c) => {
         safeEnqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
 
-      const unsubscribeFiles = subscribeFileChanges(project, task, (data) => {
+      const unsubscribeFiles = subscribeFileChanges(workspacePath, (data: { path: string; sessionId: string }) => {
         sendEvent("file_changed", data);
       });
-      const unsubscribeOpen = subscribeOpenArtifact(project, task, (data) => {
+      const unsubscribeOpen = subscribeOpenArtifact(workspacePath, (data: { path: string; sessionId: string }) => {
         sendEvent("open_artifact", data);
       });
 

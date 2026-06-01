@@ -3,9 +3,9 @@
 import { useState, useEffect, Suspense, type ReactNode } from "react";
 import { useRouter } from "@/lib/navigation";
 import { SidebarNav } from "./SidebarNav";
-import { NewProjectModal, NewTaskModal } from "./NewModal";
+import { NewWorkspaceModal } from "./NewModal";
 import { useWorkspace } from "@/lib/workspace-context";
-import { projectRoute, taskRoute } from "@/lib/routes";
+import { workspaceRoute } from "@/lib/routes";
 
 interface Props {
   children: ReactNode;
@@ -15,8 +15,10 @@ export function AppShell({ children }: Props) {
   const router = useRouter();
   const { pendingCount, refresh } = useWorkspace();
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [newTaskFor, setNewTaskFor] = useState<string | null>(null);
-  const [showNewProject, setShowNewProject] = useState(false);
+  // `null` = no modal open. Otherwise an array carrying the parent
+  // slug-chain (empty for top-level). One handler covers both cases — we
+  // don't need a second "New project" state anymore.
+  const [newWorkspaceParent, setNewWorkspaceParent] = useState<string[] | null>(null);
 
   // Read the persisted sidebar state on mount. Has to run in an effect rather
   // than a lazy initializer: localStorage is unavailable during SSR, and
@@ -39,8 +41,7 @@ export function AppShell({ children }: Props) {
         // Fallback matches the sidebar's w-[300px] to avoid layout shift.
         <Suspense fallback={<aside className="w-[300px] shrink-0 bg-[var(--bg-2)] border-r border-[var(--border)]" />}>
           <SidebarNav
-            onNewTask={(project) => setNewTaskFor(project)}
-            onNewProject={() => setShowNewProject(true)}
+            onNewWorkspace={(parentPath) => setNewWorkspaceParent(parentPath)}
             onClose={() => setSidebarOpen(false)}
           />
         </Suspense>
@@ -52,23 +53,13 @@ export function AppShell({ children }: Props) {
         {children}
       </main>
 
-      {newTaskFor && (
-        <NewTaskModal
-          projectSlug={newTaskFor}
-          onClose={() => setNewTaskFor(null)}
-          onCreated={(slug) => {
-            setNewTaskFor(null);
-            router.push(taskRoute(newTaskFor, slug));
-            refresh();
-          }}
-        />
-      )}
-      {showNewProject && (
-        <NewProjectModal
-          onClose={() => setShowNewProject(false)}
-          onCreated={(slug) => {
-            setShowNewProject(false);
-            router.push(projectRoute(slug));
+      {newWorkspaceParent !== null && (
+        <NewWorkspaceModal
+          parentPath={newWorkspaceParent}
+          onClose={() => setNewWorkspaceParent(null)}
+          onCreated={(path) => {
+            setNewWorkspaceParent(null);
+            router.push(workspaceRoute(path));
             refresh();
           }}
         />

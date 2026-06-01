@@ -22,8 +22,30 @@ import {
 } from "@/lib/sessions";
 import { extractTodosFromMessages } from "@/lib/todos";
 import { isVisibleSDKMessage } from "@/components/chat/utils";
+import { decodeWorkspacePath } from "@/lib/routes";
 
 export const sessions = new Hono();
+
+// Helper used everywhere a workspace is read from the request. Clients pass
+// the slug-chain in a `workspace=` query param (URI-encoded per segment,
+// joined with `/`). Body-borne paths are also supported via the alternate
+// callsite (e.g. for /input which already carries JSON body).
+function workspacePathFromQuery(c: Context): string[] | null {
+  const raw = c.req.query("workspace");
+  if (raw === undefined || raw === null) return null;
+  return decodeWorkspacePath(raw);
+}
+
+// Pull a workspace path out of a parsed JSON body. Accepts either an array
+// (preferred) or a slash-joined string (fallback for symmetry with the query
+// helper). Returns null when neither is present.
+function workspacePathFromBody(body: unknown): string[] | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  if (Array.isArray(b.workspace)) return b.workspace as string[];
+  if (typeof b.workspace === "string") return decodeWorkspacePath(b.workspace);
+  return null;
+}
 
 // ---- collection ---------------------------------------------------------
 sessions.get("/", async (c) => {
@@ -32,14 +54,11 @@ sessions.get("/", async (c) => {
 
 // ---- reads on a single session ------------------------------------------
 sessions.get("/:id/history", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const url = new URL(req.url);
-  const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task");
-  // task can be empty string for project-level sessions, but project is required
-  if (!project || task === null || task === undefined) {
-    return c.json({ error: "project, task required" }, 400);
+  const url = new URL(c.req.raw.url);
+  const workspacePath = workspacePathFromQuery(c);
+  if (!workspacePath) {
+    return c.json({ error: "workspace required" }, 400);
   }
 
   // Pagination parameters for lazy loading
@@ -52,7 +71,7 @@ sessions.get("/:id/history", async (c) => {
   const limit = limitStr ? parseInt(limitStr, 10) : undefined;
   const offset = offsetStr ? parseInt(offsetStr, 10) : 0;
 
-  const result = await readSessionHistory(project, task, id, limit, offset);
+  const result = await readSessionHistory(workspacePath, id, limit, offset);
   if (!result) return c.json({ error: "not found" }, 404);
   return c.json(result);
 });
@@ -75,10 +94,9 @@ sessions.get("/:id/stream", async (c) => {
   // user sends never appear until they reload.
   let s = getSession(id);
   if (!s) {
-    const project = url.searchParams.get("project");
-    const task = url.searchParams.get("task");
-    if (project !== null && task !== null) {
-      s = (await restoreSession(project, task, id)) ?? undefined;
+    const workspacePath = workspacePathFromQuery(c);
+    if (workspacePath) {
+      s = (await restoreSession(workspacePath, id)) ?? undefined;
     }
   }
   if (!s) return new Response("not found", { status: 404 });
@@ -235,9 +253,8 @@ sessions.get("/:id/stream", async (c) => {
 // containers inherit auth too) and restarts the SDK with the cached first
 // message — events resume on the existing SSE stream.
 sessions.post("/:id/auth-code", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json().catch(() => ({})) as { code?: string };
+  const body = await c.req.raw.json().catch(() => ({})) as { code?: string };
   if (typeof body.code !== "string" || !body.code.trim()) {
     return c.json({ error: "missing `code`" }, 400);
   }
@@ -272,17 +289,15 @@ sessions.post("/:id/auth-start", async (c) => {
 
 // POST /api/sessions/:id/complete
 // Body shapes:
-//   { projectSlug, taskSlug, completed: boolean }
+//   { workspace: string[] | "slug/chain", completed: boolean }
 //     → manual mark/unmark (user clicked the button)
-//   { projectSlug, taskSlug, completed: boolean, requestId: string }
+//   { workspace, completed: boolean, requestId: string }
 //     → resolve an agent suggest_session_complete request; `completed` is the
 //       user's decision (true = approve + mark complete, false = dismiss).
 sessions.post("/:id/complete", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json() as {
-    projectSlug?: string;
-    taskSlug?: string;
+  const body = await c.req.raw.json() as {
+    workspace?: string | string[];
     completed?: boolean;
     requestId?: string;
   };
@@ -290,8 +305,9 @@ sessions.post("/:id/complete", async (c) => {
   if (typeof body.completed !== "boolean") {
     return c.json({ error: "`completed` (boolean) is required" }, 400);
   }
-  if (!body.projectSlug) {
-    return c.json({ error: "projectSlug is required" }, 400);
+  const workspacePath = workspacePathFromBody(body);
+  if (!workspacePath) {
+    return c.json({ error: "workspace is required" }, 400);
   }
 
   // If this resolves an agent suggestion, unblock the parked tool handler
@@ -302,12 +318,7 @@ sessions.post("/:id/complete", async (c) => {
     resolveCompletionSuggestion(id, body.requestId, body.completed);
   }
 
-  const ok = await markSessionCompleted(
-    body.projectSlug,
-    body.taskSlug ?? "",
-    id,
-    body.completed,
-  );
+  const ok = await markSessionCompleted(workspacePath, id, body.completed);
   if (!ok) {
     return c.json({ error: "session not found" }, 404);
   }
@@ -324,9 +335,8 @@ sessions.post("/:id/force-stop", async (c) => {
 // Inject a system message into the session's event stream. Used for
 // confirmation messages (e.g., when a plan is approved).
 sessions.post("/:id/inject-message", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json() as { message?: string };
+  const body = await c.req.raw.json() as { message?: string };
 
   if (!body.message || typeof body.message !== "string") {
     return c.json({ error: "message required" }, 400);
@@ -341,31 +351,27 @@ sessions.post("/:id/inject-message", async (c) => {
 });
 
 sessions.post("/:id/input", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json();
+  const body = await c.req.raw.json();
   if (!body.message || typeof body.message !== "string") {
     return c.json({ error: "message required" }, 400);
   }
 
-  const projectSlug = body.projectSlug as string | undefined;
-  const taskSlug = body.taskSlug as string | undefined;
+  const workspacePath = workspacePathFromBody(body);
   const files = body.files as FileAttachmentInfo[] | undefined;
   const openArtifact = typeof body.openArtifact === "string" && body.openArtifact.length > 0
     ? body.openArtifact
     : undefined;
 
   // If session isn't in memory, try to restore it from disk
-  if (!getSession(id)) {
-    if (projectSlug !== undefined && taskSlug !== undefined) {
-      await restoreSession(projectSlug, taskSlug, id);
-    }
+  if (!getSession(id) && workspacePath) {
+    await restoreSession(workspacePath, id);
   }
 
   // Use extended function if files are provided
   let ok: boolean;
-  if (files && files.length > 0 && projectSlug && taskSlug) {
-    ok = await sendInputWithFiles(id, body.message, files, projectSlug, taskSlug, openArtifact);
+  if (files && files.length > 0 && workspacePath) {
+    ok = await sendInputWithFiles(id, body.message, files, workspacePath, openArtifact);
   } else {
     ok = await sendInput(id, body.message, openArtifact);
   }
@@ -392,9 +398,8 @@ sessions.post("/:id/interrupt", async (c) => {
 // finishes a plan and the UI shows an Approve/Deny card. On Approve the SDK
 // transitions out of plan mode and the agent starts executing.
 sessions.post("/:id/permission", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json() as {
+  const body = await c.req.raw.json() as {
     toolUseId?: string;
     behavior?: "allow" | "deny";
     message?: string;
@@ -434,9 +439,8 @@ sessions.post("/:id/permission", async (c) => {
 // user dismissed the prompt and the agent gets a "user declined to answer"
 // result instead of selections.
 sessions.post("/:id/question", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json() as {
+  const body = await c.req.raw.json() as {
     questionId?: string;
     answers?: Array<{ selected?: string[]; other?: string }>;
     refused?: boolean;
@@ -467,22 +471,22 @@ sessions.post("/:id/question", async (c) => {
 });
 
 // POST /api/sessions/:id/rename
-// Body: { projectSlug: string, taskSlug: string, name: string }
+// Body: { workspace: string[] | "slug/chain", name: string }
 // Renames a session (works for both live and stopped sessions)
 sessions.post("/:id/rename", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json();
-  const { projectSlug, taskSlug, name } = body;
+  const body = await c.req.raw.json();
+  const workspacePath = workspacePathFromBody(body);
+  const { name } = body;
 
-  if (!projectSlug) {
-    return c.json({ error: "projectSlug is required" }, 400);
+  if (!workspacePath) {
+    return c.json({ error: "workspace is required" }, 400);
   }
   if (!name || typeof name !== "string" || !name.trim()) {
     return c.json({ error: "name is required" }, 400);
   }
 
-  const ok = await renameSession(projectSlug, taskSlug ?? "", id, name);
+  const ok = await renameSession(workspacePath, id, name);
   if (!ok) {
     return c.json(
       { error: "session not found" },
@@ -503,19 +507,18 @@ sessions.post("/:id/retry", async (c) => {
 });
 
 // POST /api/sessions/:id/seen
-// Body: { projectSlug: string, taskSlug: string }
-// Marks the session as seen by the user
+// Body: { workspace: string[] | "slug/chain" }
+// Marks the session as seen by the user.
 sessions.post("/:id/seen", async (c) => {
-  const req = c.req.raw;
   const id = c.req.param("id");
-  const body = await req.json();
-  const { projectSlug, taskSlug } = body;
+  const body = await c.req.raw.json();
+  const workspacePath = workspacePathFromBody(body);
 
-  if (!projectSlug) {
-    return c.json({ error: "projectSlug is required" }, 400);
+  if (!workspacePath) {
+    return c.json({ error: "workspace is required" }, 400);
   }
 
-  const ok = await markSessionSeen(projectSlug, taskSlug ?? "", id);
+  const ok = await markSessionSeen(workspacePath, id);
   if (!ok) {
     return c.json({ error: "session not found" }, 404);
   }
@@ -524,20 +527,19 @@ sessions.post("/:id/seen", async (c) => {
 });
 
 // delete supports both verbs (the UI POSTs; REST clients may DELETE).
-// DELETE /api/sessions/:id/delete
-// Body: { projectSlug: string, taskSlug: string }
-// Deletes a stopped session
+// DELETE /api/sessions/:id/delete  or  POST /api/sessions/:id/delete
+// Body: { workspace: string[] | "slug/chain" }
+// Deletes a stopped session.
 async function handleDelete(c: Context) {
-  const req = c.req.raw;
   const id = c.req.param("id")!;
-  const body = await req.json();
-  const { projectSlug, taskSlug } = body;
+  const body = await c.req.raw.json();
+  const workspacePath = workspacePathFromBody(body);
 
-  if (!projectSlug) {
-    return c.json({ error: "projectSlug is required" }, 400);
+  if (!workspacePath) {
+    return c.json({ error: "workspace is required" }, 400);
   }
 
-  const ok = await deleteSession(projectSlug, taskSlug ?? "", id);
+  const ok = await deleteSession(workspacePath, id);
   if (!ok) {
     return c.json(
       { error: "Session not found or is actively running" },

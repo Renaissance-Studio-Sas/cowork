@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "@/lib/navigation";
 import { handleComposerEnter } from "@/lib/composer";
-import { projectSessionRoute } from "@/lib/routes";
+import { encodeWorkspacePath, workspaceSessionRoute } from "@/lib/routes";
 
 function sluggify(s: string): string {
   // The folder name *is* the display name — preserve case + spaces, strip
@@ -66,139 +66,33 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 // -----------------------------------------------------------------------
-// New Project
+// New Workspace
+//
+// One modal handles every new-workspace case — top-level when
+// parentPath is empty, child workspace when it identifies a parent. Same two
+// modes (chat-with-an-agent vs quick form) as before, but no per-level
+// duplication.
 // -----------------------------------------------------------------------
 
-export function NewProjectModal({ onClose, onCreated }: { onClose: () => void; onCreated: (slug: string) => void }) {
+export interface NewWorkspaceModalProps {
+  /** Slug-chain of the parent workspace. Empty array creates a top-level one. */
+  parentPath: string[];
+  onClose: () => void;
+  /** Called with the new workspace's full slug-chain. */
+  onCreated: (path: string[]) => void;
+}
+
+export function NewWorkspaceModal({ parentPath, onClose, onCreated }: NewWorkspaceModalProps) {
   const [mode, setMode] = useState<"chat" | "quick">("chat");
   return mode === "chat" ? (
-    <ChatProjectKickoff onClose={onClose} onSwitchToQuick={() => setMode("quick")} />
-  ) : (
-    <QuickProjectModal onClose={onClose} onCreated={onCreated} onSwitchToChat={() => setMode("chat")} />
-  );
-}
-
-function QuickProjectModal({
-  onClose,
-  onCreated,
-  onSwitchToChat,
-}: {
-  onClose: () => void;
-  onCreated: (slug: string) => void;
-  onSwitchToChat: () => void;
-}) {
-  const [name, setName] = useState("");
-  const [overview, setOverview] = useState("");
-  const [details, setDetails] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const submit = async () => {
-    if (!name.trim() || busy) return;
-    setBusy(true);
-    const slug = sluggify(name);
-    try {
-      await fetch(`/api/projects`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slug, overview: overview || name, details }),
-      });
-      onCreated(slug);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <ModalShell
-      title="New project"
-      subtitle="Quick form. Switch to chat for a guided setup."
+    <ChatWorkspaceKickoff
+      parentPath={parentPath}
       onClose={onClose}
-      footer={
-        <>
-          <button onClick={onSwitchToChat} className="mr-auto text-[12.5px] text-[var(--accent)] hover:underline">↩ Plan with an agent</button>
-          <button onClick={onClose} className="text-[13px] text-[var(--text-soft)] px-3 py-2 hover:bg-[var(--panel-2)] rounded-lg">Cancel</button>
-          <button
-            onClick={submit}
-            disabled={!name.trim() || busy}
-            className="bg-[var(--accent)] text-[var(--accent-text)] rounded-lg px-4 py-2 text-[13.5px] font-medium disabled:opacity-40 hover:brightness-110"
-          >Create</button>
-        </>
-      }
-    >
-      <Field label="Name">
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          placeholder="e.g. apartment-search"
-          className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
-        />
-      </Field>
-      <Field label="Overview (one line, optional)">
-        <input
-          value={overview}
-          onChange={(e) => setOverview(e.target.value)}
-          placeholder="What is this project about?"
-          className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
-        />
-      </Field>
-      <Field label="Details (markdown, optional)">
-        <textarea
-          value={details}
-          onChange={(e) => setDetails(e.target.value)}
-          rows={3}
-          placeholder="Goals, constraints, context…"
-          className="w-full resize-none bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
-        />
-      </Field>
-    </ModalShell>
-  );
-}
-
-// Captures a single first message, kicks off a normal project-level
-// planning session (server creates a stub project to host it), then routes
-// the user into the chat page. The agent's `propose_plan` tool call shows
-// up there as an inline card the user can accept.
-function ChatProjectKickoff({
-  onClose,
-  onSwitchToQuick,
-}: {
-  onClose: () => void;
-  onSwitchToQuick: () => void;
-}) {
-  return (
-    <KickoffShell
-      title="New project — plan with an agent"
-      subtitle="Tell the agent what you want. It runs as a regular session — you can step away and come back."
-      placeholder="Tell the agent about your project…"
-      switchLabel="↪ Skip and just enter a name"
-      onClose={onClose}
-      onSwitch={onSwitchToQuick}
-      buildBody={(message) => ({ message })}
+      onSwitchToQuick={() => setMode("quick")}
     />
-  );
-}
-
-// -----------------------------------------------------------------------
-// New Task
-// -----------------------------------------------------------------------
-
-export function NewTaskModal({
-  projectSlug,
-  onClose,
-  onCreated,
-}: {
-  projectSlug: string;
-  onClose: () => void;
-  onCreated: (slug: string) => void;
-}) {
-  const [mode, setMode] = useState<"chat" | "quick">("chat");
-  return mode === "chat" ? (
-    <ChatTaskKickoff projectSlug={projectSlug} onClose={onClose} onSwitchToQuick={() => setMode("quick")} />
   ) : (
-    <QuickTaskModal
-      projectSlug={projectSlug}
+    <QuickWorkspaceModal
+      parentPath={parentPath}
       onClose={onClose}
       onCreated={onCreated}
       onSwitchToChat={() => setMode("chat")}
@@ -206,15 +100,15 @@ export function NewTaskModal({
   );
 }
 
-function QuickTaskModal({
-  projectSlug,
+function QuickWorkspaceModal({
+  parentPath,
   onClose,
   onCreated,
   onSwitchToChat,
 }: {
-  projectSlug: string;
+  parentPath: string[];
   onClose: () => void;
-  onCreated: (slug: string) => void;
+  onCreated: (path: string[]) => void;
   onSwitchToChat: () => void;
 }) {
   const [name, setName] = useState("");
@@ -222,17 +116,24 @@ function QuickTaskModal({
   const [details, setDetails] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const isRoot = parentPath.length === 0;
+  const titleSuffix = isRoot ? "" : ` in ${parentPath.join(" › ")}`;
+
   const submit = async () => {
     if (!name.trim() || busy) return;
     setBusy(true);
     const slug = sluggify(name);
     try {
-      await fetch(`/api/projects/${projectSlug}/tasks`, {
+      // POST /api/workspaces[/<parent-chain>] — empty splat targets the root.
+      const url = isRoot
+        ? `/api/workspaces`
+        : `/api/workspaces/${encodeWorkspacePath(parentPath)}`;
+      await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ slug, overview: overview || name, details }),
       });
-      onCreated(slug);
+      onCreated([...parentPath, slug]);
     } finally {
       setBusy(false);
     }
@@ -240,7 +141,7 @@ function QuickTaskModal({
 
   return (
     <ModalShell
-      title={`New task in ${projectSlug}`}
+      title={`New workspace${titleSuffix}`}
       subtitle="Quick form. Switch to chat for a guided setup."
       onClose={onClose}
       footer={
@@ -261,7 +162,7 @@ function QuickTaskModal({
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          placeholder="short-title-for-this-task"
+          placeholder="short-title-for-this-workspace"
           className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>
@@ -269,7 +170,7 @@ function QuickTaskModal({
         <input
           value={overview}
           onChange={(e) => setOverview(e.target.value)}
-          placeholder="What should be done?"
+          placeholder="What is this workspace about?"
           className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-lg px-3 py-2 text-[13.5px] outline-none focus:border-[var(--accent)]"
         />
       </Field>
@@ -286,31 +187,37 @@ function QuickTaskModal({
   );
 }
 
-function ChatTaskKickoff({
-  projectSlug,
+// Plan-with-an-agent: captures one first message, kicks off a planning session
+// via /api/plan (creating a stub workspace at the root when needed), then
+// routes the user into the session page. The agent's `propose_*` tool call
+// shows up there as an inline acceptance card the user can accept.
+function ChatWorkspaceKickoff({
+  parentPath,
   onClose,
   onSwitchToQuick,
 }: {
-  projectSlug: string;
+  parentPath: string[];
   onClose: () => void;
   onSwitchToQuick: () => void;
 }) {
+  const isRoot = parentPath.length === 0;
+  const titleSuffix = isRoot ? "" : ` in ${parentPath.join(" › ")}`;
   return (
     <KickoffShell
-      title={`New task in ${projectSlug} — plan with an agent`}
+      title={`New workspace${titleSuffix} — plan with an agent`}
       subtitle="Tell the agent what you want. It runs as a regular session — you can step away and come back."
-      placeholder="Tell the agent about this task…"
+      placeholder="Tell the agent about this workspace…"
       switchLabel="↪ Skip and just enter a name"
       onClose={onClose}
       onSwitch={onSwitchToQuick}
-      buildBody={(message) => ({ mode: "task", project: projectSlug, message })}
+      buildBody={(message) => isRoot ? { message } : { message, parent: parentPath }}
     />
   );
 }
 
 // -----------------------------------------------------------------------
-// Shared kickoff: composer that POSTs to /api/plan and routes to the
-// resulting normal session page.
+// Shared kickoff: composer that POSTs to /api/plan and routes to the resulting
+// normal session page (now: a workspace session route).
 // -----------------------------------------------------------------------
 
 function KickoffShell({
@@ -348,11 +255,12 @@ function KickoffShell({
         body: JSON.stringify(buildBody(text)),
       });
       const j = await r.json();
-      if (!r.ok || !j.id || !j.projectSlug) {
+      const workspacePath: string[] | undefined = j.workspacePath;
+      if (!r.ok || !j.id || !Array.isArray(workspacePath) || workspacePath.length === 0) {
         setError(j.error ?? "failed to start");
         return;
       }
-      router.push(projectSessionRoute(j.projectSlug, j.id));
+      router.push(workspaceSessionRoute(workspacePath, j.id));
       onClose();
     } catch (err) {
       setError(String(err));

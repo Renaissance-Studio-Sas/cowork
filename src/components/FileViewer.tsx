@@ -16,7 +16,7 @@ import { buildEnhancedHtml } from "@/lib/iframe-enhancer";
 import { resolveRelative } from "@/lib/relative-path";
 import { EmailThreadViewer, type ThreadRecord } from "./EmailThreadViewer";
 import { handleComposerEnter } from "@/lib/composer";
-import { taskFileRoute, projectFileRoute } from "@/lib/routes";
+import { encodeWorkspacePath, workspaceFileRoute } from "@/lib/routes";
 import { useWorkspace } from "@/lib/workspace-context";
 import type { SessionSummaryDTO } from "@/lib/types";
 
@@ -33,8 +33,8 @@ type CommentTarget =
   | { kind: "new" };
 
 interface Props {
-  projectSlug: string;
-  taskSlug: string;
+  /** Slug-chain of the workspace this file lives in. */
+  workspacePath: string[];
   filePath: string;
 }
 
@@ -63,8 +63,9 @@ function extOf(p: string): string {
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 const TEXT_EXT = new Set(["md", "markdown", "txt", "json", "csv", "yaml", "yml", "log"]);
 
-export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
+export function FileViewer({ workspacePath, filePath }: Props) {
   const router = useRouter();
+  const encodedWorkspace = useMemo(() => encodeWorkspacePath(workspacePath), [workspacePath]);
 
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -90,21 +91,21 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   const isMd = ext === "md" || ext === "markdown";
   const isText = TEXT_EXT.has(ext) && !isEmailThread;
   const supportsComments = isMd || isHtml;
-  const rawUrl = `/api/files/raw?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`;
+  const rawUrl = `/api/files/raw?workspace=${encodedWorkspace}&path=${encodeURIComponent(filePath)}`;
 
   const { sessions } = useWorkspace();
 
   // --- Load file content --------------------------------------------------
   const refreshFile = useCallback(() => {
     if (isImage || isPdf) return;
-    fetch(`/api/files?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`)
+    fetch(`/api/files?workspace=${encodedWorkspace}&path=${encodeURIComponent(filePath)}`)
       .then(async (r) => {
         const j = await r.json();
         if (!r.ok) throw new Error(j.error ?? "failed");
         setText(j.content ?? "");
       })
       .catch((e) => setError(String(e)));
-  }, [projectSlug, taskSlug, filePath, isImage, isPdf]);
+  }, [encodedWorkspace, filePath, isImage, isPdf]);
 
   useEffect(() => {
     // Reset stale content then fetch when the target file changes — intended
@@ -118,10 +119,10 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   // --- Comments fetch -----------------------------------------------------
   const refreshComments = useCallback(async () => {
     if (!supportsComments) return;
-    const r = await fetch(`/api/comments?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(filePath)}`);
+    const r = await fetch(`/api/comments?workspace=${encodedWorkspace}&path=${encodeURIComponent(filePath)}`);
     const j = await r.json();
     setComments(j.comments ?? []);
-  }, [projectSlug, taskSlug, filePath, supportsComments]);
+  }, [encodedWorkspace, filePath, supportsComments]);
 
   // --- Auto-refresh when an agent modifies this file ----------------------
   // Subscribe to one multiplexed stream covering every live session in this
@@ -129,7 +130,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   // exhausted the browser's per-origin connection limit on busy tasks.)
   useEffect(() => {
     const es = new EventSource(
-      `/api/file-events/stream?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`,
+      `/api/file-events/stream?workspace=${encodedWorkspace}`,
     );
     es.addEventListener("file_changed", (ev) => {
       try {
@@ -142,7 +143,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
       } catch { /* ignore parse errors */ }
     });
     return () => es.close();
-  }, [projectSlug, taskSlug, filePath, refreshFile, refreshComments]);
+  }, [encodedWorkspace, filePath, refreshFile, refreshComments]);
 
   useEffect(() => {
     // Re-fetch comments and clear per-file editing UI state when the target
@@ -155,7 +156,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
     setContextMenu(null);
     setActiveId(null);
     setHtmlObsoleteIds(new Set());
-  }, [projectSlug, taskSlug, filePath, refreshComments]);
+  }, [encodedWorkspace, filePath, refreshComments]);
 
   // --- Markdown: resolve anchors against the visible DOM text ------------
   const [renderTick, setRenderTick] = useState(0);
@@ -304,10 +305,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
           const href = String(data.href ?? "");
           const target = resolveRelative(filePath, href);
           if (target) {
-            const route = taskSlug
-              ? taskFileRoute(projectSlug, taskSlug, target)
-              : projectFileRoute(projectSlug, target);
-            router.push(route);
+            router.push(workspaceFileRoute(workspacePath, target));
           }
           break;
         }
@@ -320,7 +318,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [isHtml, sendCommentsToIframe, filePath, projectSlug, taskSlug]);
+  }, [isHtml, sendCommentsToIframe, filePath, workspacePath, router]);
 
   // Push fresh comments to iframe whenever they change after load.
   useEffect(() => { sendCommentsToIframe(); }, [sendCommentsToIframe]);
@@ -408,8 +406,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        project: projectSlug,
-        task: taskSlug,
+        workspace: workspacePath,
         path: filePath,
         anchorType: isHtml ? "html" : "md",
         anchor: pendingAnchor ?? {},
@@ -422,12 +419,12 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   };
 
   const deleteComment = async (id: number) => {
-    await fetch(`/api/comments/${id}?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`, { method: "DELETE" });
+    await fetch(`/api/comments/${id}?workspace=${encodedWorkspace}`, { method: "DELETE" });
     refreshComments();
   };
 
   const editComment = async (id: number, body: string) => {
-    await fetch(`/api/comments/${id}?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`, {
+    await fetch(`/api/comments/${id}?workspace=${encodedWorkspace}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ body }),
@@ -445,31 +442,32 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
   // "new" = explicitly start a fresh session even if live ones exist.
   const [commentTargetSelection, setCommentTargetSelection] = useState<string | "new" | null>(null);
 
-  const taskSessions = useMemo(
-    () => sessions.filter((s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug),
-    [sessions, projectSlug, taskSlug],
+  const wsKey = workspacePath.join("/");
+  const workspaceSessions = useMemo(
+    () => sessions.filter((s) => s.workspacePath.join("/") === wsKey),
+    [sessions, wsKey],
   );
 
   // Sessions arrive sorted by lastActivity desc from /api/sessions, so the
   // first live one is the freshest live session, and [0] is the freshest overall.
   const defaultCommentTarget = useMemo<SessionSummaryDTO | null>(() => {
-    const live = taskSessions.find((s) => s.isLive && s.state !== "stopped" && s.state !== "error");
-    return live ?? taskSessions[0] ?? null;
-  }, [taskSessions]);
+    const live = workspaceSessions.find((s) => s.isLive && s.state !== "stopped" && s.state !== "error");
+    return live ?? workspaceSessions[0] ?? null;
+  }, [workspaceSessions]);
 
   const effectiveCommentTarget = useMemo<CommentTarget>(() => {
     if (commentTargetSelection === "new") return { kind: "new" };
     if (commentTargetSelection) {
-      const s = taskSessions.find((x) => x.id === commentTargetSelection);
+      const s = workspaceSessions.find((x) => x.id === commentTargetSelection);
       if (s) return { kind: "session", session: s };
     }
     if (defaultCommentTarget) return { kind: "session", session: defaultCommentTarget };
     return { kind: "new" };
-  }, [commentTargetSelection, taskSessions, defaultCommentTarget]);
+  }, [commentTargetSelection, workspaceSessions, defaultCommentTarget]);
 
   const sendCommentsToAgent = async () => {
     const live = resolvedComments.filter((c) => !c.obsolete);
-    if (live.length === 0 || sendingToAgent || !taskSlug) return;
+    if (live.length === 0 || sendingToAgent || workspacePath.length === 0) return;
     setSendingToAgent(true);
     try {
       const message = buildAgentMessage(filePath, live);
@@ -478,12 +476,12 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
         await fetch(`/api/sessions/${targetId}/input`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message }),
+          body: JSON.stringify({ message, workspace: workspacePath }),
         });
         if (!agentSessionId) setAgentSessionId(targetId);
       } else {
         const res = await fetch(
-          `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`,
+          `/api/workspaces/sessions/${encodedWorkspace}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -529,17 +527,14 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
           >{children}</a>
         );
       }
-      const route = taskSlug
-        ? taskFileRoute(projectSlug, taskSlug, target)
-        : projectFileRoute(projectSlug, target);
       return (
         <a
-          href={route}
+          href={workspaceFileRoute(workspacePath, target)}
           {...rest}
         >{children}</a>
       );
     },
-    [filePath, projectSlug, taskSlug],
+    [filePath, workspacePath],
   );
 
   const liveCount = resolvedComments.filter((c) => !c.obsolete).length;
@@ -583,8 +578,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
           <EmailThreadViewer
             thread={thread}
             filePath={filePath}
-            projectSlug={projectSlug}
-            taskSlug={taskSlug}
+            workspacePath={workspacePath}
           />
         ) : isHtml && text !== null ? (
           <div className="flex-1 min-w-0 flex flex-col p-4">
@@ -666,7 +660,7 @@ export function FileViewer({ projectSlug, taskSlug, filePath }: Props) {
             onEdit={editComment}
             onSendToAgent={sendCommentsToAgent}
             sendingToAgent={sendingToAgent}
-            taskSessions={taskSessions}
+            workspaceSessions={workspaceSessions}
             commentTarget={effectiveCommentTarget}
             onCommentTargetChange={setCommentTargetSelection}
           />
@@ -743,7 +737,7 @@ function ContextMenu({ x, y, onComment }: { x: number; y: number; onComment: () 
 function CommentPanel({
   comments, activeId, onActiveChange, composerRef, draft, pendingAnchor,
   onDraft, onClearPending, onPost, onDelete, onEdit, onSendToAgent, sendingToAgent,
-  taskSessions, commentTarget, onCommentTargetChange,
+  workspaceSessions, commentTarget, onCommentTargetChange,
 }: {
   comments: ResolvedComment[];
   activeId: number | null;
@@ -758,7 +752,7 @@ function CommentPanel({
   onEdit: (id: number, body: string) => void;
   onSendToAgent: () => void;
   sendingToAgent: boolean;
-  taskSessions: SessionSummaryDTO[];
+  workspaceSessions: SessionSummaryDTO[];
   commentTarget: CommentTarget;
   onCommentTargetChange: (id: string | "new" | null) => void;
 }) {
@@ -774,7 +768,7 @@ function CommentPanel({
             count={live.length}
             sending={sendingToAgent}
             target={commentTarget}
-            sessions={taskSessions}
+            sessions={workspaceSessions}
             onSend={onSendToAgent}
             onTargetChange={onCommentTargetChange}
           />
@@ -916,7 +910,7 @@ function SendToAgentButton({
         >
           {sessions.length === 0 && (
             <div className="px-3 py-2 text-[11.5px] text-[var(--muted)] italic">
-              No sessions yet for this task.
+              No sessions yet for this workspace.
             </div>
           )}
           {sessions.map((s) => {

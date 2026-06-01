@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
+import { encodeWorkspacePath } from "@/lib/routes";
 import { TodoList, extractTodosFromMessages, type TodoItem } from "./TodoList";
 import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachment } from "./FileDropZone";
 import { WorkingIndicator } from "./WorkingIndicator";
@@ -210,6 +211,14 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     attachmentsRef.current = attachments;
   });
 
+  // Derive a stable string key from the workspace path so the SSE effect
+  // doesn't tear down on every poll cycle (the WorkspaceContext refresh hands
+  // back a fresh `workspacePath` array even when the contents are unchanged).
+  const workspacePathKey = useMemo(
+    () => session.workspacePath.join("/"),
+    [session.workspacePath],
+  );
+
   useEffect(() => {
     // Reset all per-session UI state and (re)open the SSE stream whenever the
     // session changes — an intentional reset-on-prop-change paired with the
@@ -231,8 +240,9 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
     // the session might actually be live (race condition with API polling)
+    const encodedWorkspace = encodeWorkspacePath(session.workspacePath);
     const es = new EventSource(
-      `/api/sessions/${session.id}/stream?limit=${PAGE_SIZE}&project=${encodeURIComponent(session.projectSlug)}&task=${encodeURIComponent(session.taskSlug)}`,
+      `/api/sessions/${session.id}/stream?limit=${PAGE_SIZE}&workspace=${encodedWorkspace}`,
     );
     let connected = false;
     const initialMessages: SDKMessageLite[] = [];
@@ -439,7 +449,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         es.close();
         setStreamConnected(false);
         // Load from disk with pagination
-        fetch(`/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=0`)
+        fetch(`/api/sessions/${session.id}/history?workspace=${encodedWorkspace}&limit=${PAGE_SIZE}&offset=0`)
           .then((r) => r.json())
           .then((j) => {
             if (j.events) {
@@ -469,7 +479,8 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     };
     // Only reconnect SSE when session.id changes, not on state changes
     // State updates come via the SSE stream itself
-  }, [session.id, session.projectSlug, session.taskSlug]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- workspace is keyed by string above; session.completed/state intentionally not in deps
+  }, [session.id, workspacePathKey]);
 
   // Load more (older) messages when scrolling to top
   const loadMore = useCallback(async () => {
@@ -482,7 +493,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
 
     try {
       const r = await fetch(
-        `/api/sessions/${session.id}/history?project=${session.projectSlug}&task=${session.taskSlug}&limit=${PAGE_SIZE}&offset=${messages.length}`
+        `/api/sessions/${session.id}/history?workspace=${encodeWorkspacePath(session.workspacePath)}&limit=${PAGE_SIZE}&offset=${messages.length}`
       );
       const j = await r.json();
 
@@ -500,7 +511,8 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     } finally {
       setIsLoadingMore(false);
     }
-  }, [historyMeta, isLoadingMore, session.id, session.projectSlug, session.taskSlug, messages.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- workspacePath identity churns each poll; the string key above is the real dep
+  }, [historyMeta, isLoadingMore, session.id, workspacePathKey, messages.length]);
 
   useEffect(() => {
     if (composerRef.current) composerRef.current.focus();
@@ -572,7 +584,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
       formData.append("file", att.file);
       try {
         const res = await fetch(
-          `/api/files/upload?project=${session.projectSlug}&task=${session.taskSlug}`,
+          `/api/files/upload?workspace=${encodeWorkspacePath(session.workspacePath)}`,
           { method: "POST", body: formData }
         );
         if (res.ok) {
@@ -631,8 +643,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: messageText,
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
           files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
           openArtifact: openArtifactPath || undefined,
         }),
@@ -664,8 +675,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
           name: editName.trim(),
         }),
       });
@@ -682,8 +692,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
         }),
       });
       onBack(); // Navigate back after deletion
@@ -741,8 +750,8 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
           className={embedded
             ? "text-[var(--muted)] hover:text-[var(--text)] text-[14px] leading-none w-6 h-6 rounded hover:bg-[var(--panel-2)] flex items-center justify-center shrink-0"
             : "text-[var(--muted)] hover:text-[var(--text)] text-[13px] -ml-1.5"}
-          title={embedded ? "Collapse chat" : "Back to task"}
-        >{embedded ? "×" : "← Task"}</button>
+          title={embedded ? "Collapse chat" : "Back to workspace"}
+        >{embedded ? "×" : "← Workspace"}</button>
         <div className="flex-1 min-w-0">
           {isRenaming ? (
             <input
@@ -783,7 +792,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
           )}
           {!embedded && (
           <div className="text-[11.5px] text-[var(--muted)] flex items-center gap-1.5">
-            <span>{session.projectSlug}{session.taskSlug ? ` · ${session.taskSlug}` : ""}</span>
+            <span>{session.workspacePath.join(" › ") || "(no workspace)"}</span>
             <span>·</span>
             <span
               className={`inline-flex items-center gap-1 ${isPending ? "pulse" : ""}`}

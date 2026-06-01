@@ -47,8 +47,7 @@ export function ContinueComposer({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: draft.trim(),
-          projectSlug: session.projectSlug,
-          taskSlug: session.taskSlug,
+          workspace: session.workspacePath,
           openArtifact: openArtifactPath || undefined,
         }),
       });

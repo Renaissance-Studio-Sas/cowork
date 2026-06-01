@@ -1,23 +1,17 @@
 // Shared types for the agent-workbench app
 
-export interface ProjectDTO {
+export interface WorkspaceDTO {
   slug: string;
   folderName: string;
+  // Full slug-chain from the root workspace down to this one (own slug
+  // included). `["HR", "pay-contractors"]` identifies the workspace under HR
+  // previously known as task "pay-contractors".
+  path: string[];
   status: "active" | "archived";
   overview: string;
   details: string;        // markdown
   createdAt: string;
-  tasks: TaskDTO[];
-}
-
-export interface TaskDTO {
-  slug: string;
-  folderName: string;
-  projectSlug: string;
-  status: "active" | "archived";
-  overview: string;
-  details: string;        // markdown
-  createdAt: string;
+  children: WorkspaceDTO[];
 }
 
 export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
@@ -28,8 +22,7 @@ export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface SessionSummaryDTO {
   id: string;
-  projectSlug: string;
-  taskSlug: string;
+  workspacePath: string[];
   state: "running" | "idle" | "awaiting_input" | "stopped" | "error";
   title: string;
   startedAt: string;

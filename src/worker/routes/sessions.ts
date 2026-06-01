@@ -1,10 +1,14 @@
 import { Hono } from "hono";
 import { proxy, type ProxyBindings } from "../lib/proxy";
 
-// Mirrors src/app/api/sessions/** — the largest group. Sessions are live agent
-// runs owned by the backend (SDK subprocesses, in-memory event emitters), so
-// every endpoint forwards. /:id/stream is the SSE transcript; the proxy streams
-// it unbuffered.
+// Mirrors src/server/routes/sessions.ts. Sessions are live agent runs owned
+// by the backend (SDK subprocesses, in-memory event emitters), so every
+// endpoint forwards. /:id/stream is the SSE transcript; the proxy streams it
+// unbuffered.
+//
+// Endpoint bodies and query params now carry `workspace` (string[] or
+// slash-joined slug-chain) instead of the legacy `projectSlug` / `taskSlug`
+// pair, but the URL shape is unchanged — the proxy doesn't need to translate.
 export const sessions = new Hono<{ Bindings: ProxyBindings }>();
 
 // ---- collection ---------------------------------------------------------

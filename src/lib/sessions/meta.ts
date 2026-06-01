@@ -5,22 +5,20 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, sessionDir } from "../fs";
+import { getWorkspace, sessionDir } from "../fs";
 import type { SessionState } from "../session-state-machine";
 import type { RuntimeSession } from "./types";
 
 // Resolve the directory holding meta.json for a session. With flat session
-// storage the path doesn't depend on (project, task) — those args are kept
+// storage the path doesn't depend on workspace; the workspace lookup is kept
 // for existence-validation only so the API surface matches the rest of the
 // session module.
 async function resolveSessionDir(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<string | null> {
-  const project = await getProject(projectSlug);
-  if (!project) return null;
-  if (taskSlug && !project.tasks.find((t) => t.slug === taskSlug)) return null;
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return null;
   return sessionDir(sessionId);
 }
 
@@ -46,11 +44,10 @@ export async function updateMeta(
   const prev = metaWriteQueue.get(s.id) ?? Promise.resolve();
   const next = prev.then(async () => {
     try {
-      // Project lookup is retained for validation; with flat session storage
-      // the on-disk path doesn't depend on the project's folder name.
-      const project = await getProject(s.projectSlug);
-      if (!project) return;
-      if (s.taskSlug && !project.tasks.find((t) => t.slug === s.taskSlug)) return;
+      // Workspace lookup is retained for validation; with flat session storage
+      // the on-disk path doesn't depend on the workspace folder names.
+      const ws = await getWorkspace(s.workspacePath);
+      if (!ws) return;
 
       const metaPath = path.join(sessionDir(s.id), "meta.json");
       const tmpPath = metaPath + ".tmp";
@@ -96,11 +93,10 @@ export async function persistOwnerPid(s: RuntimeSession): Promise<void> {
 // ownerPid); going through updateMeta would deadlock against an in-flight
 // write.
 export async function readMetaRaw(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   sessionId: string,
 ): Promise<Record<string, unknown> | null> {
-  const dir = await resolveSessionDir(projectSlug, taskSlug, sessionId);
+  const dir = await resolveSessionDir(workspacePath, sessionId);
   if (!dir) return null;
   try {
     return JSON.parse(await fs.readFile(path.join(dir, "meta.json"), "utf8"));

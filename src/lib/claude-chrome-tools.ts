@@ -67,12 +67,11 @@ function resolveCloudBrowserHeaders(): Record<string, string> {
 // these whenever we call setMcpServers (REPLACE semantics).
 export async function buildStaticWorkbenchMcps(
   sessionId: string,
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
 ): Promise<Record<string, McpServerConfig>> {
   const base: Record<string, McpServerConfig> = {
-    "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(projectSlug, taskSlug)),
-    "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, projectSlug, taskSlug)),
+    "workbench-comments": workbenchToolsAsClaudeMcp("workbench-comments", buildCommentsTools(workspacePath)),
+    "workbench-session": workbenchToolsAsClaudeMcp("workbench-session", buildSessionTools(sessionId, workspacePath)),
     "workbench-user-input": workbenchToolsAsClaudeMcp("workbench-user-input", buildUserInputTools(sessionId)),
   };
 

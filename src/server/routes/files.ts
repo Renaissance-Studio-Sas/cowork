@@ -1,21 +1,26 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  getProject,
-  projectDirFor,
-  taskDir,
-  projectDir,
   deleteFile,
-  deleteProjectFile,
+  getWorkspace,
   readFileText,
-  readProjectFileText,
   renameFile,
-  renameProjectFile,
+  workspaceDir,
   writeFileText,
 } from "@/lib/fs";
+import { decodeWorkspacePath } from "@/lib/routes";
 
 export const files = new Hono();
+
+// Workspaces collapse the old (project, task) pair into a single slug-chain
+// passed via the `workspace=` query param (each segment URI-encoded, joined
+// with `/`). Helper used by every handler below.
+function workspacePathFromQuery(c: Context): string[] | null {
+  const raw = c.req.query("workspace");
+  if (raw === undefined || raw === null) return null;
+  return decodeWorkspacePath(raw);
+}
 
 function mimeFor(p: string): string {
   const ext = path.extname(p).toLowerCase();
@@ -49,26 +54,20 @@ function mimeFor(p: string): string {
   }
 }
 
+// Stream a file's raw bytes out of a workspace's `files/` directory.
+// Identification is `workspace=<slug-chain>&path=<relative path>`. With the
+// project/task split gone there's only one shape — no second viewer code
+// path.
 files.get("/raw", async (c) => {
-  const req = c.req.raw;
-  const url = new URL(req.url);
-  const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task") || "";
-  const file = url.searchParams.get("path");
-  if (!project || !file) {
-    return c.json({ error: "project, path required" }, 400);
+  const workspacePath = workspacePathFromQuery(c);
+  const file = c.req.query("path");
+  if (!workspacePath || !file) {
+    return c.json({ error: "workspace, path required" }, 400);
   }
 
-  let base: string;
-  if (task) {
-    const p = await getProject(project);
-    const t = p?.tasks.find((x) => x.slug === task);
-    if (!p || !t) return c.json({ error: "not found" }, 404);
-    base = path.join(taskDir(p, t), "files");
-  } else {
-    try { base = path.join(await projectDirFor(project), "files"); }
-    catch { return c.json({ error: "not found" }, 404); }
-  }
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return c.json({ error: "not found" }, 404);
+  const base = path.join(workspaceDir(ws), "files");
 
   const full = path.resolve(base, file);
   if (!full.startsWith(base + path.sep) && full !== base) {
@@ -112,20 +111,17 @@ function sanitizeFilename(name: string): string {
 }
 
 files.post("/upload", async (c) => {
-  const req = c.req.raw;
-  const url = new URL(req.url);
-  const projectSlug = url.searchParams.get("project");
-  const taskSlug = url.searchParams.get("task") || "";
+  const workspacePath = workspacePathFromQuery(c);
   // Default to the artifacts root (files/). Callers can still pass an explicit
   // subdir (e.g. the artifacts list passes the folder currently being viewed).
-  const subdir = url.searchParams.get("subdir") || "";
+  const subdir = c.req.query("subdir") || "";
 
-  if (!projectSlug) {
-    return c.json({ error: "project required" }, 400);
+  if (!workspacePath) {
+    return c.json({ error: "workspace required" }, 400);
   }
 
   // Parse multipart form data
-  const formData = await req.formData();
+  const formData = await c.req.raw.formData();
   const file = formData.get("file") as File | null;
 
   if (!file) {
@@ -135,26 +131,15 @@ files.post("/upload", async (c) => {
   if (file.size > MAX_FILE_SIZE) {
     return c.json(
       { error: `File too large. Max size is ${MAX_FILE_SIZE / 1024 / 1024}MB` },
-      400
+      400,
     );
   }
 
-  // Determine base directory
-  let base: string;
-  if (taskSlug) {
-    const project = await getProject(projectSlug);
-    const task = project?.tasks.find((t) => t.slug === taskSlug);
-    if (!project || !task) {
-      return c.json({ error: "task not found" }, 404);
-    }
-    base = path.join(taskDir(project, task), "files");
-  } else {
-    const project = await getProject(projectSlug);
-    if (!project) {
-      return c.json({ error: "project not found" }, 404);
-    }
-    base = path.join(projectDir(project), "files");
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) {
+    return c.json({ error: "workspace not found" }, 404);
   }
+  const base = path.join(workspaceDir(ws), "files");
 
   // Generate unique filename with timestamp
   const timestamp = Date.now();
@@ -179,26 +164,19 @@ files.post("/upload", async (c) => {
     });
   } catch (err) {
     console.error("Upload error:", err);
-    return c.json(
-      { error: String(err) },
-      500
-    );
+    return c.json({ error: String(err) }, 500);
   }
 });
 
+// Read a text file (JSON wrapper, used by the in-app editor / viewer).
 files.get("/", async (c) => {
-  const req = c.req.raw;
-  const url = new URL(req.url);
-  const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task") || "";
-  const file = url.searchParams.get("path");
-  if (!project || !file) {
-    return c.json({ error: "project, path required" }, 400);
+  const workspacePath = workspacePathFromQuery(c);
+  const file = c.req.query("path");
+  if (!workspacePath || !file) {
+    return c.json({ error: "workspace, path required" }, 400);
   }
   try {
-    const content = task
-      ? await readFileText(project, task, file)
-      : await readProjectFileText(project, file);
+    const content = await readFileText(workspacePath, file);
     return c.json({ content });
   } catch (err) {
     return c.json({ error: String(err) }, 404);
@@ -206,32 +184,25 @@ files.get("/", async (c) => {
 });
 
 files.put("/", async (c) => {
-  const req = c.req.raw;
-  const url = new URL(req.url);
-  const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task");
-  const file = url.searchParams.get("path");
-  const { content } = await req.json();
-  if (!project || !task || !file || typeof content !== "string") {
-    return c.json({ error: "project, task, path, content required" }, 400);
+  const workspacePath = workspacePathFromQuery(c);
+  const file = c.req.query("path");
+  const { content } = await c.req.raw.json();
+  if (!workspacePath || !file || typeof content !== "string") {
+    return c.json({ error: "workspace, path, content required" }, 400);
   }
-  await writeFileText(project, task, file, content);
+  await writeFileText(workspacePath, file, content);
   return c.json({ ok: true });
 });
 
 files.patch("/", async (c) => {
-  const req = c.req.raw;
-  const body = await req.json();
-  const { project, task, from, to } = body ?? {};
-  if (!project || !from || !to) {
-    return c.json({ error: "project, from, to required" }, 400);
+  const body = await c.req.raw.json();
+  const { workspace, from, to } = body ?? {};
+  if (!workspace || !from || !to) {
+    return c.json({ error: "workspace, from, to required" }, 400);
   }
+  const workspacePath = Array.isArray(workspace) ? workspace : decodeWorkspacePath(String(workspace));
   try {
-    if (task) {
-      await renameFile(project, task, from, to);
-    } else {
-      await renameProjectFile(project, from, to);
-    }
+    await renameFile(workspacePath, from, to);
     return c.json({ ok: true, path: to });
   } catch (err) {
     return c.json({ error: String(err) }, 400);
@@ -239,20 +210,13 @@ files.patch("/", async (c) => {
 });
 
 files.delete("/", async (c) => {
-  const req = c.req.raw;
-  const url = new URL(req.url);
-  const project = url.searchParams.get("project");
-  const task = url.searchParams.get("task");
-  const file = url.searchParams.get("path");
-  if (!project || !file) {
-    return c.json({ error: "project, path required" }, 400);
+  const workspacePath = workspacePathFromQuery(c);
+  const file = c.req.query("path");
+  if (!workspacePath || !file) {
+    return c.json({ error: "workspace, path required" }, 400);
   }
   try {
-    if (task) {
-      await deleteFile(project, task, file);
-    } else {
-      await deleteProjectFile(project, file);
-    }
+    await deleteFile(workspacePath, file);
     return c.json({ ok: true });
   } catch (err) {
     return c.json({ error: String(err) }, 400);

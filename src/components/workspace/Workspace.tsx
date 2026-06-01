@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useRouter, useSearchParams, usePathname } from "@/lib/navigation";
-import type { ProjectDTO, TaskDTO, SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
-import { useWorkspace } from "@/lib/workspace-context";
+import type { WorkspaceDTO, SessionSummaryDTO, SessionRuntime, EffortLevel } from "@/lib/types";
+import { findWorkspace, useWorkspace } from "@/lib/workspace-context";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { WorkingIndicator } from "@/components/WorkingIndicator";
 import { Markdown } from "@/components/chat/Markdown";
@@ -14,9 +14,9 @@ import { FileViewer } from "@/components/FileViewer";
 import { Chat } from "@/components/Chat";
 import {
   buildWorkspaceQuery,
-  projectRoute,
-  taskRoute,
-  saveTaskPath,
+  encodeWorkspacePath,
+  saveWorkspacePath,
+  workspaceRoute,
   type WorkspaceParams,
 } from "@/lib/routes";
 
@@ -99,43 +99,39 @@ function clampFraction(n: number): number {
   return Math.min(MAX_COLUMN_FRACTION, Math.max(MIN_COLUMN_FRACTION, n));
 }
 
+function pathKey(path: string[]): string { return path.join("/"); }
+
 // ---------------------------------------------------------------------------
 // Workspace shell
 // ---------------------------------------------------------------------------
 
 interface WorkspaceProps {
-  projectSlug: string;
-  /** Undefined for project-level workspace. */
-  taskSlug?: string;
+  /** Slug-chain identifying this workspace, from root → leaf. */
+  workspacePath: string[];
 }
 
-export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
+export function Workspace({ workspacePath }: WorkspaceProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const { projects, sessions, refresh } = useWorkspace();
+  const { workspaces, sessions, refresh } = useWorkspace();
 
   const dirPath = searchParams.get("dir") ?? "";
   const artifactPath = searchParams.get("artifact") ?? "";
   const chatSessionId = searchParams.get("chat") ?? "";
   const splitParam = searchParams.get("split");
 
-  const project = useMemo<ProjectDTO | null>(
-    () => projects.find((p) => p.slug === projectSlug) ?? null,
-    [projects, projectSlug],
-  );
-  const task = useMemo<TaskDTO | null>(
-    () => (taskSlug ? project?.tasks.find((t) => t.slug === taskSlug) ?? null : null),
-    [project, taskSlug],
+  const workspace = useMemo<WorkspaceDTO | null>(
+    () => findWorkspace(workspaces, workspacePath),
+    [workspaces, workspacePath],
   );
 
-  // Sessions scoped to this view (project-level or task-level).
-  const viewSessions = useMemo(() => {
-    if (taskSlug) {
-      return sessions.filter((s) => s.projectSlug === projectSlug && s.taskSlug === taskSlug);
-    }
-    return sessions.filter((s) => s.projectSlug === projectSlug && !s.taskSlug);
-  }, [sessions, projectSlug, taskSlug]);
+  // Sessions that belong directly to this workspace (not its descendants).
+  const wsKey = pathKey(workspacePath);
+  const viewSessions = useMemo(
+    () => sessions.filter((s) => pathKey(s.workspacePath) === wsKey),
+    [sessions, wsKey],
+  );
 
   // ---- URL helpers --------------------------------------------------------
 
@@ -158,11 +154,13 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     [dirPath, artifactPath, chatSessionId, splitParam],
   );
 
-  // Remember the current view so the sidebar can restore it (task view only).
+  // Remember the current view so the sidebar can restore it on next visit.
+  // Persist for every workspace (root or deeply nested) so "click in sidebar"
+  // always lands the user where they left off.
   useEffect(() => {
-    if (!taskSlug) return;
-    saveTaskPath(projectSlug, taskSlug, `${pathname}${buildWorkspaceQuery(currentParams)}`);
-  }, [projectSlug, taskSlug, pathname, currentParams]);
+    if (workspacePath.length === 0) return;
+    saveWorkspacePath(workspacePath, `${pathname}${buildWorkspaceQuery(currentParams)}`);
+  }, [workspacePath, pathname, currentParams]);
 
   // ---- Files --------------------------------------------------------------
 
@@ -173,11 +171,11 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   const [renamingPath, setRenamingPath] = useState<{ path: string; type: "file" | "folder" } | null>(null);
   const [renameValue, setRenameValue] = useState("");
 
+  const encodedWorkspace = useMemo(() => encodeWorkspacePath(workspacePath), [workspacePath]);
+
   const refreshFiles = useCallback(async () => {
-    const url = taskSlug
-      ? `/api/projects/${projectSlug}/tasks/${taskSlug}`
-      : `/api/projects/${projectSlug}/files`;
-    const r = await fetch(url, { cache: "no-store" });
+    if (workspacePath.length === 0) return;
+    const r = await fetch(`/api/workspaces/files/${encodedWorkspace}`, { cache: "no-store" });
     const j = await r.json();
     const meta: { path: string; mtime: number }[] | null = j.filesMeta ?? null;
     if (meta) {
@@ -191,16 +189,17 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
       const paths: string[] = j.files ?? [];
       setFiles(paths.map((p) => ({ type: "file", name: p.split("/").pop() ?? p, path: p })));
     }
-  }, [projectSlug, taskSlug]);
+  }, [encodedWorkspace, workspacePath.length]);
 
   const refreshCommentCounts = useCallback(async () => {
+    if (workspacePath.length === 0) return;
     const r = await fetch(
-      `/api/comments/counts?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug ?? "")}`,
+      `/api/comments/counts?workspace=${encodedWorkspace}`,
       { cache: "no-store" },
     );
     const j = await r.json();
     setCommentCounts(j.counts ?? {});
-  }, [projectSlug, taskSlug]);
+  }, [encodedWorkspace, workspacePath.length]);
 
   useEffect(() => {
     // Initial load of the artifact list + comment counts; both set state from
@@ -217,12 +216,12 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   const openArtifactRef = useRef<((p: string) => void) | null>(null);
 
   // Keep the artifacts list live: refresh whenever a file changes in this
-  // project/task, and react to open_artifact requests from any agent in this
-  // task (workbench-session.open_artifact tool → SSE → here → openArtifact).
+  // workspace, and react to open_artifact requests from any agent here
+  // (workbench-session.open_artifact tool → SSE → here → openArtifact).
   useEffect(() => {
-    if (!taskSlug) return;
+    if (workspacePath.length === 0) return;
     const es = new EventSource(
-      `/api/file-events/stream?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}`,
+      `/api/file-events/stream?workspace=${encodedWorkspace}`,
     );
     es.addEventListener("file_changed", () => {
       refreshFiles();
@@ -235,7 +234,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
       } catch { /* ignore parse errors */ }
     });
     return () => es.close();
-  }, [projectSlug, taskSlug, refreshFiles, refreshCommentCounts]);
+  }, [encodedWorkspace, workspacePath.length, refreshFiles, refreshCommentCounts]);
 
   // Flatten file paths into entries for the current directory, sorted by
   // recency (most recently modified first). A folder's recency is the newest
@@ -268,7 +267,9 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
       mtime: info.mtime,
     }));
     const isRoot = !dirPath;
-    const hiddenAtRoot = taskSlug ? "task.json" : "project.json";
+    // workspace.json is the on-disk brief — hide it from the artifacts list so
+    // the user only sees files they actually authored.
+    const hiddenAtRoot = "workspace.json";
     const byRecency = (a: Entry, b: Entry) =>
       (b.mtime ?? 0) - (a.mtime ?? 0) || a.name.localeCompare(b.name);
     const folders = folderEntries.sort(byRecency);
@@ -276,7 +277,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
       .filter((e) => !(isRoot && e.name === hiddenAtRoot))
       .sort(byRecency);
     return [...folders, ...filesAtLevel];
-  }, [files, dirPath, taskSlug]);
+  }, [files, dirPath]);
 
   const breadcrumb = useMemo(() => {
     if (!dirPath) return [{ name: "Artifacts", path: "" }];
@@ -361,7 +362,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
 
   const handleFileDrop = useCallback(
     async (attachments: FileAttachment[]) => {
-      if (!taskSlug || attachments.length === 0) return;
+      if (workspacePath.length === 0 || attachments.length === 0) return;
       setUploading(true);
       setUploadError(null);
       const failed: string[] = [];
@@ -370,7 +371,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
           const formData = new FormData();
           formData.append("file", att.file);
           const subdir = dirPath || "";
-          const url = `/api/files/upload?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}${subdir ? `&subdir=${encodeURIComponent(subdir)}` : "&subdir="}`;
+          const url = `/api/files/upload?workspace=${encodedWorkspace}${subdir ? `&subdir=${encodeURIComponent(subdir)}` : "&subdir="}`;
           try {
             const res = await fetch(url, { method: "POST", body: formData });
             if (!res.ok) {
@@ -389,7 +390,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         }
       }
     },
-    [projectSlug, taskSlug, dirPath, refreshFiles],
+    [encodedWorkspace, workspacePath.length, dirPath, refreshFiles],
   );
 
   // ---- Context menus / file management -----------------------------------
@@ -418,7 +419,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     const res = await fetch(`/api/files`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: projectSlug, task: taskSlug ?? "", from: renamingPath.path, to: newPath }),
+      body: JSON.stringify({ workspace: workspacePath, from: renamingPath.path, to: newPath }),
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
@@ -434,7 +435,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
       ? `Delete folder "${e.name}" and everything in it?`
       : `Delete "${e.name}"?`)) return;
     const r = await fetch(
-      `/api/files?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug ?? "")}&path=${encodeURIComponent(e.path)}`,
+      `/api/files?workspace=${encodedWorkspace}&path=${encodeURIComponent(e.path)}`,
       { method: "DELETE" },
     );
     if (!r.ok) {
@@ -447,8 +448,8 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
 
   const openEntryContextMenu = (e: React.MouseEvent, entry: Entry) => {
     e.preventDefault();
-    const briefName = taskSlug ? "task.json" : "project.json";
-    if (entry.type === "file" && entry.path === briefName) return;
+    // workspace.json is the on-disk brief — block rename/delete from the UI.
+    if (entry.type === "file" && entry.path === "workspace.json") return;
     const items: MenuItem[] = [
       { label: "Rename", onClick: () => startRename(entry) },
       { label: "Delete", danger: true, onClick: () => deleteEntry(entry) },
@@ -475,7 +476,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     const res = await fetch(`/api/sessions/${sessionId}/rename`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectSlug, taskSlug: taskSlug ?? "", name: newName }),
+      body: JSON.stringify({ workspace: workspacePath, name: newName }),
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
@@ -489,7 +490,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     const res = await fetch(`/api/sessions/${s.id}/delete`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectSlug, taskSlug: taskSlug ?? "" }),
+      body: JSON.stringify({ workspace: workspacePath }),
     });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
@@ -519,23 +520,17 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
   const [showDetails, setShowDetails] = useState(false);
 
   const brief = useMemo(() => {
-    if (taskSlug && task) {
-      if (!task.overview && !task.details) return null;
-      return { label: "Task", overview: task.overview, details: task.details };
-    }
-    if (!taskSlug && project) {
-      if (!project.overview && !project.details) return null;
-      return { label: "Project", overview: project.overview, details: project.details };
-    }
-    return null;
-  }, [task, project, taskSlug]);
+    if (!workspace) return null;
+    if (!workspace.overview && !workspace.details) return null;
+    return { overview: workspace.overview, details: workspace.details };
+  }, [workspace]);
 
   // ---- New-session composer ----------------------------------------------
 
   // Persist the new-session draft in localStorage (like the in-session
-  // composer) so typed text survives navigation/reload. Keyed per
-  // project/task scope; "new-" prefix can't collide with real session ids.
-  const [draft, setDraft] = useStickyDraft(`new-${projectSlug}-${taskSlug ?? "project"}`);
+  // composer) so typed text survives navigation/reload. Keyed per workspace
+  // chain; "new-" prefix can't collide with real session ids.
+  const [draft, setDraft] = useStickyDraft(`new-${pathKey(workspacePath)}`);
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const [effort, setEffort] = useState<EffortLevel | "">("");
@@ -561,7 +556,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         for (const att of newAttachments) {
           const formData = new FormData();
           formData.append("file", att.file);
-          const upUrl = `/api/files/upload?project=${encodeURIComponent(projectSlug)}${taskSlug ? `&task=${encodeURIComponent(taskSlug)}` : ""}`;
+          const upUrl = `/api/files/upload?workspace=${encodedWorkspace}`;
           try {
             const res = await fetch(upUrl, { method: "POST", body: formData });
             if (res.ok) {
@@ -582,9 +577,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         }
       }
 
-      const url = taskSlug
-        ? `/api/projects/${projectSlug}/tasks/${taskSlug}/sessions`
-        : `/api/projects/${projectSlug}/sessions`;
+      const url = `/api/workspaces/sessions/${encodedWorkspace}`;
       const r = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -632,42 +625,35 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     fetch(`/api/sessions/${chatSessionId}/seen`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectSlug, taskSlug: taskSlug ?? "" }),
+      body: JSON.stringify({ workspace: workspacePath }),
     }).then(() => refresh());
-  }, [chatSessionId, sessions, projectSlug, taskSlug, refresh]);
+  }, [chatSessionId, sessions, workspacePath, refresh]);
 
   // ---- Archive toggle -----------------------------------------------------
 
   const toggleArchived = async () => {
-    if (taskSlug && task) {
-      await fetch(`/api/projects/${projectSlug}/tasks/${taskSlug}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: task.status === "active" ? "archived" : "active" }),
-      });
-    } else if (project) {
-      await fetch(`/api/projects/${projectSlug}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: project.status === "active" ? "archived" : "active" }),
-      });
-    }
+    if (!workspace) return;
+    await fetch(`/api/workspaces/status/${encodedWorkspace}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: workspace.status === "active" ? "archived" : "active" }),
+    });
     refresh();
   };
 
   // ---- Loading state ------------------------------------------------------
 
-  if (!project) {
+  if (workspacePath.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
-        {projects.length === 0 ? "Loading..." : "Project not found"}
+        Pick a workspace on the left.
       </div>
     );
   }
-  if (taskSlug && !task) {
+  if (!workspace) {
     return (
       <div className="flex-1 flex items-center justify-center text-[var(--muted)]">
-        Task not found
+        {workspaces.length === 0 ? "Loading..." : "Workspace not found"}
       </div>
     );
   }
@@ -683,39 +669,38 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
     ? sessions.find((s) => s.id === chatSessionId) ?? null
     : null;
 
+  const childCount = workspace.children.length;
+
   return (
     <>
       {/* Header */}
       <header className="h-14 border-b border-[var(--border)] flex items-center px-6 gap-3 shrink-0">
         <div className="flex-1 min-w-0">
-          <div className="text-[14px] truncate">
-            {taskSlug ? (
-              <>
-                <Link href={projectRoute(projectSlug)} className="text-[var(--muted)] hover:text-[var(--text)]">
-                  {projectSlug}
-                </Link>
-                <span className="text-[var(--muted)] mx-1.5">·</span>
-                <span className={task?.status === "archived" ? "text-[var(--muted)] line-through" : ""}>
-                  {task?.slug}
+          <div className="text-[14px] truncate flex items-center gap-1.5">
+            {workspacePath.slice(0, -1).map((slug, i) => {
+              const parentPath = workspacePath.slice(0, i + 1);
+              return (
+                <span key={i} className="flex items-center gap-1.5">
+                  <Link href={workspaceRoute(parentPath)} className="text-[var(--muted)] hover:text-[var(--text)]">
+                    {slug}
+                  </Link>
+                  <span className="text-[var(--muted)]">›</span>
                 </span>
-              </>
-            ) : (
-              <span className={project.status === "archived" ? "text-[var(--muted)] line-through" : ""}>
-                {project.slug}
-              </span>
-            )}
+              );
+            })}
+            <span className={workspace.status === "archived" ? "text-[var(--muted)] line-through" : ""}>
+              {workspace.slug}
+            </span>
           </div>
-          {!taskSlug && (
-            <div className="text-[11.5px] text-[var(--muted)]">
-              project · {project.tasks.length} task{project.tasks.length === 1 ? "" : "s"}
-            </div>
-          )}
+          <div className="text-[11.5px] text-[var(--muted)]">
+            workspace{childCount > 0 ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}
+          </div>
         </div>
         <button
           onClick={toggleArchived}
           className="text-[12px] text-[var(--text-soft)] border border-[var(--border-strong)] rounded-lg px-3 py-1.5 hover:bg-[var(--panel-2)]"
         >
-          {(taskSlug ? task?.status : project.status) === "active" ? "🗄 Archive" : "↺ Unarchive"}
+          {workspace.status === "active" ? "🗄 Archive" : "↺ Unarchive"}
         </button>
       </header>
 
@@ -725,7 +710,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
           <div className="max-w-[1200px] mx-auto">
             <div className="flex items-start gap-3">
               <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] font-medium pt-1 shrink-0">
-                {brief.label}
+                Workspace
               </div>
               <div className="flex-1 min-w-0">
                 {brief.overview && (
@@ -764,8 +749,7 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         rightMinWidth={!chatExpanded && artifactExpanded ? LIST_MIN_WIDTH : undefined}
         left={
           <ArtifactsColumn
-            projectSlug={projectSlug}
-            taskSlug={taskSlug}
+            workspacePath={workspacePath}
             expanded={artifactExpanded}
             artifactPath={artifactPath}
             dirPath={dirPath}
@@ -793,9 +777,8 @@ export function Workspace({ projectSlug, taskSlug }: WorkspaceProps) {
         }
         right={
           <SessionsColumn
-            projectSlug={projectSlug}
-            taskSlug={taskSlug}
-            project={project}
+            workspacePath={workspacePath}
+            workspace={workspace}
             expanded={chatExpanded}
             expandedSession={expandedSession}
             openArtifactPath={artifactExpanded ? artifactPath : undefined}
@@ -941,8 +924,7 @@ function SplitColumns({
 // ---------------------------------------------------------------------------
 
 interface ArtifactsColumnProps {
-  projectSlug: string;
-  taskSlug?: string;
+  workspacePath: string[];
   expanded: boolean;
   artifactPath: string;
   dirPath: string;
@@ -966,7 +948,7 @@ interface ArtifactsColumnProps {
 
 function ArtifactsColumn(props: ArtifactsColumnProps) {
   const {
-    projectSlug, taskSlug, expanded, artifactPath, dirPath, entries, breadcrumb,
+    workspacePath, expanded, artifactPath, dirPath, entries, breadcrumb,
     commentCounts, uploading, uploadError, onUploadError, renamingPath, renameValue,
     onRenameValue, onRenameCommit, onRenameCancel, onContextMenu,
     onNavigateDir, onOpenFile, onCloseArtifact, onFileDrop,
@@ -990,8 +972,7 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
         </div>
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
           <FileViewer
-            projectSlug={projectSlug}
-            taskSlug={taskSlug ?? ""}
+            workspacePath={workspacePath}
             filePath={artifactPath}
           />
         </div>
@@ -1021,7 +1002,7 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
 
       {entries.length === 0 ? (
         <div className="text-[13px] text-[var(--muted)] italic px-1">
-          {taskSlug ? "Drop files here or start empty." : "No artifacts yet."}
+          Drop files here or start empty.
         </div>
       ) : (
         <>
@@ -1104,36 +1085,32 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
           Artifacts
         </span>
         <span className="text-[11px] text-[var(--muted)]">· {entries.length}{uploading && " (uploading…)"}</span>
-        {taskSlug && (
-          <>
-            <input
-              ref={uploadInputRef}
-              type="file"
-              multiple
-              className="hidden"
-              onChange={async (e) => {
-                const picked = e.target.files;
-                if (picked && picked.length > 0) {
-                  onFileDrop(await filesToAttachments(picked, undefined, onUploadError));
-                }
-                e.target.value = "";
-              }}
-            />
-            <button
-              onClick={() => uploadInputRef.current?.click()}
-              disabled={uploading}
-              title="Upload files"
-              aria-label="Upload files"
-              className="ml-auto text-[var(--muted)] hover:text-[var(--accent)] w-6 h-6 rounded hover:bg-[var(--panel-2)] flex items-center justify-center disabled:opacity-40 transition"
-            >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
-            </button>
-          </>
-        )}
+        <input
+          ref={uploadInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={async (e) => {
+            const picked = e.target.files;
+            if (picked && picked.length > 0) {
+              onFileDrop(await filesToAttachments(picked, undefined, onUploadError));
+            }
+            e.target.value = "";
+          }}
+        />
+        <button
+          onClick={() => uploadInputRef.current?.click()}
+          disabled={uploading}
+          title="Upload files"
+          aria-label="Upload files"
+          className="ml-auto text-[var(--muted)] hover:text-[var(--accent)] w-6 h-6 rounded hover:bg-[var(--panel-2)] flex items-center justify-center disabled:opacity-40 transition"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+            <polyline points="17 8 12 3 7 8" />
+            <line x1="12" y1="3" x2="12" y2="15" />
+          </svg>
+        </button>
       </div>
       {uploadError && (
         <div className="px-3 py-2 border-b border-[var(--border)] bg-[var(--warn-soft)] text-[var(--warn)] text-[12px] flex items-start gap-2 shrink-0">
@@ -1141,13 +1118,9 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
           <button onClick={() => onUploadError("")} title="Dismiss" className="shrink-0 hover:opacity-70">×</button>
         </div>
       )}
-      {taskSlug ? (
-        <FileDropZone onFiles={onFileDrop} onError={onUploadError} disabled={uploading} className="flex-1 min-h-0 flex flex-col">
-          {Body}
-        </FileDropZone>
-      ) : (
-        Body
-      )}
+      <FileDropZone onFiles={onFileDrop} onError={onUploadError} disabled={uploading} className="flex-1 min-h-0 flex flex-col">
+        {Body}
+      </FileDropZone>
     </>
   );
 }
@@ -1157,9 +1130,8 @@ function ArtifactsColumn(props: ArtifactsColumnProps) {
 // ---------------------------------------------------------------------------
 
 interface SessionsColumnProps {
-  projectSlug: string;
-  taskSlug?: string;
-  project: ProjectDTO;
+  workspacePath: string[];
+  workspace: WorkspaceDTO;
   expanded: boolean;
   expandedSession: SessionSummaryDTO | null;
   /** Artifact path open in the other column, if any — forwarded to Chat. */
@@ -1191,7 +1163,7 @@ interface SessionsColumnProps {
 
 function SessionsColumn(props: SessionsColumnProps) {
   const {
-    projectSlug, taskSlug, project, expanded, expandedSession, openArtifactPath, sessions,
+    workspacePath, workspace, expanded, expandedSession, openArtifactPath, sessions,
     renamingSession, sessionRenameValue,
     onSessionRenameValue, onSessionRenameCommit, onSessionRenameCancel,
     onSessionContextMenu, onOpenSession, onCloseSession, onChange,
@@ -1201,7 +1173,7 @@ function SessionsColumn(props: SessionsColumnProps) {
   } = props;
 
   const [showAllSessions, setShowAllSessions] = useState(false);
-  const [showAllTasks, setShowAllTasks] = useState(false);
+  const [showAllChildren, setShowAllChildren] = useState(false);
   const newAttachInputRef = useRef<HTMLInputElement>(null);
 
   if (expanded && expandedSession) {
@@ -1236,16 +1208,11 @@ function SessionsColumn(props: SessionsColumnProps) {
     );
   }
 
-  // Tasks list (project view only)
-  const visibleTasks = !taskSlug
-    ? (() => {
-        const all = [...project.tasks].sort((a, b) => {
-          if (a.status !== b.status) return a.status === "active" ? -1 : 1;
-          return a.slug.localeCompare(b.slug);
-        });
-        return showAllTasks ? all : all.slice(0, PAGE_SIZE);
-      })()
-    : [];
+  const allChildren = [...workspace.children].sort((a, b) => {
+    if (a.status !== b.status) return a.status === "active" ? -1 : 1;
+    return a.slug.localeCompare(b.slug);
+  });
+  const visibleChildren = showAllChildren ? allChildren : allChildren.slice(0, PAGE_SIZE);
 
   const visibleSessions = showAllSessions ? sessions : sessions.slice(0, PAGE_SIZE);
 
@@ -1253,44 +1220,38 @@ function SessionsColumn(props: SessionsColumnProps) {
     <>
       <div className="h-10 px-3 border-b border-[var(--border)] flex items-center gap-2 shrink-0 bg-[var(--bg-2)]">
         <span className="text-[12px] uppercase tracking-wider text-[var(--muted)] font-semibold">
-          {!taskSlug ? "Tasks & Sessions" : "Sessions"}
+          {workspace.children.length > 0 ? "Workspaces & Sessions" : "Sessions"}
         </span>
         <span className="text-[11px] text-[var(--muted)]">· {sessions.length}</span>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
-        {/* Tasks (project view only) */}
-        {!taskSlug && (
+        {/* Child workspaces, if any */}
+        {workspace.children.length > 0 && (
           <div>
             <div className="text-[11px] uppercase tracking-wider text-[var(--muted)] font-medium mb-1.5 px-1">
-              Tasks <span className="normal-case tracking-normal">· {project.tasks.length}</span>
+              Child workspaces <span className="normal-case tracking-normal">· {workspace.children.length}</span>
             </div>
-            {project.tasks.length === 0 ? (
-              <div className="text-[12.5px] text-[var(--muted)] italic px-1">No tasks yet.</div>
-            ) : (
-              <>
-                <div className="space-y-1">
-                  {visibleTasks.map((t) => (
-                    <Link
-                      key={t.slug}
-                      href={taskRoute(projectSlug, t.slug)}
-                      className="block w-full text-left rounded-lg border border-[var(--border)] bg-[var(--panel)] hover:bg-[var(--panel-2)] px-3 py-2 transition"
-                    >
-                      <span className={`text-[13px] truncate block ${t.status === "archived" ? "text-[var(--muted)] line-through" : ""}`}>
-                        {t.slug}
-                      </span>
-                    </Link>
-                  ))}
-                </div>
-                {!showAllTasks && project.tasks.length > PAGE_SIZE && (
-                  <button
-                    onClick={() => setShowAllTasks(true)}
-                    className="mt-2 text-[12px] text-[var(--accent)] hover:text-[var(--text)] px-3 py-1.5 rounded-md border border-[var(--border)] hover:border-[var(--accent)] transition w-full"
-                  >
-                    View {project.tasks.length - PAGE_SIZE} more
-                  </button>
-                )}
-              </>
+            <div className="space-y-1">
+              {visibleChildren.map((child) => (
+                <Link
+                  key={child.slug}
+                  href={workspaceRoute([...workspacePath, child.slug])}
+                  className="block w-full text-left rounded-lg border border-[var(--border)] bg-[var(--panel)] hover:bg-[var(--panel-2)] px-3 py-2 transition"
+                >
+                  <span className={`text-[13px] truncate block ${child.status === "archived" ? "text-[var(--muted)] line-through" : ""}`}>
+                    {child.slug}
+                  </span>
+                </Link>
+              ))}
+            </div>
+            {!showAllChildren && allChildren.length > PAGE_SIZE && (
+              <button
+                onClick={() => setShowAllChildren(true)}
+                className="mt-2 text-[12px] text-[var(--accent)] hover:text-[var(--text)] px-3 py-1.5 rounded-md border border-[var(--border)] hover:border-[var(--accent)] transition w-full"
+              >
+                View {allChildren.length - PAGE_SIZE} more
+              </button>
             )}
           </div>
         )}
@@ -1302,9 +1263,7 @@ function SessionsColumn(props: SessionsColumnProps) {
           </div>
           {sessions.length === 0 ? (
             <div className="text-[12.5px] text-[var(--muted)] italic px-1">
-              {taskSlug
-                ? "No agents have worked on this task yet. Send one with the composer below."
-                : "No project-level sessions yet."}
+              No agents have worked on this workspace yet. Send one with the composer below.
             </div>
           ) : (
             <>
@@ -1422,7 +1381,7 @@ function SessionsColumn(props: SessionsColumnProps) {
             <textarea
               value={draft}
               onChange={(e) => onDraft(e.target.value)}
-              placeholder={taskSlug ? "Tell an agent what to do on this task…" : "Brief an agent on this project as a whole…"}
+              placeholder="Tell an agent what to do in this workspace…"
               rows={2}
               style={{ maxHeight: 200 }}
               onInput={(e) => {

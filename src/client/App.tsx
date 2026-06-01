@@ -9,18 +9,21 @@ import {
 import { Providers } from "@/components/Providers";
 import { Workspace } from "@/components/workspace/Workspace";
 import {
-  projectRoute,
-  taskRoute,
+  buildWorkspaceQuery,
+  decodeWorkspacePath,
+  encodeWorkspacePath,
   type WorkspaceParams,
 } from "@/lib/routes";
 
-// SPA router. Replaces the Next App Router file tree. Routing is query-param
-// driven (see src/lib/routes.ts), so there are only three real page shapes plus
-// redirect-only legacy deep links.
+// SPA router. Routing is query-param driven (see src/lib/routes.ts) so the
+// canonical app has exactly two shapes: Welcome at `/` and the workspace page
+// at `/workspace/<slug>/<child>/...`. Path segments are URL-encoded individually
+// and matched by a single splat (`*`), so deeply-nested workspaces all hit the
+// same component.
 //
-// The old src/app/layout.tsx wrapped every page in <Providers> (which renders
-// WorkspaceProvider > AppShell > children). Here a layout route does the same:
-// <Providers> renders the chrome and <Outlet/> takes the place of `children`.
+// Legacy `/project/...` and `/project/:slug/task/...` deep links are preserved
+// as redirect-only routes so old links don't 404 — they 301 to the equivalent
+// `/workspace/...` URL.
 
 function Layout() {
   return (
@@ -36,34 +39,32 @@ function Welcome() {
       <div className="text-center max-w-md">
         <div className="text-[28px] font-semibold mb-2">Welcome.</div>
         <div className="text-[15px] text-[var(--text-soft)] leading-relaxed">
-          Pick a task on the left to brief an agent on it. They&apos;ll work in the
-          background and ping you when they need input.
+          Pick a workspace on the left to brief an agent on it. They&apos;ll work
+          in the background and ping you when they need input.
         </div>
       </div>
     </div>
   );
 }
 
-// react-router already URL-decodes path params, so (unlike the old Next pages,
-// which decoded manually) we pass them straight through.
-function ProjectPage() {
-  const { slug } = useParams();
-  return <Workspace projectSlug={slug!} />;
+// react-router URL-decodes path params for us, but the splat is returned
+// pre-decoded as a slash-joined string. decodeWorkspacePath splits it back
+// into the slug-chain expected by the Workspace component.
+function WorkspacePage() {
+  const params = useParams<{ "*": string }>();
+  const workspacePath = decodeWorkspacePath(params["*"] ?? "");
+  return <Workspace workspacePath={workspacePath} />;
 }
 
-function TaskPage() {
-  const { slug, taskSlug } = useParams();
-  return <Workspace projectSlug={slug!} taskSlug={taskSlug!} />;
-}
+// Legacy deep-link redirects collapse the (project[, task][, file/dir/session])
+// segments onto a `/workspace/<chain>` URL with the file/dir/session carried
+// as a query param.
 
-// Legacy deep links collapse onto the canonical project/task route with the
-// path carried as a query param, matching the old redirect-only pages. The
-// splat ("*") is the catch-all `[...path]` segment.
-function legacyRedirect(
-  base: string,
+function buildLegacyRedirect(
+  slugPath: string[],
   key: "artifact" | "dir" | "chat",
   value: string,
-) {
+): string {
   const params: WorkspaceParams =
     key === "artifact"
       ? {
@@ -73,30 +74,35 @@ function legacyRedirect(
       : key === "dir"
         ? { dir: value }
         : { chat: value };
-  return <Navigate to={base + queryFor(params)} replace />;
+  return `/workspace/${encodeWorkspacePath(slugPath)}${buildWorkspaceQuery(params)}`;
 }
 
-function queryFor(params: WorkspaceParams): string {
-  // Reuse the canonical query builder by routing through the helpers.
-  return projectRoute("__x__", params).replace(`/project/${encodeURIComponent("__x__")}`, "");
+function ProjectRedirect() {
+  const { slug } = useParams<{ slug: string }>();
+  return <Navigate to={`/workspace/${encodeWorkspacePath([slug!])}`} replace />;
+}
+
+function TaskRedirect() {
+  const { slug, taskSlug } = useParams<{ slug: string; taskSlug: string }>();
+  return <Navigate to={`/workspace/${encodeWorkspacePath([slug!, taskSlug!])}`} replace />;
 }
 
 function FileRedirect() {
-  const { slug, taskSlug, "*": splat } = useParams();
-  const base = taskSlug ? taskRoute(slug!, taskSlug) : projectRoute(slug!);
-  return legacyRedirect(base, "artifact", splat ?? "");
+  const { slug, taskSlug, "*": splat } = useParams<{ slug: string; taskSlug?: string; "*": string }>();
+  const chain = taskSlug ? [slug!, taskSlug] : [slug!];
+  return <Navigate to={buildLegacyRedirect(chain, "artifact", splat ?? "")} replace />;
 }
 
 function DirRedirect() {
-  const { slug, taskSlug, "*": splat } = useParams();
-  const base = taskSlug ? taskRoute(slug!, taskSlug) : projectRoute(slug!);
-  return legacyRedirect(base, "dir", splat ?? "");
+  const { slug, taskSlug, "*": splat } = useParams<{ slug: string; taskSlug?: string; "*": string }>();
+  const chain = taskSlug ? [slug!, taskSlug] : [slug!];
+  return <Navigate to={buildLegacyRedirect(chain, "dir", splat ?? "")} replace />;
 }
 
 function SessionRedirect() {
-  const { slug, taskSlug, sessionId } = useParams();
-  const base = taskSlug ? taskRoute(slug!, taskSlug) : projectRoute(slug!);
-  return legacyRedirect(base, "chat", sessionId ?? "");
+  const { slug, taskSlug, sessionId } = useParams<{ slug: string; taskSlug?: string; sessionId: string }>();
+  const chain = taskSlug ? [slug!, taskSlug] : [slug!];
+  return <Navigate to={buildLegacyRedirect(chain, "chat", sessionId ?? "")} replace />;
 }
 
 export function App() {
@@ -105,10 +111,10 @@ export function App() {
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<Welcome />} />
-          <Route path="/project/:slug" element={<ProjectPage />} />
-          <Route path="/project/:slug/task/:taskSlug" element={<TaskPage />} />
+          {/* Canonical workspace page — splat captures the entire slug-chain. */}
+          <Route path="/workspace/*" element={<WorkspacePage />} />
 
-          {/* redirect-only legacy deep links */}
+          {/* Legacy /project/... deep links → /workspace/... */}
           <Route path="/project/:slug/file/*" element={<FileRedirect />} />
           <Route path="/project/:slug/dir/*" element={<DirRedirect />} />
           <Route path="/project/:slug/session/:sessionId" element={<SessionRedirect />} />
@@ -118,6 +124,8 @@ export function App() {
             path="/project/:slug/task/:taskSlug/session/:sessionId"
             element={<SessionRedirect />}
           />
+          <Route path="/project/:slug/task/:taskSlug" element={<TaskRedirect />} />
+          <Route path="/project/:slug" element={<ProjectRedirect />} />
 
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

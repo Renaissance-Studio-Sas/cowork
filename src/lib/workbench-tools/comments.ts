@@ -1,6 +1,6 @@
 // Workbench tools for the comments panel: list_comments, resolve_comment,
 // add_comment, edit_comment. One builder per session — closes over the
-// session's project/task so the agent doesn't have to specify them on
+// session's workspace path so the agent doesn't have to specify it on
 // every call. Per-runtime adapters in src/lib/runtimes/ wrap as MCP for
 // Claude or register into gemini-cli-core's ToolRegistry for Gemini.
 
@@ -8,14 +8,14 @@ import { z } from "zod";
 import { addComment, deleteComment, listComments, updateComment } from "../comments-store";
 import { defineTool, type WorkbenchTool } from "./types";
 
-export function buildCommentsTools(projectSlug: string, taskSlug: string): WorkbenchTool[] {
+export function buildCommentsTools(workspacePath: string[]): WorkbenchTool[] {
   return [
     defineTool(
       "list_comments",
-      "List comments on a file in the current task. Use this to read what the user wants addressed. Returns an array of {id, file_path, quote, body, author, created_at, resolved}. Pass an empty string for file_path to list comments across the whole task.",
+      "List comments on a file in the current workspace. Use this to read what the user wants addressed. Returns an array of {id, file_path, quote, body, author, created_at, resolved}. Pass an empty string for file_path to list comments across the whole workspace.",
       { file_path: z.string() },
       async ({ file_path }) => {
-        const rows = await listComments(projectSlug, taskSlug, file_path || undefined);
+        const rows = await listComments(workspacePath, file_path || undefined);
         const out = rows.map((r) => ({
           id: r.id,
           file_path: r.filePath,
@@ -34,10 +34,10 @@ export function buildCommentsTools(projectSlug: string, taskSlug: string): Workb
       "Resolve a comment after you have addressed it. This deletes the comment from the user's view so they know it's been handled. Call this immediately after fixing the document text the comment was attached to.",
       { comment_id: z.number().int() },
       async ({ comment_id }) => {
-        const removed = await deleteComment(projectSlug, taskSlug, comment_id);
+        const removed = await deleteComment(workspacePath, comment_id);
         if (!removed) {
           return {
-            content: [{ type: "text", text: `No comment with id ${comment_id} in this task.` }],
+            content: [{ type: "text", text: `No comment with id ${comment_id} in this workspace.` }],
             isError: true,
           };
         }
@@ -49,7 +49,7 @@ export function buildCommentsTools(projectSlug: string, taskSlug: string): Workb
 
     defineTool(
       "add_comment",
-      "Add a new comment on a file in the current task. Use this to flag things for the user — questions, observations, items to review. Pass the exact visible text the comment attaches to in `quote` (the UI will highlight that span). Use an empty string for `quote` to comment on the whole document.",
+      "Add a new comment on a file in the current workspace. Use this to flag things for the user — questions, observations, items to review. Pass the exact visible text the comment attaches to in `quote` (the UI will highlight that span). Use an empty string for `quote` to comment on the whole document.",
       {
         file_path: z.string(),
         quote: z.string(),
@@ -57,7 +57,7 @@ export function buildCommentsTools(projectSlug: string, taskSlug: string): Workb
       },
       async ({ file_path, quote, body }) => {
         const anchor = quote ? { prefix: "", exact: quote, suffix: "" } : {};
-        const created = await addComment(projectSlug, taskSlug, {
+        const created = await addComment(workspacePath, {
           filePath: file_path,
           anchorType: file_path.endsWith(".html") || file_path.endsWith(".htm") ? "html" : "md",
           anchor,
@@ -78,10 +78,10 @@ export function buildCommentsTools(projectSlug: string, taskSlug: string): Workb
         body: z.string(),
       },
       async ({ comment_id, body }) => {
-        const updated = await updateComment(projectSlug, taskSlug, comment_id, body);
+        const updated = await updateComment(workspacePath, comment_id, body);
         if (!updated) {
           return {
-            content: [{ type: "text", text: `No comment with id ${comment_id} in this task.` }],
+            content: [{ type: "text", text: `No comment with id ${comment_id} in this workspace.` }],
             isError: true,
           };
         }

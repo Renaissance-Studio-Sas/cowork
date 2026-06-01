@@ -1,81 +1,68 @@
 // System prompt + label generation helpers. Self-contained — only touches
-// the filesystem and the project lookup helpers, so it sits at the bottom
+// the filesystem and the workspace lookup helpers, so it sits at the bottom
 // of the sessions module dependency graph.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  getProject,
-  PROJECT_BRIEF_FILENAME,
-  TASK_BRIEF_FILENAME,
+  getWorkspace,
+  WORKSPACE_BRIEF_FILENAME,
   WORKSPACE_ROOT,
+  workspaceDir,
   type Brief,
 } from "../fs";
 
 // Build the per-session system prompt. Always returns a prompt (never
-// undefined) so the agent always knows what project/task it's working on
-// and where files live. Includes the project.json and task.json briefs
-// verbatim when they exist; otherwise notes the file is empty and points
-// the agent at the location to write to.
+// undefined) so the agent always knows what workspace it's working in and
+// where files live. Includes the workspace.json briefs along the ancestor
+// chain verbatim when they exist; otherwise notes the file is empty and
+// points the agent at the location to write to.
 //
 // The agent's working directory is the cowork workspace root (set by the
 // caller — see sessions.ts). That's where CLAUDE.md / GEMINI.md live, and
-// where `projects/<project>/<task>/` is reachable. We tell the agent the
-// EXPLICIT relative path to the task folder so file operations go to the
-// right place.
+// where `projects/<workspace-path>/` is reachable. We tell the agent the
+// EXPLICIT relative path to the workspace folder so file operations go to
+// the right place.
 export async function buildContextSystemPrompt(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   currentTitle?: string,
 ): Promise<{ type: "preset"; preset: "claude_code"; append: string }> {
-  // Resolve the task folder relative to the workspace root. We need the
-  // actual folder name (which carries " [Archived]" when archived), not
-  // just the slug, because the agent will reference it in file ops.
-  const project = await getProject(projectSlug).catch(() => null);
-  let taskFolderRel: string | null = null;
-  let projectFolderRel: string | null = null;
-  if (project) {
-    projectFolderRel = path.join("projects", project.folderName);
-    if (taskSlug) {
-      const task = project.tasks.find((t) => t.slug === taskSlug);
-      if (task) taskFolderRel = path.join(projectFolderRel, task.folderName);
+  // Resolve the workspace folder relative to the project root, plus each
+  // ancestor for the brief chain. Folder names carry " [Archived]" when
+  // archived, so we use them rather than just the slugs in path hints the
+  // agent will reference.
+  const ws = await getWorkspace(workspacePath).catch(() => null);
+  const ancestors: Array<{ label: string; relPath: string; brief: Brief | null }> = [];
+  let folderRel: string | null = null;
+  if (ws) {
+    folderRel = path.relative(WORKSPACE_ROOT, workspaceDir(ws));
+    // Walk down the slug chain to read each ancestor's brief in turn — gives
+    // the agent the full breadcrumb context, not just the leaf.
+    for (let i = 1; i <= workspacePath.length; i++) {
+      const partial = workspacePath.slice(0, i);
+      const node = await getWorkspace(partial).catch(() => null);
+      if (!node) continue;
+      const rel = path.relative(WORKSPACE_ROOT, workspaceDir(node));
+      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, "files", WORKSPACE_BRIEF_FILENAME));
+      ancestors.push({
+        label: partial.join(" > "),
+        relPath: path.join(rel, "files", WORKSPACE_BRIEF_FILENAME),
+        brief,
+      });
     }
   }
 
-  // Read the project.json and task.json briefs if they exist. Missing
-  // files are not an error — the agent gets a "not yet written"
-  // placeholder so it knows the file is supposed to be there and that
-  // writing to it is a normal first step on a new project/task.
-  const projectBrief = projectFolderRel
-    ? await readBriefIfExists(path.join(WORKSPACE_ROOT, projectFolderRel, "files", PROJECT_BRIEF_FILENAME))
-    : null;
-  const taskBrief = taskFolderRel
-    ? await readBriefIfExists(path.join(WORKSPACE_ROOT, taskFolderRel, "files", TASK_BRIEF_FILENAME))
-    : null;
+  const breadcrumb = workspacePath.join(" > ");
+  const where = `workspace **${breadcrumb}**`;
 
-  const where = taskFolderRel
-    ? `task **${taskSlug}** in project **${projectSlug}**`
-    : `project **${projectSlug}** (project-level — no specific task)`;
+  const pathLine = folderRel
+    ? `Workspace folder (relative to workspace root): \`${folderRel}/\``
+    : `Workspace folder: (unknown — workspace ${breadcrumb} not found on disk)`;
 
-  const pathLine = taskFolderRel
-    ? `Task folder (relative to workspace root): \`${taskFolderRel}/\`\nProject folder: \`${projectFolderRel}/\``
-    : `Project folder: \`${projectFolderRel ?? "(unknown)"}/\``;
-
-  const projectBriefBlock = projectFolderRel
-    ? formatBriefSection(
-        "Project context",
-        path.join(projectFolderRel, "files", PROJECT_BRIEF_FILENAME),
-        projectBrief,
-      )
-    : "";
-
-  const taskBriefBlock = taskFolderRel
-    ? formatBriefSection(
-        "Task context",
-        path.join(taskFolderRel, "files", TASK_BRIEF_FILENAME),
-        taskBrief,
-      )
-    : "";
+  // One brief block per ancestor, top-down.
+  const briefBlocks = ancestors
+    .map((a) => formatBriefSection(`Context for ${a.label}`, a.relPath, a.brief))
+    .join("");
 
   const titleBlock = currentTitle
     ? `## Session title
@@ -88,6 +75,8 @@ turns out wrong later, call \`set_session_title\` to override it.
 `
     : "";
 
+  const apiPath = workspacePath.map(encodeURIComponent).join("/");
+
   const append = `
 You are working in the **cowork agent workbench** on ${where}.
 
@@ -97,13 +86,13 @@ haven't already.
 
 ${pathLine}
 
-When you write output files for this task, put them under the task's
-\`files/\` directory using the path above. When you read or modify the
-project/task brief, edit the JSON file shown in the section below — it
-has the shape \`{ "overview": "...", "details": "...", "createdAt": "..." }\`
+When you write output files for this workspace, put them under the
+workspace's \`files/\` directory using the path above. When you read or
+modify the workspace brief, edit the JSON file shown in the section below —
+it has the shape \`{ "overview": "...", "details": "...", "createdAt": "..." }\`
 where \`overview\` is a one-line summary and \`details\` is markdown.
 
-${projectBriefBlock}${taskBriefBlock}${titleBlock}## Inline Media in Chat
+${briefBlocks}${titleBlock}## Inline Media in Chat
 
 You can display images and videos inline in your chat responses using markdown syntax:
 
@@ -115,13 +104,15 @@ You can display images and videos inline in your chat responses using markdown s
 - \`![description|800](url)\` — 800px wide, maintains aspect ratio
 - \`![description|800x600](url)\` — exact 800x600 dimensions
 
-**For files in the task folder**, use the raw file API:
+**For files in the workspace folder**, use the raw file API:
 \`\`\`
-![screenshot|600](/api/files/raw?project=PROJECT&task=TASK&path=uploads/image.png)
-![demo video|800](/api/files/raw?project=PROJECT&task=TASK&path=uploads/demo.mp4)
+![screenshot|600](/api/files/raw?workspace=${apiPath}&path=uploads/image.png)
+![demo video|800](/api/files/raw?workspace=${apiPath}&path=uploads/demo.mp4)
 \`\`\`
 
-Replace PROJECT and TASK with the current project/task slugs (URL-encoded). Files in the task's \`files/\` directory are served via this API.
+The \`workspace\` query parameter is the slash-joined slug chain
+(URL-encoded). Files in the workspace's \`files/\` directory are served via
+this API.
 `.trim();
 
   return { type: "preset", preset: "claude_code", append };

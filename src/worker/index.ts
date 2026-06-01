@@ -5,7 +5,7 @@ import { workspace } from "./routes/workspace";
 import { files } from "./routes/files";
 import { plan } from "./routes/plan";
 import { fileEvents } from "./routes/file-events";
-import { projects } from "./routes/projects";
+import { workspaces } from "./routes/workspaces";
 import { sessions } from "./routes/sessions";
 
 // The Cloudflare Worker entry. Hosts the API under /api/*; everything else is a
@@ -36,7 +36,10 @@ app.route("/api/workspace", workspace);
 app.route("/api/files", files);
 app.route("/api/plan", plan);
 app.route("/api/file-events", fileEvents);
-app.route("/api/projects", projects);
+// The recursive workspace model replaces the old (project, task) pair. Splat
+// captures the slug-chain so e.g. /api/workspaces/HR/pay-contractors reaches
+// the nested workspace on the backend without rewriting.
+app.route("/api/workspaces", workspaces);
 app.route("/api/sessions", sessions);
 
 // Any /api path not matched above is genuinely unknown — return 404 rather than

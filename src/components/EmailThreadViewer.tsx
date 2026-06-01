@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { encodeWorkspacePath } from "@/lib/routes";
 
 // JSON schema produced by `rowads email save-thread`. Kept in sync with
 // `thread_to_record()` in scripts/automations/google_workspace/manage_emails.py.
@@ -49,13 +50,14 @@ export interface ThreadRecord {
 
 interface Props {
   thread: ThreadRecord;
-  /** Path of the thread JSON inside the task, used to resolve attachment URLs. */
+  /** Path of the thread JSON inside the workspace, used to resolve attachment URLs. */
   filePath: string;
-  projectSlug: string;
-  taskSlug: string;
+  /** Slug-chain of the workspace this thread lives in. */
+  workspacePath: string[];
 }
 
-export function EmailThreadViewer({ thread, filePath, projectSlug, taskSlug }: Props) {
+export function EmailThreadViewer({ thread, filePath, workspacePath }: Props) {
+  const encodedWorkspace = encodeWorkspacePath(workspacePath);
   // Most recent message expanded by default; older ones collapsed.
   const lastIdx = thread.messages.length - 1;
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set([lastIdx]));
@@ -74,7 +76,7 @@ export function EmailThreadViewer({ thread, filePath, projectSlug, taskSlug }: P
   const threadDir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
   const attachmentUrl = (relPath: string) => {
     const joined = threadDir ? `${threadDir}/${relPath}` : relPath;
-    return `/api/files/raw?project=${encodeURIComponent(projectSlug)}&task=${encodeURIComponent(taskSlug)}&path=${encodeURIComponent(joined)}`;
+    return `/api/files/raw?workspace=${encodedWorkspace}&path=${encodeURIComponent(joined)}`;
   };
 
   return (

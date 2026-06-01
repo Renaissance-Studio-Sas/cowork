@@ -33,8 +33,11 @@ export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 // lifecycle.deleteSession.
 export interface RuntimeSession {
   id: string;
-  projectSlug: string;
-  taskSlug: string;
+  // Slug-chain of the workspace this session belongs to, e.g. ["HR", "pay-contractors"].
+  // Single-element for what used to be a project-level session, two or more
+  // for any nested workspace. The empty-array case is never valid — every
+  // session must live in some workspace.
+  workspacePath: string[];
   cwd: string;
   title: string;                 // short label derived from first message (e.g. "Add dark mode")
   startedAt: Date;
@@ -154,8 +157,7 @@ export interface PendingCompletion {
 // SessionSummaryDTO.
 export interface SessionSummary {
   id: string;
-  projectSlug: string;
-  taskSlug: string;
+  workspacePath: string[];
   state: SessionState;
   title: string;
   startedAt: string;             // ISO

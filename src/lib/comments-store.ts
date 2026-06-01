@@ -1,15 +1,15 @@
-// File-based comment storage. Each task gets a `.comments.json` file inside
-// its task folder, so when a task is renamed or moved the comments travel
-// with it automatically.
+// File-based comment storage. Each workspace gets a `.comments.json` file
+// inside its workspace folder, so when a workspace is renamed or moved the
+// comments travel with it automatically.
 //
 // Schema:
 //   { next_id: number, comments: StoredComment[] }
 //
-// IDs are unique per-task and monotonically increasing (never reused).
+// IDs are unique per-workspace and monotonically increasing (never reused).
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getProject, taskDir, projectDir } from "./fs";
+import { getWorkspace, workspaceDir } from "./fs";
 
 export interface StoredComment {
   id: number;
@@ -28,22 +28,12 @@ interface CommentsFile {
   comments: StoredComment[];
 }
 
-// Returns the path to the .comments.json file for a project or task.
-// - If taskSlug is provided, returns the task-level comments file.
-// - If taskSlug is empty/null, returns the project-level comments file.
-async function pathFor(projectSlug: string, taskSlug: string): Promise<string | null> {
-  const project = await getProject(projectSlug);
-  if (!project) return null;
-
-  // Project-level comments (no task)
-  if (!taskSlug) {
-    return path.join(projectDir(project), ".comments.json");
-  }
-
-  // Task-level comments
-  const task = project.tasks.find((t) => t.slug === taskSlug);
-  if (!task) return null;
-  return path.join(taskDir(project, task), ".comments.json");
+// Returns the path to the .comments.json file for a workspace, or null if
+// the workspace doesn't exist on disk.
+async function pathFor(workspacePath: string[]): Promise<string | null> {
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return null;
+  return path.join(workspaceDir(ws), ".comments.json");
 }
 
 async function read(file: string): Promise<CommentsFile> {
@@ -63,15 +53,15 @@ async function write(file: string, data: CommentsFile): Promise<void> {
   await fs.writeFile(file, JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 
-export async function listComments(projectSlug: string, taskSlug: string, filePath?: string): Promise<StoredComment[]> {
-  const p = await pathFor(projectSlug, taskSlug);
+export async function listComments(workspacePath: string[], filePath?: string): Promise<StoredComment[]> {
+  const p = await pathFor(workspacePath);
   if (!p) return [];
   const f = await read(p);
   return filePath ? f.comments.filter((c) => c.filePath === filePath) : f.comments;
 }
 
-export async function commentCounts(projectSlug: string, taskSlug: string): Promise<Record<string, number>> {
-  const p = await pathFor(projectSlug, taskSlug);
+export async function commentCounts(workspacePath: string[]): Promise<Record<string, number>> {
+  const p = await pathFor(workspacePath);
   if (!p) return {};
   const f = await read(p);
   const out: Record<string, number> = {};
@@ -80,12 +70,11 @@ export async function commentCounts(projectSlug: string, taskSlug: string): Prom
 }
 
 export async function addComment(
-  projectSlug: string,
-  taskSlug: string,
+  workspacePath: string[],
   input: Omit<StoredComment, "id" | "createdAt" | "updatedAt" | "resolvedAt"> & { createdAt?: string },
 ): Promise<StoredComment> {
-  const p = await pathFor(projectSlug, taskSlug);
-  if (!p) throw new Error(`unknown task ${projectSlug}/${taskSlug}`);
+  const p = await pathFor(workspacePath);
+  if (!p) throw new Error(`unknown workspace ${workspacePath.join("/")}`);
   const f = await read(p);
   const id = f.next_id;
   const created: StoredComment = {
@@ -105,8 +94,8 @@ export async function addComment(
   return created;
 }
 
-export async function deleteComment(projectSlug: string, taskSlug: string, id: number): Promise<StoredComment | null> {
-  const p = await pathFor(projectSlug, taskSlug);
+export async function deleteComment(workspacePath: string[], id: number): Promise<StoredComment | null> {
+  const p = await pathFor(workspacePath);
   if (!p) return null;
   const f = await read(p);
   const idx = f.comments.findIndex((c) => c.id === id);
@@ -116,8 +105,8 @@ export async function deleteComment(projectSlug: string, taskSlug: string, id: n
   return removed;
 }
 
-export async function setResolved(projectSlug: string, taskSlug: string, id: number, resolved: boolean): Promise<void> {
-  const p = await pathFor(projectSlug, taskSlug);
+export async function setResolved(workspacePath: string[], id: number, resolved: boolean): Promise<void> {
+  const p = await pathFor(workspacePath);
   if (!p) return;
   const f = await read(p);
   const c = f.comments.find((x) => x.id === id);
@@ -126,8 +115,8 @@ export async function setResolved(projectSlug: string, taskSlug: string, id: num
   await write(p, f);
 }
 
-export async function updateComment(projectSlug: string, taskSlug: string, id: number, body: string): Promise<StoredComment | null> {
-  const p = await pathFor(projectSlug, taskSlug);
+export async function updateComment(workspacePath: string[], id: number, body: string): Promise<StoredComment | null> {
+  const p = await pathFor(workspacePath);
   if (!p) return null;
   const f = await read(p);
   const c = f.comments.find((x) => x.id === id);

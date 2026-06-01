@@ -1,10 +1,11 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ProjectDTO, SessionSummaryDTO } from "./types";
+import type { WorkspaceDTO, SessionSummaryDTO } from "./types";
 
 interface WorkspaceContextValue {
-  projects: ProjectDTO[];
+  // Tree of top-level workspaces; each carries its full nested `children` tree.
+  workspaces: WorkspaceDTO[];
   sessions: SessionSummaryDTO[];
   pendingCount: number;
   refresh: () => Promise<void>;
@@ -21,10 +22,38 @@ export function isPending(s: SessionSummaryDTO): boolean {
   return true;
 }
 
+// Walk the workspace tree and yield every workspace, flattened. Useful for
+// look-ups that need to find a workspace anywhere in the tree by slug-chain.
+export function flattenWorkspaces(tree: WorkspaceDTO[]): WorkspaceDTO[] {
+  const out: WorkspaceDTO[] = [];
+  const walk = (list: WorkspaceDTO[]) => {
+    for (const ws of list) {
+      out.push(ws);
+      if (ws.children.length > 0) walk(ws.children);
+    }
+  };
+  walk(tree);
+  return out;
+}
+
+// Find a workspace by its slug-chain. Returns null when no workspace matches.
+export function findWorkspace(tree: WorkspaceDTO[], path: string[]): WorkspaceDTO | null {
+  if (path.length === 0) return null;
+  let list = tree;
+  let found: WorkspaceDTO | null = null;
+  for (const slug of path) {
+    const next = list.find((ws) => ws.slug === slug);
+    if (!next) return null;
+    found = next;
+    list = next.children;
+  }
+  return found;
+}
+
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const [projects, setProjects] = useState<ProjectDTO[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceDTO[]>([]);
   const [sessions, setSessions] = useState<SessionSummaryDTO[]>([]);
 
   const refresh = useCallback(async () => {
@@ -32,8 +61,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       fetch("/api/workspace", { cache: "no-store" }).then((r) => r.json()),
       fetch("/api/sessions", { cache: "no-store" }).then((r) => r.json()),
     ]);
-    setProjects(w.projects);
-    setSessions(s.sessions);
+    setWorkspaces(w.workspaces ?? []);
+    setSessions(s.sessions ?? []);
   }, []);
 
   useEffect(() => {
@@ -51,15 +80,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ projects, sessions, pendingCount, refresh }),
-    [projects, sessions, pendingCount, refresh],
+    () => ({ workspaces, sessions, pendingCount, refresh }),
+    [workspaces, sessions, pendingCount, refresh],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
 }
 
 const defaultContext: WorkspaceContextValue = {
-  projects: [],
+  workspaces: [],
   sessions: [],
   pendingCount: 0,
   refresh: async () => {},
