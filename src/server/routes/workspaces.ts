@@ -99,49 +99,12 @@ workspaces.post("/from-plan", async (c) => {
   }
 });
 
-// Create a workspace under the path captured by the splat. Empty splat creates
-// a top-level workspace; e.g. `POST /api/workspaces/HR` creates a child under
-// HR. Body: `{ slug, overview?, details? }`.
-workspaces.post("/:path{.*}", async (c) => {
-  const body = await c.req.raw.json();
-  if (!body.slug || typeof body.slug !== "string") {
-    return c.json({ error: "slug required" }, 400);
-  }
-  try {
-    const parentPath = pathFromSplat(c);
-    const created = await createWorkspace(parentPath, body.slug, {
-      overview: body.overview ?? "",
-      details: body.details ?? "",
-    });
-    return c.json(created);
-  } catch (err) {
-    return c.json({ error: String(err) }, 400);
-  }
-});
-
-// Stub creation at the root: `POST /api/workspaces` (no slug in splat) ends up
-// in `POST /*` with an empty splat — but Hono's splat won't match an empty
-// path on a `/` POST. Keep an explicit alias so client UIs can hit either.
-workspaces.post("/", async (c) => {
-  const body = await c.req.raw.json();
-  if (!body.slug || typeof body.slug !== "string") {
-    return c.json({ error: "slug required" }, 400);
-  }
-  try {
-    const created = await createWorkspace([], body.slug, {
-      overview: body.overview ?? "",
-      details: body.details ?? "",
-    });
-    return c.json(created);
-  } catch (err) {
-    return c.json({ error: String(err) }, 400);
-  }
-});
-
 // ---- nested sub-resources on a single workspace -------------------------
 //
-// These must be declared BEFORE the catch-all `/:* ` handlers below so they
-// match first (Hono matches in declaration order).
+// These must be declared BEFORE the catch-all `POST /:path{.*}` handler at
+// the bottom of this file so they match first (Hono matches in declaration
+// order). Otherwise `POST /sessions/<path>` matches the catch-all with
+// `path = "sessions/<path>"` and 400s with `slug required`.
 
 // Move a workspace to a new parent (or to the root with `toParentPath: []`).
 workspaces.post("/move/:path{.*}", async (c) => {
@@ -266,6 +229,46 @@ workspaces.post("/sessions/:id/move/:path{.*}", async (c) => {
 });
 
 // ---- single workspace by path -------------------------------------------
+
+// Create a workspace under the path captured by the splat. Empty splat creates
+// a top-level workspace; e.g. `POST /api/workspaces/HR` creates a child under
+// HR. Body: `{ slug, overview?, details? }`. Declared after the specific
+// sub-resource POSTs above so `/sessions/...` and `/move/...` win the match.
+workspaces.post("/:path{.*}", async (c) => {
+  const body = await c.req.raw.json();
+  if (!body.slug || typeof body.slug !== "string") {
+    return c.json({ error: "slug required" }, 400);
+  }
+  try {
+    const parentPath = pathFromSplat(c);
+    const created = await createWorkspace(parentPath, body.slug, {
+      overview: body.overview ?? "",
+      details: body.details ?? "",
+    });
+    return c.json(created);
+  } catch (err) {
+    return c.json({ error: String(err) }, 400);
+  }
+});
+
+// Stub creation at the root: `POST /api/workspaces` (no slug in splat) ends up
+// in `POST /*` with an empty splat — but Hono's splat won't match an empty
+// path on a `/` POST. Keep an explicit alias so client UIs can hit either.
+workspaces.post("/", async (c) => {
+  const body = await c.req.raw.json();
+  if (!body.slug || typeof body.slug !== "string") {
+    return c.json({ error: "slug required" }, 400);
+  }
+  try {
+    const created = await createWorkspace([], body.slug, {
+      overview: body.overview ?? "",
+      details: body.details ?? "",
+    });
+    return c.json(created);
+  } catch (err) {
+    return c.json({ error: String(err) }, 400);
+  }
+});
 
 // Fetch a single workspace (with its child tree) by slug-path.
 workspaces.get("/:path{.*}", async (c) => {
