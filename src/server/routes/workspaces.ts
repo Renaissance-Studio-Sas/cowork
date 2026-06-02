@@ -99,29 +99,14 @@ workspaces.post("/from-plan", async (c) => {
   }
 });
 
-// Create a workspace under the path captured by the splat. Empty splat creates
-// a top-level workspace; e.g. `POST /api/workspaces/HR` creates a child under
-// HR. Body: `{ slug, overview?, details? }`.
-workspaces.post("/:path{.*}", async (c) => {
-  const body = await c.req.raw.json();
-  if (!body.slug || typeof body.slug !== "string") {
-    return c.json({ error: "slug required" }, 400);
-  }
-  try {
-    const parentPath = pathFromSplat(c);
-    const created = await createWorkspace(parentPath, body.slug, {
-      overview: body.overview ?? "",
-      details: body.details ?? "",
-    });
-    return c.json(created);
-  } catch (err) {
-    return c.json({ error: String(err) }, 400);
-  }
-});
-
 // Stub creation at the root: `POST /api/workspaces` (no slug in splat) ends up
 // in `POST /*` with an empty splat — but Hono's splat won't match an empty
 // path on a `/` POST. Keep an explicit alias so client UIs can hit either.
+//
+// The path-bearing variant (`POST /api/workspaces/<parent-chain>`) lives at
+// the bottom of this file with the other `/:path{.*}` catch-alls — declaring
+// it here would shadow `/move/...`, `/sessions/...`, etc. (Hono matches in
+// declaration order, and `/:path{.*}` greedily eats those prefixes).
 workspaces.post("/", async (c) => {
   const body = await c.req.raw.json();
   if (!body.slug || typeof body.slug !== "string") {
@@ -266,6 +251,29 @@ workspaces.post("/sessions/:id/move/:path{.*}", async (c) => {
 });
 
 // ---- single workspace by path -------------------------------------------
+
+// Create a workspace under the path captured by the splat. Empty splat would
+// match the root, but Hono's splat won't match an empty `/` POST — so the
+// root case is handled by the explicit `POST /` alias above. Body: `{ slug,
+// overview?, details? }`. This must be declared AFTER every `/move/...`,
+// `/sessions/...`, `/status/...`, `/rename/...` sub-resource — the splat is
+// greedy and would otherwise eat them.
+workspaces.post("/:path{.*}", async (c) => {
+  const body = await c.req.raw.json();
+  if (!body.slug || typeof body.slug !== "string") {
+    return c.json({ error: "slug required" }, 400);
+  }
+  try {
+    const parentPath = pathFromSplat(c);
+    const created = await createWorkspace(parentPath, body.slug, {
+      overview: body.overview ?? "",
+      details: body.details ?? "",
+    });
+    return c.json(created);
+  } catch (err) {
+    return c.json({ error: String(err) }, 400);
+  }
+});
 
 // Fetch a single workspace (with its child tree) by slug-path.
 workspaces.get("/:path{.*}", async (c) => {
