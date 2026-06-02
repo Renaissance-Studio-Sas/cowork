@@ -62,9 +62,9 @@ function resolveCloudBrowserHeaders(): Record<string, string> {
   return {};
 }
 
-// Build the static workbench-MCP map for a session. Used both at session
-// start (in sessions.ts) and inside chrome_connect/disconnect to re-include
-// these whenever we call setMcpServers (REPLACE semantics).
+// Build the static workbench-MCP map for a session. Registered at session
+// start (in sessions.ts). Includes the cloud-browser MCP, which is the sole
+// browser-automation path now that the local Chrome bridge is gone.
 export async function buildStaticWorkbenchMcps(
   sessionId: string,
   workspacePath: string[],
