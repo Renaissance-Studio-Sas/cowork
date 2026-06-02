@@ -43,10 +43,10 @@ export async function buildContextSystemPrompt(
       const node = await getWorkspace(partial).catch(() => null);
       if (!node) continue;
       const rel = path.relative(WORKSPACE_ROOT, workspaceDir(node));
-      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, "files", WORKSPACE_BRIEF_FILENAME));
+      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, WORKSPACE_BRIEF_FILENAME));
       ancestors.push({
         label: partial.join(" > "),
-        relPath: path.join(rel, "files", WORKSPACE_BRIEF_FILENAME),
+        relPath: path.join(rel, WORKSPACE_BRIEF_FILENAME),
         brief,
       });
     }

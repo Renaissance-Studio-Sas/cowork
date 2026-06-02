@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Hexagon cluster, Rowads-pink edition. Each hex is scaled 0.85 toward
+       its own centre so a ~2 px gap shows between the three cells —
+       transparent, so the gap picks up the browser tab strip's colour
+       (white on light tabs, similar to the BBC News mark's pattern). -->
+  <!-- Top hex (centre 16, 10) -->
+  <polygon points="16,3.2 21.89,6.6 21.89,13.4 16,16.8 10.11,13.4 10.11,6.6"
+           fill="#B90949"/><!-- HSL 338 91% 38% -->
+  <!-- Bottom-left hex (centre 9.07, 22) -->
+  <polygon points="9.07,15.2 14.96,18.6 14.96,25.4 9.07,28.8 3.18,25.4 3.18,18.6"
+           fill="#ED1165"/><!-- canonical brand pink -->
+  <!-- Bottom-right hex (centre 22.93, 22) -->
+  <polygon points="22.93,15.2 28.82,18.6 28.82,25.4 22.93,28.8 17.04,25.4 17.04,18.6"
+           fill="#F75590"/><!-- HSL 338 91% 65% -->
+</svg>

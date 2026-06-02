@@ -253,9 +253,13 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
   return (
     <aside className="w-[300px] shrink-0 bg-[var(--bg-2)] border-r border-[var(--border)] flex flex-col">
       <div className="px-4 pt-5 pb-3 flex items-start gap-2">
-        <Link href="/" className="flex-1 min-w-0">
-          <div className="text-[15px] font-semibold leading-tight">Coworking space</div>
-          <div className="text-[12.5px] text-[var(--muted)] leading-snug mt-0.5">where humans and AI collaborate</div>
+        <Link href="/" className="flex-1 min-w-0 flex items-center gap-2.5">
+          {/* The hex-cluster mark from /icon.svg — same asset as the favicon. */}
+          <img src="/icon.svg" width="32" height="32" alt="" aria-hidden="true" className="shrink-0" />
+          <div className="min-w-0">
+            <div className="text-[15px] font-semibold leading-tight">Cowork</div>
+            <div className="text-[12.5px] text-[var(--muted)] leading-snug mt-0.5">where humans and AI collaborate</div>
+          </div>
         </Link>
         <button
           onClick={onClose}
