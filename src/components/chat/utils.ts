@@ -29,9 +29,13 @@ export function isInterruptNoise(text: string | undefined | null): boolean {
 // renders an editable acceptance card instead of a generic tool chip.
 export const PROPOSE_PLAN_NAME = "mcp__workbench-planning__propose_plan";
 export const PROPOSE_TASK_NAME = "mcp__workbench-planning__propose_task";
+// Current planning tool — a single recursive workspace with optional children.
+// Supersedes propose_plan/propose_task, which are kept only for back-compat
+// with old sessions whose stream still carries the legacy names.
+export const PROPOSE_WORKSPACE_NAME = "mcp__workbench-planning__propose_workspace";
 
 export function isProposalToolName(name: string | undefined | null): boolean {
-  return name === PROPOSE_PLAN_NAME || name === PROPOSE_TASK_NAME;
+  return name === PROPOSE_PLAN_NAME || name === PROPOSE_TASK_NAME || name === PROPOSE_WORKSPACE_NAME;
 }
 
 // Whether an SDK event renders as a "real" entry in the chat (text bubble,

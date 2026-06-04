@@ -48,12 +48,27 @@ workspaces.get("/", async (c) => {
   return c.json({ workspaces: tree });
 });
 
+// True for the throwaway stub slug `/api/plan` mints for ROOT-level planning
+// (`untitled-<6 hex>`). Nested planning runs the session inside a real parent
+// instead, so the slug never matches — which is exactly how `from-plan` below
+// tells the two flows apart.
+function isPlanningStub(slug: string): boolean {
+  return /^untitled-[0-9a-f]{6}$/.test(slug);
+}
+
 // Materializes a (possibly edited) plan from the "New workspace" planning
-// chat. The chat runs in a normal session inside a stub workspace (created by
-// /api/plan). On accept, we rename the stub to the chosen slug, fill in the
-// brief, optionally create proposed child workspaces, and mark the planning
-// session completed. The session naturally follows the renamed folder via the
-// in-meta `workspace` path.
+// chat. Two shapes converge here (see /api/plan):
+//
+//  • ROOT planning created a throwaway stub `untitled-<hex>` and ran the
+//    session inside it. The stub IS the workspace being named, so we rename
+//    it in place and fill in its brief.
+//  • NESTED planning ran the session inside an existing PARENT workspace. The
+//    new workspace is a CHILD of that parent, so we create the child and move
+//    the session into it — we must NOT rename the parent (doing so is the bug
+//    that turned "Admin" into the planned workspace).
+//
+// Either way we then create any proposed child workspaces and mark the
+// planning session completed.
 workspaces.post("/from-plan", async (c) => {
   const body = await c.req.raw.json();
   const currentPath: string[] = Array.isArray(body.current_path) ? body.current_path : [];
@@ -77,12 +92,26 @@ workspaces.post("/from-plan", async (c) => {
     }
 
     const currentSlug = currentPath[currentPath.length - 1];
-    let finalPath = currentPath;
-    if (newSlug !== currentSlug) {
-      await renameWorkspace(currentPath, newSlug);
-      finalPath = [...currentPath.slice(0, -1), newSlug];
+    let finalPath: string[];
+    if (isPlanningStub(currentSlug)) {
+      // Root planning: rename the stub in place and fill its brief. The
+      // session already lives in this folder, so it follows the rename.
+      finalPath = currentPath;
+      if (newSlug !== currentSlug) {
+        await renameWorkspace(currentPath, newSlug);
+        finalPath = [...currentPath.slice(0, -1), newSlug];
+      }
+      await setWorkspaceBrief(finalPath, { overview, details });
+    } else {
+      // Nested planning: create the new workspace as a CHILD of the parent the
+      // session ran in, then move the session into it. The parent is left
+      // untouched.
+      const created = await createWorkspace(currentPath, newSlug, { overview, details });
+      finalPath = created.path;
+      if (sessionId) {
+        await moveSessionToWorkspace(sessionId, finalPath);
+      }
     }
-    await setWorkspaceBrief(finalPath, { overview, details });
     for (const child of children) {
       if (!child.slug) continue;
       await createWorkspace(finalPath, child.slug, {

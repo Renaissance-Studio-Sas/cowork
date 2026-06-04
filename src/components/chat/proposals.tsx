@@ -34,6 +34,25 @@ interface ProposedPlanInput {
   tasks?: Array<{ slug?: string; overview?: string; details?: string }>;
 }
 
+// Current planning tool (`propose_workspace`): one recursive workspace with
+// optional children. Its field names differ from the legacy plan tool, so we
+// normalize it onto ProposedPlanInput before reusing PlanProposalCard.
+interface ProposedWorkspaceInput {
+  workspace_slug?: string;
+  workspace_overview?: string;
+  workspace_details?: string;
+  children?: Array<{ slug?: string; overview?: string; details?: string }>;
+}
+
+function workspaceInputToPlan(input: ProposedWorkspaceInput): ProposedPlanInput {
+  return {
+    project_slug: input.workspace_slug,
+    project_overview: input.workspace_overview,
+    project_details: input.workspace_details,
+    tasks: input.children,
+  };
+}
+
 export function ProposalCard({
   name,
   input,
@@ -48,6 +67,20 @@ export function ProposalCard({
   onCreated: () => void;
 }) {
   const router = useRouter();
+  if (/propose_workspace$/.test(name)) {
+    return (
+      <PlanProposalCard
+        initial={workspaceInputToPlan(input as ProposedWorkspaceInput)}
+        isLatest={isLatest}
+        currentPath={session.workspacePath}
+        sessionId={session.id}
+        onCreated={(path) => {
+          onCreated();
+          router.push(workspaceRoute(path));
+        }}
+      />
+    );
+  }
   if (/propose_task$/.test(name)) {
     return (
       <ChildWorkspaceProposalCard
