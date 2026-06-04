@@ -59,7 +59,7 @@ interface RwCredentialsFile {
   envs?: Record<string, RwCredentialsEnv | undefined>;
 }
 
-function loadRwCredentials(): { gateway: string; cookie: string } {
+function loadRwCredentials(): { gateway: string; cookie: string; email: string | null } {
   const path = process.env.RW_CREDENTIALS_PATH ?? join(homedir(), ".rw", "credentials.json");
   let raw: string;
   try {
@@ -80,14 +80,17 @@ function loadRwCredentials(): { gateway: string; cookie: string } {
     throw new Error(`cloud runtime: ${path} has no production env — run \`rw auth login\``);
   }
   const gateway = process.env.RW_GATEWAY_URL ?? prod.gateway;
-  return { gateway: gateway.replace(/\/$/, ""), cookie: prod.cookie };
+  // `email` feeds the per-user cowork cloud-drive name (`cowork-<local-part>`);
+  // it's optional here because not every code path needs it (only workspace
+  // provisioning does), so we surface null and let that path error clearly.
+  return { gateway: gateway.replace(/\/$/, ""), cookie: prod.cookie, email: prod.email ?? null };
 }
 
 // Cached at module init. The cookie has a 7-day Max-Age; if it expires the
 // gateway returns 401 and the user re-runs `rw auth login`. We don't poll
 // for refresh — `rw fetch` doesn't either, and that's the established UX.
-let CREDENTIALS: { gateway: string; cookie: string } | null = null;
-function getCredentials(): { gateway: string; cookie: string } {
+let CREDENTIALS: { gateway: string; cookie: string; email: string | null } | null = null;
+function getCredentials(): { gateway: string; cookie: string; email: string | null } {
   if (CREDENTIALS) return CREDENTIALS;
   CREDENTIALS = loadRwCredentials();
   return CREDENTIALS;
@@ -97,6 +100,105 @@ function authHeader(): string {
   // The cookie field stores ONLY the value of __gateway_session — wrap it in
   // the cookie header format the worker expects.
   return `__gateway_session=${getCredentials().cookie}`;
+}
+
+// Per-user cowork cloud-drive (Cowork shared workspace mounted at /home/cowork
+// inside the cloud-agent container). The name is derived from the caller email
+// so each user gets a stable, private workspace: marco@rowads.studio →
+// `cowork-marco`. Must satisfy the cloud-drive NAME_RE (1-64 chars, [A-Za-z0-9_-]).
+function coworkWorkspaceName(email: string): string {
+  const local = email.split("@")[0] ?? email;
+  const slug = local.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^-+|-+$/g, "");
+  return `cowork-${slug || "user"}`;
+}
+
+// Default CLAUDE.md seeded into a freshly-created cowork workspace. This is the
+// shared workspace's project memory (distinct from the agent-operations CLAUDE.md
+// baked into the cloud-agent image) — the user edits it over time and it lives
+// at /home/cowork/CLAUDE.md inside the container.
+const DEFAULT_COWORK_CLAUDE_MD = `# Cowork workspace
+
+This is your shared Cowork workspace, mounted at \`/home/cowork\` in every cloud
+agent you launch. Files here are live-synced and persist across sessions.
+
+Use this file to capture standing context for your agents: who you are, what
+you're working on, conventions to follow. Everything in this folder is shared
+with each agent and survives restarts.
+`;
+
+interface CloudDriveWorkspace {
+  id: string;
+  name: string;
+}
+
+// Ensure the caller's per-user cowork cloud-drive exists, creating + seeding it
+// on first use, and return its workspace id (for `workspaceId` on session create).
+// Idempotent: if the workspace already exists we just return its id. Failures are
+// surfaced to the caller, which treats a missing workspaceId as "no shared mount"
+// (the container still boots with an empty /home/cowork — non-fatal).
+async function ensureCoworkWorkspace(gateway: string): Promise<string> {
+  const { email } = getCredentials();
+  if (!email) {
+    throw new Error(
+      "cloud runtime: no caller email in ~/.rw/credentials.json — cannot derive the cowork workspace name. Run `rw auth login`.",
+    );
+  }
+  const name = coworkWorkspaceName(email);
+  const base = `${gateway}/api/cloud-drive`;
+  const headers = { "content-type": "application/json", cookie: authHeader() };
+
+  // 1. Look for an existing workspace by name (list is already ACL-scoped to us).
+  const listRes = await fetch(`${base}/workspaces`, { headers });
+  if (!listRes.ok) {
+    throw new Error(`cloud-drive GET /workspaces failed (${listRes.status}): ${await listRes.text().catch(() => "")}`);
+  }
+  const existing = (await listRes.json()) as CloudDriveWorkspace[];
+  const found = existing.find((w) => w.name === name);
+  if (found) return found.id;
+
+  // 2. Create it with snapshot:true so the warm-snapshot DO arms immediately
+  //    (hourly squashfs → quick cold-start restore inside the container).
+  const createRes = await fetch(`${base}/workspaces`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name, snapshot: true }),
+  });
+  // 409 = lost a create race with a concurrent session; re-list to grab the id.
+  if (createRes.status === 409) {
+    const reRes = await fetch(`${base}/workspaces`, { headers });
+    const again = (await reRes.json()) as CloudDriveWorkspace[];
+    const w = again.find((x) => x.name === name);
+    if (w) return w.id;
+  }
+  if (!createRes.ok) {
+    throw new Error(`cloud-drive POST /workspaces failed (${createRes.status}): ${await createRes.text().catch(() => "")}`);
+  }
+  const created = (await createRes.json()) as { id: string; root: string };
+
+  // 3. Seed CLAUDE.md: create an empty doc node, then write v0 → v1 via CAS.
+  //    Best-effort — a seed failure leaves a usable (empty) workspace, so we
+  //    log and continue rather than failing the whole session boot.
+  try {
+    const docRes = await fetch(`${base}/workspaces/${created.id}/docs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ parent_id: created.root, name: "CLAUDE.md" }),
+    });
+    if (docRes.ok) {
+      const doc = (await docRes.json()) as { id: string };
+      await fetch(`${base}/workspaces/${created.id}/nodes/${doc.id}/content`, {
+        method: "PUT",
+        headers: { "content-type": "text/markdown", cookie: authHeader(), "If-Match": '"0"' },
+        body: DEFAULT_COWORK_CLAUDE_MD,
+      });
+    } else {
+      console.warn(`[cloud] seed CLAUDE.md: doc create failed (${docRes.status})`);
+    }
+  } catch (e) {
+    console.warn(`[cloud] seed CLAUDE.md failed: ${(e as Error).message}`);
+  }
+
+  return created.id;
 }
 
 // Strip non-serializable fields from cowork's options blob. Same shape as
@@ -404,6 +506,18 @@ class CloudAgentQuery implements AgentQuery {
         return session;
       }
 
+      // Ensure the caller's per-user cowork cloud-drive exists (create + seed
+      // on first use) and attach it at /home/cowork via `workspaceId`. The
+      // cloud-agent warm-restores it from the workspace snapshot on container
+      // start. Non-fatal: if provisioning fails we boot without a shared mount
+      // (empty /home/cowork) rather than blocking the session.
+      let workspaceId: string | undefined;
+      try {
+        workspaceId = await ensureCoworkWorkspace(gateway);
+      } catch (e) {
+        console.warn(`[cloud] cowork workspace provisioning failed, booting without /home/cowork: ${(e as Error).message}`);
+      }
+
       const r = await fetch(`${gateway}/api/agent/sessions`, {
         method: "POST",
         headers: {
@@ -415,6 +529,7 @@ class CloudAgentQuery implements AgentQuery {
           options: serializeOptions(this.opts),
           message: firstMessage,
           workbenchTools: wb?.specs ?? [],
+          ...(workspaceId ? { workspaceId } : {}),
         }),
       });
       if (!r.ok) {
