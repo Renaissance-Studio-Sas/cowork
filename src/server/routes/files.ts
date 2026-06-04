@@ -67,7 +67,9 @@ files.get("/raw", async (c) => {
 
   const ws = await getWorkspace(workspacePath);
   if (!ws) return c.json({ error: "not found" }, 404);
-  const base = path.join(workspaceDir(ws), "files");
+  // Artifacts live directly in the workspace dir — there's no `files/` wrapper
+  // (see workspaceFilesDir in lib/fs.ts). Resolve against the workspace root.
+  const base = workspaceDir(ws);
 
   const full = path.resolve(base, file);
   if (!full.startsWith(base + path.sep) && full !== base) {
@@ -139,7 +141,8 @@ files.post("/upload", async (c) => {
   if (!ws) {
     return c.json({ error: "workspace not found" }, 404);
   }
-  const base = path.join(workspaceDir(ws), "files");
+  // Artifacts live directly in the workspace dir — no `files/` wrapper.
+  const base = workspaceDir(ws);
 
   // Generate unique filename with timestamp
   const timestamp = Date.now();
