@@ -86,8 +86,9 @@ haven't already.
 
 ${pathLine}
 
-When you write output files for this workspace, put them under the
-workspace's \`files/\` directory using the path above. When you read or
+When you write output files for this workspace, put them directly in the
+workspace folder shown above (artifacts live alongside the workspace.json
+brief — there is no \`files/\` subfolder). When you read or
 modify the workspace brief, edit the JSON file shown in the section below —
 it has the shape \`{ "overview": "...", "details": "...", "createdAt": "..." }\`
 where \`overview\` is a one-line summary and \`details\` is markdown.
@@ -111,8 +112,7 @@ You can display images and videos inline in your chat responses using markdown s
 \`\`\`
 
 The \`workspace\` query parameter is the slash-joined slug chain
-(URL-encoded). Files in the workspace's \`files/\` directory are served via
-this API.
+(URL-encoded). Files in the workspace folder are served via this API.
 `.trim();
 
   return { type: "preset", preset: "claude_code", append };

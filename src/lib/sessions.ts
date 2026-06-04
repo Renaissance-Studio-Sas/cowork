@@ -1270,7 +1270,9 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // <system-reminder> with its path so the agent knows what the user is
   // looking at from turn 1. Keep `firstMessage` raw in the session record so
   // auto-titling and labels use the user's actual prompt.
-  const filesDir = path.join(workspaceDir(ws), "files");
+  // Attachments are written directly into the workspace dir (no `files/`
+  // wrapper) by the upload route — read them from there.
+  const filesDir = workspaceDir(ws);
   const { text: firstWithFiles, images: firstImages } = await buildAttachmentMessage(
     p.firstMessage,
     p.files,
@@ -2047,7 +2049,8 @@ export async function sendInputWithFiles(
   if (imageFiles.length > 0) {
     const ws = await getWorkspace(workspacePath);
     if (ws) {
-      const filesDir = path.join(workspaceDir(ws), "files");
+      // Attachments live directly in the workspace dir (no `files/` wrapper).
+      const filesDir = workspaceDir(ws);
       for (const imgFile of imageFiles) {
         try {
           const imgPath = path.join(filesDir, imgFile.path);

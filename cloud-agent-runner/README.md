@@ -1,7 +1,7 @@
 # cloud-agent-runner
 
 Local controller + container image for running Claude Code agents off the
-laptop. Design lives in `../projects/Cowork App/Cloud Agent Runner/files/design.html`.
+laptop. Design lives in `../workspaces/Cowork App/Cloud Agent Runner/design.html`.
 
 MVP layout — no R2 yet. The container bind-mounts the laptop's repo at
 `/workspace` and forwards Anthropic OAuth via `CLAUDE_CODE_OAUTH_TOKEN`.
