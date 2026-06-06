@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
-import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
+import { handleComposerEnter, handleComposerPaste, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
 import { encodeWorkspacePath } from "@/lib/routes";
 import { TodoList, extractTodosFromMessages, type TodoItem } from "./TodoList";
@@ -1095,6 +1095,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                     el.style.height = Math.min(el.scrollHeight, 200) + "px";
                   }}
                   onKeyDown={(e) => handleComposerEnter(e, send)}
+                  onPaste={handleComposerPaste}
                   className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
                 />
                 <button

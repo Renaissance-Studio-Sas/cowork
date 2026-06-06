@@ -9,7 +9,7 @@ import { WorkingIndicator } from "@/components/WorkingIndicator";
 import { Markdown } from "@/components/chat/Markdown";
 import { useStickyDraft } from "@/components/chat/useStickyDraft";
 import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachment } from "@/components/FileDropZone";
-import { handleComposerEnter } from "@/lib/composer";
+import { handleComposerEnter, handleComposerPaste } from "@/lib/composer";
 import { FileViewer } from "@/components/FileViewer";
 import { Chat } from "@/components/Chat";
 import {
@@ -1418,6 +1418,7 @@ function SessionsColumn(props: SessionsColumnProps) {
                 el.style.height = Math.min(el.scrollHeight, 200) + "px";
               }}
               onKeyDown={(e) => handleComposerEnter(e, onStart)}
+              onPaste={handleComposerPaste}
               className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
             />
             <button

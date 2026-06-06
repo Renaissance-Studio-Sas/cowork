@@ -6,7 +6,7 @@
 
 import { useState } from "react";
 import { useRouter } from "@/lib/navigation";
-import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
+import { handleComposerEnter, handleComposerPaste, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
 
 export function ContinueComposer({
@@ -97,6 +97,7 @@ export function ContinueComposer({
             el.style.height = Math.min(el.scrollHeight, 200) + "px";
           }}
           onKeyDown={(e) => handleComposerEnter(e, resume)}
+          onPaste={handleComposerPaste}
           className="flex-1 resize-none bg-transparent outline-none text-[14px] py-2 leading-relaxed"
         />
         {isError && (

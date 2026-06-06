@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "@/lib/navigation";
-import { handleComposerEnter } from "@/lib/composer";
+import { handleComposerEnter, handleComposerPaste } from "@/lib/composer";
 import { encodeWorkspacePath, workspaceSessionRoute } from "@/lib/routes";
 
 function sluggify(s: string): string {
@@ -297,6 +297,7 @@ function KickoffShell({
             el.style.height = Math.min(el.scrollHeight, 200) + "px";
           }}
           onKeyDown={(e) => handleComposerEnter(e, send)}
+          onPaste={handleComposerPaste}
           className="flex-1 resize-none bg-transparent outline-none text-[13.5px] py-1 leading-relaxed"
         />
         <button

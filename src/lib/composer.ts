@@ -51,17 +51,41 @@ export function handleComposerEnter(
   submit();
 }
 
+// Normalize text pasted into a composer textarea. Rich-text / HTML sources
+// (web pages, Word, Google Docs) put CRLF line endings and a trailing newline
+// on the clipboard's text/plain flavor — pasting that verbatim leaves a spurious
+// blank line in the composer. We collapse CRLF → LF and drop trailing newlines
+// from the pasted chunk before inserting it at the caret.
+//
+// Only plain-text pastes are touched. File pastes (handled by FileDropZone) and
+// pastes with no text/plain flavor fall through to the browser default, as do
+// pastes that need no cleanup (so native undo behavior is preserved verbatim).
+export function handleComposerPaste(
+  e: React.ClipboardEvent<HTMLTextAreaElement>,
+): void {
+  const raw = e.clipboardData?.getData("text/plain");
+  if (!raw) return;
+  const cleaned = raw.replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+  if (cleaned === raw) return; // nothing to fix — let the browser handle it
+  e.preventDefault();
+  insertText(e.currentTarget, cleaned);
+}
+
 function insertNewline(el: HTMLTextAreaElement): void {
+  insertText(el, "\n");
+}
+
+function insertText(el: HTMLTextAreaElement, text: string): void {
   // Prefer execCommand because it preserves the textarea's undo history.
   // Fall back to manual splice + setter (still keeps the controlled-input
   // bookkeeping working via a fresh InputEvent).
   let ok = false;
-  try { ok = !!document.execCommand?.("insertText", false, "\n"); } catch { /* ignore */ }
+  try { ok = !!document.execCommand?.("insertText", false, text); } catch { /* ignore */ }
   if (ok) return;
 
   const start = el.selectionStart ?? el.value.length;
   const end = el.selectionEnd ?? el.value.length;
-  const next = el.value.slice(0, start) + "\n" + el.value.slice(end);
+  const next = el.value.slice(0, start) + text + el.value.slice(end);
 
   // Use the native setter so React's controlled-input wrapper sees the change
   // and re-renders with the new value.
@@ -69,6 +93,6 @@ function insertNewline(el: HTMLTextAreaElement): void {
   setter?.call(el, next);
   el.dispatchEvent(new Event("input", { bubbles: true }));
   requestAnimationFrame(() => {
-    el.selectionStart = el.selectionEnd = start + 1;
+    el.selectionStart = el.selectionEnd = start + text.length;
   });
 }

@@ -15,7 +15,7 @@ import {
 import { buildEnhancedHtml } from "@/lib/iframe-enhancer";
 import { resolveRelative } from "@/lib/relative-path";
 import { EmailThreadViewer, type ThreadRecord } from "./EmailThreadViewer";
-import { handleComposerEnter } from "@/lib/composer";
+import { handleComposerEnter, handleComposerPaste } from "@/lib/composer";
 import { encodeWorkspacePath, workspaceFileRoute } from "@/lib/routes";
 import { useWorkspace } from "@/lib/workspace-context";
 import type { SessionSummaryDTO } from "@/lib/types";
@@ -789,6 +789,7 @@ function CommentPanel({
             placeholder={pendingAnchor ? "Comment on selection…" : "Comment on the whole document…"}
             rows={3}
             onKeyDown={(e) => handleComposerEnter(e, onPost)}
+            onPaste={handleComposerPaste}
             className="w-full resize-none bg-transparent outline-none text-[13.5px] px-3 py-2 leading-relaxed"
           />
           <div className="flex justify-end px-2 pb-2">
