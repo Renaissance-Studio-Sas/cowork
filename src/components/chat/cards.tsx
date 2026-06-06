@@ -362,18 +362,18 @@ export function CompleteToggleButton({
   );
 }
 
-// Composer button — toggles the session's sticky "blocked" flag. A blocked
+// Composer button — toggles the session's sticky "backlog" flag. A backlog
 // session is parked waiting on something external (another session, a person, a
-// dependency); it drops out of "Active Sessions" into the "Blocked" list.
+// dependency); it drops out of "Active Sessions" into the "Backlog" list.
 // Unlike completion this never navigates away — you stay on the session. State
-// flips immediately via the `blocked_changed` SSE echo.
-export function BlockToggleButton({
+// flips immediately via the `backlog_changed` SSE echo.
+export function BacklogToggleButton({
   session,
-  blocked,
+  backlog,
   variant = "full",
 }: {
   session: SessionSummaryDTO;
-  blocked: boolean;
+  backlog: boolean;
   /** "full" = labeled pill; "icon" = square icon button. */
   variant?: "full" | "icon";
 }) {
@@ -382,20 +382,20 @@ export function BlockToggleButton({
     if (busy) return;
     setBusy(true);
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(session.id)}/blocked`, {
+      await fetch(`/api/sessions/${encodeURIComponent(session.id)}/backlog`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           workspace: session.workspacePath,
-          blocked: !blocked,
+          backlog: !backlog,
         }),
       });
-      // The SSE `blocked_changed` event will flip the local state.
+      // The SSE `backlog_changed` event will flip the local state.
     } finally {
       setBusy(false);
     }
   };
-  const title = blocked
+  const title = backlog
     ? "Move this session back to the active list"
     : "Move this session to the Backlog (its completion is waiting on something external)";
 
@@ -405,14 +405,14 @@ export function BlockToggleButton({
         onClick={toggle}
         disabled={busy}
         className={`rounded-lg border w-9 h-9 flex items-center justify-center text-[15px] transition disabled:opacity-50 shrink-0 ${
-          blocked
+          backlog
             ? "border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn-soft)]"
             : "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
         }`}
         title={title}
-        aria-label={blocked ? "Move session to active" : "Move session to backlog"}
+        aria-label={backlog ? "Move session to active" : "Move session to backlog"}
       >
-        {blocked ? "▶" : "⏸"}
+        {backlog ? "▶" : "⏸"}
       </button>
     );
   }
@@ -422,13 +422,13 @@ export function BlockToggleButton({
       onClick={toggle}
       disabled={busy}
       className={`text-[12px] px-3 py-1.5 rounded-lg border transition disabled:opacity-50 ${
-        blocked
+        backlog
           ? "border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn-soft)]"
           : "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
       }`}
       title={title}
     >
-      {blocked ? "▶ Unblock" : "⏸ Mark blocked"}
+      {backlog ? "▶ Move to active" : "⏸ Move to backlog"}
     </button>
   );
 }

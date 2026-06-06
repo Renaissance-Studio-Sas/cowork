@@ -741,7 +741,7 @@ export function listLiveSessions(): SessionSummary[] {
       isLive: true,
       unread,
       completed: !!s.completed,
-      blocked: !!s.blocked,
+      backlog: !!s.backlog,
       hasPendingPrompt,
       runtime: s.runtime,
       model: s.model,
@@ -774,7 +774,7 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
     const sessDir = path.join(SESSIONS_ROOT, id);
     const metaPath = path.join(sessDir, "meta.json");
     const inputPath = path.join(sessDir, "input.jsonl");
-    let meta: { workspace?: string[]; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; blocked?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
+    let meta: { workspace?: string[]; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; backlog?: boolean; blocked?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { continue; /* no meta → not a session */ }
     const workspacePath = Array.isArray(meta.workspace) ? meta.workspace : [];
     // Prefer generated name from meta.json; fall back to first message for legacy sessions.
@@ -807,7 +807,9 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
       isLive: false,
       unread,
       completed: meta.completed === true,
-      blocked: meta.blocked === true,
+      // Legacy meta.json wrote the field as `blocked`; read both so old
+      // sessions keep their state after the rename to `backlog`.
+      backlog: meta.backlog === true || meta.blocked === true,
       hasPendingPrompt: meta.hasPendingPrompt === true,
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
@@ -904,6 +906,7 @@ async function doRestoreSession(
     lastActivity?: string;
     completedAt?: string;
     completed?: boolean;
+    backlog?: boolean;
     blocked?: boolean;
     runtime?: SessionRuntime;
   } = {};
@@ -967,7 +970,8 @@ async function doRestoreSession(
     pendingQuestions,
     pendingCompletions,
     completed: meta.completed === true,
-    blocked: meta.blocked === true,
+    // Legacy meta.json wrote this as `blocked` — read both after the rename.
+    backlog: meta.backlog === true || meta.blocked === true,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
@@ -1356,7 +1360,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     pendingQuestions,
     pendingCompletions,
     completed: false,
-    blocked: false,
+    backlog: false,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -2002,12 +2006,12 @@ export async function sendInput(id: string, text: string, openArtifact?: string)
     void updateMeta(s, (meta) => { meta.completed = false; });
     s.events.emit("completed_changed", { completed: false });
   }
-  // A new message means the blocker (if any) is resolved — drop the blocked
+  // A new message means the dependency (if any) is resolved — drop the backlog
   // flag so the session returns to the active list.
-  if (s.blocked) {
-    s.blocked = false;
-    void updateMeta(s, (meta) => { meta.blocked = false; });
-    s.events.emit("blocked_changed", { blocked: false });
+  if (s.backlog) {
+    s.backlog = false;
+    void updateMeta(s, (meta) => { meta.backlog = false; delete meta.blocked; });
+    s.events.emit("backlog_changed", { backlog: false });
   }
   setState(s, "running");
   return true;
@@ -2096,10 +2100,10 @@ export async function sendInputWithFiles(
     void updateMeta(s, (meta) => { meta.completed = false; });
     s.events.emit("completed_changed", { completed: false });
   }
-  if (s.blocked) {
-    s.blocked = false;
-    void updateMeta(s, (meta) => { meta.blocked = false; });
-    s.events.emit("blocked_changed", { blocked: false });
+  if (s.backlog) {
+    s.backlog = false;
+    void updateMeta(s, (meta) => { meta.backlog = false; delete meta.blocked; });
+    s.events.emit("backlog_changed", { backlog: false });
   }
   setState(s, "running");
   return true;
@@ -2326,10 +2330,10 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
       void updateMeta(s, (meta) => { meta.completed = false; });
       s.events.emit("completed_changed", { completed: false });
     }
-    if (s.blocked) {
-      s.blocked = false;
-      void updateMeta(s, (meta) => { meta.blocked = false; });
-      s.events.emit("blocked_changed", { blocked: false });
+    if (s.backlog) {
+      s.backlog = false;
+      void updateMeta(s, (meta) => { meta.backlog = false; delete meta.blocked; });
+      s.events.emit("backlog_changed", { backlog: false });
     }
     // Clear the interrupt latch — a fresh turn is starting, so the new
     // pumpEvents loop should track "running" normally again. Drop any
@@ -2534,13 +2538,13 @@ export async function markSessionCompleted(
   }
 }
 
-// Mark a session as blocked (or un-block it). "Blocked" means the session's
-// completion is waiting on something external — another session, a person, a
-// dependency. Sticky across reloads via meta.json and orthogonal to the
-// runtime state and the `completed` flag. Blocked sessions are pulled out of
-// the "Active Sessions" list into a separate "Blocked" list, and sending a new
-// message auto-unblocks (see sendInput / sendInputWithFiles / resumeSession).
-export async function markSessionBlocked(
+// Move a session to the backlog (or back to active). "Backlog" means the
+// session's completion is waiting on something external — another session, a
+// person, a dependency. Sticky across reloads via meta.json and orthogonal to
+// the runtime state and the `completed` flag. Backlog sessions are pulled out
+// of the "Active Sessions" list into a separate "Backlog" list, and sending a
+// new message auto-clears it (see sendInput / sendInputWithFiles / resumeSession).
+export async function markSessionBacklog(
   workspacePath: string[],
   sessionId: string,
   value: boolean,
@@ -2549,11 +2553,12 @@ export async function markSessionBlocked(
   // setState / persistSdkSessionId writers (concurrent writes corrupt meta.json).
   const liveSession = registry.get(sessionId);
   if (liveSession) {
-    liveSession.blocked = value;
+    liveSession.backlog = value;
     await updateMeta(liveSession, (meta) => {
-      meta.blocked = value;
+      meta.backlog = value;
+      delete meta.blocked; // migrate off the legacy key
     });
-    liveSession.events.emit("blocked_changed", { blocked: value });
+    liveSession.events.emit("backlog_changed", { backlog: value });
     return true;
   }
 
@@ -2565,7 +2570,8 @@ export async function markSessionBlocked(
   try {
     const raw = await fs.readFile(metaPath, "utf8");
     const meta = JSON.parse(raw);
-    meta.blocked = value;
+    meta.backlog = value;
+    delete meta.blocked; // migrate off the legacy key
     const tmpPath = metaPath + ".tmp";
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
     await fs.rename(tmpPath, metaPath);

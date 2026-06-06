@@ -16,7 +16,7 @@ import {
   QuestionCard,
   CompletionSuggestionCard,
   CompleteToggleButton,
-  BlockToggleButton,
+  BacklogToggleButton,
 } from "./chat/cards";
 import { ContinueComposer } from "./chat/ContinueComposer";
 import { UsageIndicator } from "./chat/UsageIndicator";
@@ -137,10 +137,10 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // suggestion is approved.
   const [completed, setCompletedState] = useState<boolean>(session.completed);
 
-  // Sticky blocked mark — drives the composer's Mark blocked / Unblock toggle.
-  // Bootstraps from the DTO and stays in sync via `blocked_changed` SSE events
+  // Sticky backlog mark — drives the composer's Move to Backlog toggle.
+  // Bootstraps from the DTO and stays in sync via `backlog_changed` SSE events
   // so the button flips immediately when toggled here or elsewhere.
-  const [blocked, setBlockedState] = useState<boolean>(session.blocked);
+  const [backlog, setBacklogState] = useState<boolean>(session.backlog);
 
   // Todo list pushed by the server, derived from the FULL session history. The
   // chat transcript is paginated, so deriving todos from `messages` alone misses
@@ -241,7 +241,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     setPendingCompletions(new Map());
     setPendingSends([]);
     setCompletedState(session.completed);
-    setBlockedState(session.blocked);
+    setBacklogState(session.backlog);
     isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
@@ -449,10 +449,10 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
         onChangeRef.current();
       } catch { /* ignore */ }
     });
-    es.addEventListener("blocked_changed", (ev) => {
+    es.addEventListener("backlog_changed", (ev) => {
       try {
-        const { blocked: b } = JSON.parse((ev as MessageEvent).data);
-        setBlockedState(!!b);
+        const { backlog: b } = JSON.parse((ev as MessageEvent).data);
+        setBacklogState(!!b);
         onChangeRef.current();
       } catch { /* ignore */ }
     });
@@ -1138,7 +1138,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
             />
           )}
           {/* Footer row: model/usage info on the left, session-level action
-              buttons (mark blocked / mark complete) pushed to the right, all on
+              buttons (move to backlog / mark complete) pushed to the right, all on
               one vertically-centered line. The actions live here rather than
               inside the input box so they read as session controls, not
               message-composition affordances. */}
@@ -1177,7 +1177,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               </div>
               {!isRenaming && (
                 <div className="shrink-0 flex items-center gap-2">
-                  <BlockToggleButton session={session} blocked={blocked} variant="full" />
+                  <BacklogToggleButton session={session} backlog={backlog} variant="full" />
                   <CompleteToggleButton session={session} completed={completed} variant="full" />
                 </div>
               )}

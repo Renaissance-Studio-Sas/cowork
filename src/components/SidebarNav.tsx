@@ -15,7 +15,7 @@ import {
 
 const COLLAPSED_KEY = "wb-workspaces-collapsed";
 const RECENT_COLLAPSED_KEY = "wb-recent-sessions-collapsed";
-const BLOCKED_COLLAPSED_KEY = "wb-blocked-sessions-collapsed";
+const BACKLOG_COLLAPSED_KEY = "wb-backlog-sessions-collapsed";
 const ROOT_COLLAPSED_KEY = "wb-workspaces-section-collapsed";
 
 // Key a workspace's collapsed-state in localStorage by its full slug-chain so
@@ -44,9 +44,9 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [recentCollapsed, setRecentCollapsed] = useState(false);
-  // Blocked section defaults to collapsed — it's a parked-work list, not the
+  // Backlog section defaults to collapsed — it's a parked-work list, not the
   // top-of-mind one, so it stays out of the way until the user expands it.
-  const [blockedCollapsed, setBlockedCollapsed] = useState(true);
+  const [backlogCollapsed, setBacklogCollapsed] = useState(true);
   const [rootCollapsed, setRootCollapsed] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [renaming, setRenaming] = useState<{ path: string[] } | null>(null);
@@ -67,7 +67,7 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
     try {
       setRecentCollapsed(localStorage.getItem(RECENT_COLLAPSED_KEY) === "true");
       // Default-collapsed: only expand if the user previously expanded it.
-      setBlockedCollapsed(localStorage.getItem(BLOCKED_COLLAPSED_KEY) !== "false");
+      setBacklogCollapsed(localStorage.getItem(BACKLOG_COLLAPSED_KEY) !== "false");
       setRootCollapsed(localStorage.getItem(ROOT_COLLAPSED_KEY) === "true");
     } catch { /* ignore */ }
   }, []);
@@ -86,9 +86,9 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
     try { localStorage.setItem(RECENT_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
   };
 
-  const updateBlockedCollapsed = (value: boolean) => {
-    setBlockedCollapsed(value);
-    try { localStorage.setItem(BLOCKED_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
+  const updateBacklogCollapsed = (value: boolean) => {
+    setBacklogCollapsed(value);
+    try { localStorage.setItem(BACKLOG_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
   };
 
   const updateRootCollapsed = (value: boolean) => {
@@ -121,17 +121,17 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
   // Get the 10 most recent active sessions sorted by lastActivity.
   // Completed sessions are deliberately excluded — once the user (or agent +
   // approval) marks a session done, it falls out of the top-of-mind list.
-  // Blocked sessions are excluded too — they live in their own list below.
+  // Backlog sessions are excluded too — they live in their own list below.
   const activeSessions = [...sessions]
-    .filter((s) => !s.completed && !s.blocked)
+    .filter((s) => !s.completed && !s.backlog)
     .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
     .slice(0, 10);
 
   // Sessions parked on an external dependency. Shown in a separate, foldable
-  // "Blocked" list below the active one. Completed sessions never appear here —
+  // "Backlog" list below the active one. Completed sessions never appear here —
   // a finished session isn't waiting on anything.
-  const blockedSessions = [...sessions]
-    .filter((s) => s.blocked && !s.completed)
+  const backlogSessions = [...sessions]
+    .filter((s) => s.backlog && !s.completed)
     .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1));
 
   const startRename = (path: string[]) => {
@@ -228,11 +228,11 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
     refresh();
   };
 
-  const toggleSessionBlocked = async (s: SessionSummaryDTO, blocked: boolean) => {
-    await fetch(`/api/sessions/${s.id}/blocked`, {
+  const toggleSessionBacklog = async (s: SessionSummaryDTO, backlog: boolean) => {
+    await fetch(`/api/sessions/${s.id}/backlog`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace: s.workspacePath, blocked }),
+      body: JSON.stringify({ workspace: s.workspacePath, backlog }),
     });
     refresh();
   };
@@ -271,8 +271,8 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
         onClick: () => toggleSessionCompleted(s, !s.completed),
       },
       {
-        label: s.blocked ? "Unblock" : "Mark blocked",
-        onClick: () => toggleSessionBlocked(s, !s.blocked),
+        label: s.backlog ? "Move to active" : "Move to backlog",
+        onClick: () => toggleSessionBacklog(s, !s.backlog),
       },
       { label: "Delete", danger: true, onClick: () => deleteSession(s), disabled: isRunning },
     ];
@@ -378,33 +378,33 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Blocked Sessions — parked on an external dependency. Foldable, and
-            hidden entirely when nothing is blocked. */}
-        {blockedSessions.length > 0 && (
+        {/* Backlog Sessions — parked on an external dependency. Foldable, and
+            hidden entirely when nothing is in the backlog. */}
+        {backlogSessions.length > 0 && (
           <div className="mb-3">
             <div className="flex items-center gap-1 px-1 py-1.5">
               <button
-                onClick={() => updateBlockedCollapsed(!blockedCollapsed)}
+                onClick={() => updateBacklogCollapsed(!backlogCollapsed)}
                 className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
-                title={blockedCollapsed ? "Expand" : "Collapse"}
+                title={backlogCollapsed ? "Expand" : "Collapse"}
               >
                 <svg
                   width="18" height="18" viewBox="0 0 24 24"
-                  className={`text-[var(--muted)] transition-transform ${blockedCollapsed ? "" : "rotate-90"}`}
+                  className={`text-[var(--muted)] transition-transform ${backlogCollapsed ? "" : "rotate-90"}`}
                   fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
                   aria-hidden
                 ><path d="M9 6l6 6-6 6" /></svg>
               </button>
               <span className="flex-1 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
-                Blocked
+                Backlog
               </span>
-              <span className="text-[10px] text-[var(--muted)] shrink-0" title={`${blockedSessions.length} blocked`}>
-                {blockedSessions.length}
+              <span className="text-[10px] text-[var(--muted)] shrink-0" title={`${backlogSessions.length} in backlog`}>
+                {backlogSessions.length}
               </span>
             </div>
-            {!blockedCollapsed && (
+            {!backlogCollapsed && (
               <div className="space-y-0.5">
-                {blockedSessions.map((s) => (
+                {backlogSessions.map((s) => (
                   <RecentSessionRow
                     key={s.id}
                     session={s}
@@ -706,9 +706,9 @@ function RecentSessionRow({ session, selected, onContextMenu }: {
 
   const stateIcon = () => {
     if (session.completed) return null;
-    // Blocked sessions are intentionally parked — show a static "on hold" mark
+    // Backlog sessions are intentionally parked — show a static "on hold" mark
     // rather than the pulsing "pending" dot so they don't read as needing action.
-    if (session.blocked) return <span className="text-[var(--muted)]" title="Blocked">⏸</span>;
+    if (session.backlog) return <span className="text-[var(--muted)]" title="Backlog">⏸</span>;
     if (session.state === "error") return <span className="text-red-500" title="Error">●</span>;
     if (session.state === "running" && !session.hasPendingPrompt) {
       return <WorkingIndicator size={11} title="Working" />;

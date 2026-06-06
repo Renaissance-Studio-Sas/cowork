@@ -17,9 +17,9 @@ interface WorkspaceContextValue {
 // "error" gets its own treatment.
 export function isPending(s: SessionSummaryDTO): boolean {
   if (s.completed) return false;
-  // Blocked sessions are intentionally parked on an external dependency — they
+  // Backlog sessions are intentionally parked on an external dependency — they
   // shouldn't nag as "pending" or count toward the workspace pending badge.
-  if (s.blocked) return false;
+  if (s.backlog) return false;
   if (s.state === "error") return false;
   if (s.state === "running" && !s.hasPendingPrompt) return false;
   return true;
