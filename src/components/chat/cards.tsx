@@ -396,8 +396,8 @@ export function BlockToggleButton({
     }
   };
   const title = blocked
-    ? "Unblock this session (it returns to the active list)"
-    : "Mark this session blocked (its completion is waiting on something external)";
+    ? "Move this session back to the active list"
+    : "Move this session to the Backlog (its completion is waiting on something external)";
 
   if (variant === "icon") {
     return (
@@ -410,7 +410,7 @@ export function BlockToggleButton({
             : "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
         }`}
         title={title}
-        aria-label={blocked ? "Unblock session" : "Mark session blocked"}
+        aria-label={blocked ? "Move session to active" : "Move session to backlog"}
       >
         {blocked ? "▶" : "⏸"}
       </button>

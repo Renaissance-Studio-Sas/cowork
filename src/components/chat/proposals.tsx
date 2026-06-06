@@ -132,6 +132,10 @@ function ChildWorkspaceProposalCard({
   const [details, setDetails] = useState(initial.task_details ?? "");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Once accepted, fold the editor into its header. `collapsed` stays
+  // user-toggleable so they can re-expand to inspect what was created.
+  const [created, setCreated] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
 
   const create = async () => {
     if (!slug.trim() || creating) return;
@@ -150,6 +154,8 @@ function ChildWorkspaceProposalCard({
       });
       const j = await r.json();
       if (!r.ok) { setError(j.error ?? "failed to create"); return; }
+      setCreated(true);
+      setCollapsed(true);
       onCreated(j.slug ?? cleanSlug);
     } catch (err) {
       setError(String(err));
@@ -158,19 +164,25 @@ function ChildWorkspaceProposalCard({
     }
   };
 
-  const opacity = isLatest ? "" : "opacity-60";
+  const opacity = isLatest && !created ? "" : "opacity-60";
+  const editable = isLatest && !created;
   return (
     <div className={`rounded-xl border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-3 ${opacity}`}>
-      <div className="text-[10.5px] uppercase tracking-wider text-[var(--accent)] font-semibold mb-2">
-        {isLatest ? "Proposed child workspace" : "Earlier proposal"}
-      </div>
+      <ProposalHeader
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((c) => !c)}
+        label={created ? "Workspace created" : isLatest ? "Proposed child workspace" : "Earlier proposal"}
+        summary={collapsed ? slug : undefined}
+        created={created}
+      />
+      {!collapsed && (
       <div className="space-y-2">
         <div>
           <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Workspace name</div>
           <input
             value={slug}
             onChange={(e) => setSlug(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13.5px] outline-none focus:border-[var(--accent)] font-mono disabled:opacity-60"
           />
         </div>
@@ -179,7 +191,7 @@ function ChildWorkspaceProposalCard({
           <input
             value={overview}
             onChange={(e) => setOverview(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13.5px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
           />
         </div>
@@ -188,13 +200,14 @@ function ChildWorkspaceProposalCard({
           <textarea
             value={details}
             onChange={(e) => setDetails(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             rows={8}
             className="w-full resize-y bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] font-mono leading-relaxed disabled:opacity-60"
           />
         </div>
       </div>
-      {isLatest && (
+      )}
+      {editable && (
         <div className="mt-3 flex items-center justify-end gap-2">
           {error && <div className="text-[12px] text-[#dc2626] mr-auto">{error}</div>}
           <button
@@ -205,6 +218,37 @@ function ChildWorkspaceProposalCard({
         </div>
       )}
     </div>
+  );
+}
+
+// Shared header for proposal cards. Clickable to fold/unfold the editor body;
+// shows a ✓ + the chosen name once the workspace has been created.
+function ProposalHeader({
+  collapsed,
+  onToggle,
+  label,
+  summary,
+  created,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+  label: string;
+  summary?: string;
+  created: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`w-full flex items-center gap-1.5 text-left text-[10.5px] uppercase tracking-wider font-semibold ${collapsed ? "" : "mb-2"} text-[var(--accent)] hover:brightness-110`}
+    >
+      <span className="text-[8px] leading-none w-2 shrink-0">{collapsed ? "▸" : "▾"}</span>
+      {created && <span className="leading-none">✓</span>}
+      <span>{label}</span>
+      {summary && (
+        <span className="normal-case tracking-normal font-normal text-[var(--muted)] truncate">· {summary}</span>
+      )}
+    </button>
   );
 }
 
@@ -240,6 +284,9 @@ function PlanProposalCard({
   );
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Fold the plan into its header once accepted; stays re-expandable.
+  const [created, setCreated] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
 
   const updateChild = (i: number, patch: Partial<{ slug: string; overview: string; details: string }>) => {
     setChildren((prev) => prev.map((t, j) => (i === j ? { ...t, ...patch } : t)));
@@ -272,6 +319,8 @@ function PlanProposalCard({
       const finalPath: string[] = Array.isArray(j.path) && j.path.length > 0
         ? j.path
         : [...currentPath.slice(0, -1), cleanSlug];
+      setCreated(true);
+      setCollapsed(true);
       onCreated(finalPath);
     } catch (err) {
       setError(String(err));
@@ -280,19 +329,26 @@ function PlanProposalCard({
     }
   };
 
-  const opacity = isLatest ? "" : "opacity-60";
+  const opacity = isLatest && !created ? "" : "opacity-60";
+  const editable = isLatest && !created;
+  const childSummary = children.length ? ` + ${children.length} child${children.length > 1 ? "ren" : ""}` : "";
   return (
     <div className={`rounded-xl border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-3 ${opacity}`}>
-      <div className="text-[10.5px] uppercase tracking-wider text-[var(--accent)] font-semibold mb-2">
-        {isLatest ? "Proposed workspace plan" : "Earlier proposal"}
-      </div>
+      <ProposalHeader
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((c) => !c)}
+        label={created ? "Workspace created" : isLatest ? "Proposed workspace plan" : "Earlier proposal"}
+        summary={collapsed ? `${wsSlug}${childSummary}` : undefined}
+        created={created}
+      />
+      {!collapsed && (
       <div className="space-y-2">
         <div>
           <div className="text-[10.5px] uppercase tracking-wider text-[var(--muted)] mb-1">Workspace name</div>
           <input
             value={wsSlug}
             onChange={(e) => setWsSlug(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13.5px] outline-none focus:border-[var(--accent)] font-mono disabled:opacity-60"
           />
         </div>
@@ -301,7 +357,7 @@ function PlanProposalCard({
           <input
             value={wsOverview}
             onChange={(e) => setWsOverview(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             className="w-full bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] disabled:opacity-60"
           />
         </div>
@@ -310,7 +366,7 @@ function PlanProposalCard({
           <textarea
             value={wsDetails}
             onChange={(e) => setWsDetails(e.target.value)}
-            disabled={!isLatest}
+            disabled={!editable}
             rows={4}
             className="w-full resize-y bg-[var(--panel)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[13px] outline-none focus:border-[var(--accent)] font-mono leading-relaxed disabled:opacity-60"
           />
@@ -323,18 +379,18 @@ function PlanProposalCard({
                 <input
                   value={c.slug}
                   onChange={(e) => updateChild(i, { slug: e.target.value })}
-                  disabled={!isLatest}
+                  disabled={!editable}
                   className="w-[140px] shrink-0 bg-transparent border-b border-transparent focus:border-[var(--accent)] outline-none text-[12.5px] font-mono py-0.5 disabled:opacity-60"
                   placeholder="slug"
                 />
                 <input
                   value={c.overview}
                   onChange={(e) => updateChild(i, { overview: e.target.value })}
-                  disabled={!isLatest}
+                  disabled={!editable}
                   className="flex-1 bg-transparent border-b border-transparent focus:border-[var(--accent)] outline-none text-[12.5px] py-0.5 disabled:opacity-60"
                   placeholder="overview"
                 />
-                {isLatest && (
+                {editable && (
                   <button
                     onClick={() => removeChild(i)}
                     className="text-[var(--muted)] hover:text-[#dc2626] text-[12px] px-1"
@@ -343,7 +399,7 @@ function PlanProposalCard({
                 )}
               </div>
             ))}
-            {isLatest && (
+            {editable && (
               <button
                 onClick={addChild}
                 className="text-[11.5px] text-[var(--muted)] hover:text-[var(--text)] underline underline-offset-2"
@@ -352,7 +408,8 @@ function PlanProposalCard({
           </div>
         </div>
       </div>
-      {isLatest && (
+      )}
+      {editable && (
         <div className="mt-3 flex items-center justify-end gap-2">
           {error && <div className="text-[12px] text-[#dc2626] mr-auto">{error}</div>}
           <button
