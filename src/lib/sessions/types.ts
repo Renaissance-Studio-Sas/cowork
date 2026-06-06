@@ -90,6 +90,13 @@ export interface RuntimeSession {
   // complete. Sticky across reloads via meta.json. Cleared automatically when
   // a new user message is sent (the session is being revived).
   completed: boolean;
+  // Whether the human has marked this session blocked — its completion is
+  // waiting on something external (another session, a person, a dependency).
+  // Sticky across reloads via meta.json. Orthogonal to `completed` and to the
+  // runtime state. Blocked sessions drop out of the "Active Sessions" list into
+  // a separate "Blocked" list. Cleared automatically when a new user message is
+  // sent (the blocker is presumably resolved).
+  blocked: boolean;
   sdkSessionId: string | null;   // the SDK's internal session ID for resumption
   permissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   model: string | null;
@@ -165,6 +172,7 @@ export interface SessionSummary {
   isLive: boolean;
   unread: boolean;               // completed session not yet viewed
   completed: boolean;            // sticky "marked complete" flag (manual or agent-suggested + approved)
+  blocked: boolean;              // sticky "marked blocked" flag — completion waits on something external
   hasPendingPrompt: boolean;     // agent's turn is parked on a user decision (permission/question/completion)
   runtime: SessionRuntime;
   model: string | null;          // actual model id (e.g. "claude-opus-4-7", "gemini-3.5-flash")

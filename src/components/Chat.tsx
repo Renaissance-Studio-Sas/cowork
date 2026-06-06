@@ -16,6 +16,7 @@ import {
   QuestionCard,
   CompletionSuggestionCard,
   CompleteToggleButton,
+  BlockToggleButton,
 } from "./chat/cards";
 import { ContinueComposer } from "./chat/ContinueComposer";
 import { UsageIndicator } from "./chat/UsageIndicator";
@@ -136,6 +137,11 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // suggestion is approved.
   const [completed, setCompletedState] = useState<boolean>(session.completed);
 
+  // Sticky blocked mark — drives the composer's Mark blocked / Unblock toggle.
+  // Bootstraps from the DTO and stays in sync via `blocked_changed` SSE events
+  // so the button flips immediately when toggled here or elsewhere.
+  const [blocked, setBlockedState] = useState<boolean>(session.blocked);
+
   // Todo list pushed by the server, derived from the FULL session history. The
   // chat transcript is paginated, so deriving todos from `messages` alone misses
   // tool calls in older, not-yet-loaded messages. Prefer this when present; fall
@@ -235,6 +241,7 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
     setPendingCompletions(new Map());
     setPendingSends([]);
     setCompletedState(session.completed);
+    setBlockedState(session.blocked);
     isInitialLoadRef.current = true;
 
     // Always try to connect to SSE stream first — even if session.isLive is false,
@@ -439,6 +446,13 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
       try {
         const { completed: c } = JSON.parse((ev as MessageEvent).data);
         setCompletedState(!!c);
+        onChangeRef.current();
+      } catch { /* ignore */ }
+    });
+    es.addEventListener("blocked_changed", (ev) => {
+      try {
+        const { blocked: b } = JSON.parse((ev as MessageEvent).data);
+        setBlockedState(!!b);
         onChangeRef.current();
       } catch { /* ignore */ }
     });
@@ -1112,9 +1126,6 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                     </svg>
                   </button>
                 )}
-                {!isRenaming && (
-                  <CompleteToggleButton session={session} completed={completed} variant="icon" />
-                )}
               </div>
             </FileDropZone>
           ) : (
@@ -1123,42 +1134,52 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
               draft={draft}
               setDraft={setDraft}
               openArtifactPath={openArtifactPath}
-              completeButton={!isRenaming ? <CompleteToggleButton session={session} completed={completed} variant="icon" /> : null}
             />
           )}
-          {/* Footer: model (+ thinking effort) alongside the subscription
-              usage indicator. Model shows even before any usage event lands. */}
-          {(session.model || session.runtime || rateLimit) && (
-            <div
-              className="mt-1.5 px-1 flex items-center gap-2 flex-wrap text-[11px] leading-none select-none"
-              style={{ color: "var(--text-soft)" }}
-            >
-              {(session.model || session.runtime) && (
-                <span
-                  className="inline-flex items-center gap-1 shrink-0"
-                  title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                >
-                  <span className="font-mono">{session.model ?? session.runtime}</span>
-                  {session.runtime === "cloud" && (
-                    <span
-                      className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
-                      title="Running on Cloudflare Containers (via /api/agent)"
-                    >
-                      cloud
-                    </span>
-                  )}
+          {/* Footer row: model/usage info on the left, session-level action
+              buttons (mark blocked / mark complete) pushed to the right, all on
+              one vertically-centered line. The actions live here rather than
+              inside the input box so they read as session controls, not
+              message-composition affordances. */}
+          {(session.model || session.runtime || rateLimit || !isRenaming) && (
+            <div className="mt-2 px-1 flex items-center gap-2">
+              <div
+                className="flex-1 min-w-0 flex items-center gap-2 flex-wrap text-[11px] leading-none select-none"
+                style={{ color: "var(--text-soft)" }}
+              >
+                {(session.model || session.runtime) && (
                   <span
-                    className="font-mono opacity-70"
-                    title={session.effort ? `Thinking effort: ${session.effort}` : "Thinking effort: high (SDK default)"}
+                    className="inline-flex items-center gap-1 shrink-0"
+                    title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
                   >
-                    ({session.effort ?? "high"})
+                    <span className="font-mono">{session.model ?? session.runtime}</span>
+                    {session.runtime === "cloud" && (
+                      <span
+                        className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
+                        title="Running on Cloudflare Containers (via /api/agent)"
+                      >
+                        cloud
+                      </span>
+                    )}
+                    <span
+                      className="font-mono opacity-70"
+                      title={session.effort ? `Thinking effort: ${session.effort}` : "Thinking effort: high (SDK default)"}
+                    >
+                      ({session.effort ?? "high"})
+                    </span>
                   </span>
-                </span>
+                )}
+                {(session.model || session.runtime) && rateLimit && (
+                  <span className="opacity-40">·</span>
+                )}
+                <UsageIndicator info={rateLimit} />
+              </div>
+              {!isRenaming && (
+                <div className="shrink-0 flex items-center gap-2">
+                  <BlockToggleButton session={session} blocked={blocked} variant="full" />
+                  <CompleteToggleButton session={session} completed={completed} variant="full" />
+                </div>
               )}
-              {(session.model || session.runtime) && rateLimit && (
-                <span className="opacity-40">·</span>
-              )}
-              <UsageIndicator info={rateLimit} />
             </div>
           )}
         </div>

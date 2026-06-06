@@ -72,13 +72,19 @@ function effectiveState(s: SessionSummaryDTO): SessionSummaryDTO["state"] {
   return s.state === "running" && s.hasPendingPrompt ? "awaiting_input" : s.state;
 }
 function sessionLabel(s: SessionSummaryDTO): string {
-  return s.completed ? "completed" : STATE_LABEL[effectiveState(s)];
+  if (s.completed) return "completed";
+  if (s.blocked) return "blocked";
+  return STATE_LABEL[effectiveState(s)];
 }
 function sessionColor(s: SessionSummaryDTO): string {
-  return s.completed ? "var(--ok)" : STATE_COLOR[effectiveState(s)];
+  if (s.completed) return "var(--ok)";
+  if (s.blocked) return "var(--muted)";
+  return STATE_COLOR[effectiveState(s)];
 }
 function sessionIsPending(s: SessionSummaryDTO): boolean {
-  if (s.completed) return false;
+  // Blocked sessions are intentionally parked — they don't count as "needs
+  // attention" pending work.
+  if (s.completed || s.blocked) return false;
   const st = effectiveState(s);
   return st !== "running" && st !== "error";
 }
@@ -504,11 +510,29 @@ export function Workspace({ workspacePath }: WorkspaceProps) {
     refresh();
   };
 
+  const blockSession = async (s: SessionSummaryDTO, blocked: boolean) => {
+    const res = await fetch(`/api/sessions/${s.id}/blocked`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace: workspacePath, blocked }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.error ?? "failed to update blocked state");
+      return;
+    }
+    refresh();
+  };
+
   const openSessionContextMenu = (e: React.MouseEvent, s: SessionSummaryDTO) => {
     e.preventDefault();
     const isRunning = s.state === "running" || s.state === "awaiting_input";
     const items: MenuItem[] = [
       { label: "Rename", onClick: () => startRenameSession(s) },
+      {
+        label: s.blocked ? "Unblock" : "Mark blocked",
+        onClick: () => blockSession(s, !s.blocked),
+      },
       { label: "Delete", danger: true, onClick: () => deleteSession(s), disabled: isRunning },
     ];
     setMenu({ x: e.clientX, y: e.clientY, items });
@@ -1323,6 +1347,11 @@ function SessionsColumn(props: SessionsColumnProps) {
                             ✓
                           </span>
                         )}
+                        {s.blocked && !s.completed && (
+                          <span className="shrink-0 text-[9.5px] bg-[var(--panel-2)] text-[var(--muted)] font-medium rounded-md px-1.5 py-0.5" title="Blocked — waiting on something external">
+                            ⏸ blocked
+                          </span>
+                        )}
                         <span className="text-[10.5px] text-[var(--muted)] shrink-0">
                           {formatRelative(s.lastActivity)}
                         </span>
@@ -1448,6 +1477,16 @@ function SessionStateIcon({ session }: { session: SessionSummaryDTO }) {
       <span className="text-[var(--ok)] shrink-0 inline-flex" title="Completed">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
           <polyline points="20 6 9 17 4 12" />
+        </svg>
+      </span>
+    );
+  }
+  if (session.blocked) {
+    return (
+      <span className="text-[var(--muted)] shrink-0 inline-flex" title="Blocked — waiting on something external">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <rect x="6" y="5" width="4" height="14" rx="1" />
+          <rect x="14" y="5" width="4" height="14" rx="1" />
         </svg>
       </span>
     );

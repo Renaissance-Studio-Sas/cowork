@@ -362,6 +362,77 @@ export function CompleteToggleButton({
   );
 }
 
+// Composer button — toggles the session's sticky "blocked" flag. A blocked
+// session is parked waiting on something external (another session, a person, a
+// dependency); it drops out of "Active Sessions" into the "Blocked" list.
+// Unlike completion this never navigates away — you stay on the session. State
+// flips immediately via the `blocked_changed` SSE echo.
+export function BlockToggleButton({
+  session,
+  blocked,
+  variant = "full",
+}: {
+  session: SessionSummaryDTO;
+  blocked: boolean;
+  /** "full" = labeled pill; "icon" = square icon button. */
+  variant?: "full" | "icon";
+}) {
+  const [busy, setBusy] = useState(false);
+  const toggle = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(session.id)}/blocked`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workspace: session.workspacePath,
+          blocked: !blocked,
+        }),
+      });
+      // The SSE `blocked_changed` event will flip the local state.
+    } finally {
+      setBusy(false);
+    }
+  };
+  const title = blocked
+    ? "Unblock this session (it returns to the active list)"
+    : "Mark this session blocked (its completion is waiting on something external)";
+
+  if (variant === "icon") {
+    return (
+      <button
+        onClick={toggle}
+        disabled={busy}
+        className={`rounded-lg border w-9 h-9 flex items-center justify-center text-[15px] transition disabled:opacity-50 shrink-0 ${
+          blocked
+            ? "border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn-soft)]"
+            : "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
+        }`}
+        title={title}
+        aria-label={blocked ? "Unblock session" : "Mark session blocked"}
+      >
+        {blocked ? "▶" : "⏸"}
+      </button>
+    );
+  }
+
+  return (
+    <button
+      onClick={toggle}
+      disabled={busy}
+      className={`text-[12px] px-3 py-1.5 rounded-lg border transition disabled:opacity-50 ${
+        blocked
+          ? "border-[var(--warn)] text-[var(--warn)] hover:bg-[var(--warn-soft)]"
+          : "border-[var(--border-strong)] text-[var(--text-soft)] hover:bg-[var(--panel-2)]"
+      }`}
+      title={title}
+    >
+      {blocked ? "▶ Unblock" : "⏸ Mark blocked"}
+    </button>
+  );
+}
+
 // Approve/Dismiss card for an agent's `suggest_session_complete` request.
 // Approve marks the session complete and unblocks the agent's tool call
 // with "approved". Dismiss leaves the flag alone and tells the agent to keep

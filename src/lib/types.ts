@@ -30,6 +30,7 @@ export interface SessionSummaryDTO {
   isLive: boolean;
   unread: boolean; // true if session completed but hasn't been viewed by user
   completed: boolean; // sticky "marked complete" flag (manual or agent-suggested + approved)
+  blocked: boolean; // sticky "marked blocked" flag — completion waits on something external (e.g. another session, a person)
   // True when the agent's turn is parked on a user decision (tool approval,
   // AskUserQuestion, or completion suggestion). state is still "running" in
   // this case but the UI should treat it as "pending" — needs the human.

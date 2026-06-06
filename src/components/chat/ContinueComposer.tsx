@@ -4,7 +4,7 @@
 // source of truth — otherwise editing here would leave Chat's stale draft to
 // re-appear when isLive flips and the live composer takes over.
 
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 import { useRouter } from "@/lib/navigation";
 import { handleComposerEnter, useNewlineModifier } from "@/lib/composer";
 import type { SessionSummaryDTO } from "@/lib/types";
@@ -14,7 +14,6 @@ export function ContinueComposer({
   draft,
   setDraft,
   openArtifactPath,
-  completeButton,
 }: {
   session: SessionSummaryDTO;
   draft: string;
@@ -25,8 +24,6 @@ export function ContinueComposer({
    * about which file the user is looking at.
    */
   openArtifactPath?: string;
-  /** Optional mark-complete/reopen control rendered next to the resume button. */
-  completeButton?: ReactNode;
 }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
@@ -82,11 +79,11 @@ export function ContinueComposer({
 
   return (
     <div className="space-y-2">
-      <div className="text-[11.5px] text-[var(--muted)] px-1">
-        {isError
-          ? "This session encountered an error. You can retry the last request or send a new message to continue."
-          : "This session is paused. Sending a message will resume it with full conversation context."}
-      </div>
+      {isError && (
+        <div className="text-[11.5px] text-[var(--muted)] px-1">
+          This session encountered an error. You can retry the last request or send a new message to continue.
+        </div>
+      )}
       <div className="rounded-2xl border border-[var(--border-strong)] bg-[var(--panel)] flex items-end gap-2 px-3 py-2 focus-within:border-[var(--accent)] transition">
         <textarea
           value={draft}
@@ -117,7 +114,6 @@ export function ContinueComposer({
           title={newlineMod ? "Insert a new line (↵ — release the modifier to send)" : "Resume session — send the message to continue (↵)"}
           aria-label={newlineMod ? "Insert a new line" : "Resume session"}
         >{newlineMod ? "↵" : "↑"}</button>
-        {completeButton}
       </div>
     </div>
   );

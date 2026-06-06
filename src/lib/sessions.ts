@@ -741,6 +741,7 @@ export function listLiveSessions(): SessionSummary[] {
       isLive: true,
       unread,
       completed: !!s.completed,
+      blocked: !!s.blocked,
       hasPendingPrompt,
       runtime: s.runtime,
       model: s.model,
@@ -773,7 +774,7 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
     const sessDir = path.join(SESSIONS_ROOT, id);
     const metaPath = path.join(sessDir, "meta.json");
     const inputPath = path.join(sessDir, "input.jsonl");
-    let meta: { workspace?: string[]; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
+    let meta: { workspace?: string[]; startedAt?: string; name?: string; seenAt?: string; finalState?: SessionState; lastActivity?: string; completedAt?: string; completed?: boolean; blocked?: boolean; hasPendingPrompt?: boolean; runtime?: SessionRuntime; model?: string | null; effort?: EffortLevel | null } = {};
     try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); } catch { continue; /* no meta → not a session */ }
     const workspacePath = Array.isArray(meta.workspace) ? meta.workspace : [];
     // Prefer generated name from meta.json; fall back to first message for legacy sessions.
@@ -806,6 +807,7 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
       isLive: false,
       unread,
       completed: meta.completed === true,
+      blocked: meta.blocked === true,
       hasPendingPrompt: meta.hasPendingPrompt === true,
       runtime: meta.runtime ?? "claude",
       model: meta.model ?? null,
@@ -902,6 +904,7 @@ async function doRestoreSession(
     lastActivity?: string;
     completedAt?: string;
     completed?: boolean;
+    blocked?: boolean;
     runtime?: SessionRuntime;
   } = {};
   try {
@@ -964,6 +967,7 @@ async function doRestoreSession(
     pendingQuestions,
     pendingCompletions,
     completed: meta.completed === true,
+    blocked: meta.blocked === true,
     sdkSessionId: meta.sdkSessionId ?? null,
     permissionMode: (meta.permissionMode as "default" | "acceptEdits" | "bypassPermissions" | "plan") ?? "bypassPermissions",
     model: meta.model ?? null,
@@ -1352,6 +1356,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     pendingQuestions,
     pendingCompletions,
     completed: false,
+    blocked: false,
     sdkSessionId: null,
     permissionMode: p.permissionMode ?? "bypassPermissions",
     model: p.model ?? null,
@@ -1997,6 +2002,13 @@ export async function sendInput(id: string, text: string, openArtifact?: string)
     void updateMeta(s, (meta) => { meta.completed = false; });
     s.events.emit("completed_changed", { completed: false });
   }
+  // A new message means the blocker (if any) is resolved — drop the blocked
+  // flag so the session returns to the active list.
+  if (s.blocked) {
+    s.blocked = false;
+    void updateMeta(s, (meta) => { meta.blocked = false; });
+    s.events.emit("blocked_changed", { blocked: false });
+  }
   setState(s, "running");
   return true;
 }
@@ -2083,6 +2095,11 @@ export async function sendInputWithFiles(
     s.completed = false;
     void updateMeta(s, (meta) => { meta.completed = false; });
     s.events.emit("completed_changed", { completed: false });
+  }
+  if (s.blocked) {
+    s.blocked = false;
+    void updateMeta(s, (meta) => { meta.blocked = false; });
+    s.events.emit("blocked_changed", { blocked: false });
   }
   setState(s, "running");
   return true;
@@ -2309,6 +2326,11 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
       void updateMeta(s, (meta) => { meta.completed = false; });
       s.events.emit("completed_changed", { completed: false });
     }
+    if (s.blocked) {
+      s.blocked = false;
+      void updateMeta(s, (meta) => { meta.blocked = false; });
+      s.events.emit("blocked_changed", { blocked: false });
+    }
     // Clear the interrupt latch — a fresh turn is starting, so the new
     // pumpEvents loop should track "running" normally again. Drop any
     // leftover streamingText from a prior aborted turn (no final assistant
@@ -2503,6 +2525,47 @@ export async function markSessionCompleted(
     const meta = JSON.parse(raw);
     meta.completed = value;
     if (value) meta.seenAt = now.toISOString();
+    const tmpPath = metaPath + ".tmp";
+    await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
+    await fs.rename(tmpPath, metaPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Mark a session as blocked (or un-block it). "Blocked" means the session's
+// completion is waiting on something external — another session, a person, a
+// dependency. Sticky across reloads via meta.json and orthogonal to the
+// runtime state and the `completed` flag. Blocked sessions are pulled out of
+// the "Active Sessions" list into a separate "Blocked" list, and sending a new
+// message auto-unblocks (see sendInput / sendInputWithFiles / resumeSession).
+export async function markSessionBlocked(
+  workspacePath: string[],
+  sessionId: string,
+  value: boolean,
+): Promise<boolean> {
+  // Live session: route through updateMeta so this serializes with the
+  // setState / persistSdkSessionId writers (concurrent writes corrupt meta.json).
+  const liveSession = registry.get(sessionId);
+  if (liveSession) {
+    liveSession.blocked = value;
+    await updateMeta(liveSession, (meta) => {
+      meta.blocked = value;
+    });
+    liveSession.events.emit("blocked_changed", { blocked: value });
+    return true;
+  }
+
+  // Dead session (not in registry): no other writer can race, direct write is fine.
+  const ws = await getWorkspace(workspacePath);
+  if (!ws) return false;
+
+  const metaPath = path.join(sessionDir(sessionId), "meta.json");
+  try {
+    const raw = await fs.readFile(metaPath, "utf8");
+    const meta = JSON.parse(raw);
+    meta.blocked = value;
     const tmpPath = metaPath + ".tmp";
     await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
     await fs.rename(tmpPath, metaPath);

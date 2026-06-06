@@ -6,6 +6,7 @@ import {
   restoreSession,
   relayRemoteRunner,
   markSessionCompleted,
+  markSessionBlocked,
   resolveCompletionSuggestion,
   deleteSession,
   forceStop,
@@ -179,6 +180,7 @@ sessions.get("/:id/stream", async (c) => {
         sendEvent("completion_request", { requestId, reason: pending.reason ?? null });
       }
       sendEvent("completed_changed", { completed: !!s.completed });
+      sendEvent("blocked_changed", { blocked: !!s.blocked });
       // Replay the last known subscription rate-limit snapshot so the usage
       // indicator renders immediately on load, before the next turn refreshes it.
       if (s.rateLimit) sendEvent("rate_limit", s.rateLimit);
@@ -195,6 +197,7 @@ sessions.get("/:id/stream", async (c) => {
       const onCompletionRequest = (data: unknown) => sendEvent("completion_request", data);
       const onCompletionResolved = (data: unknown) => sendEvent("completion_resolved", data);
       const onCompletedChanged = (data: unknown) => sendEvent("completed_changed", data);
+      const onBlockedChanged = (data: unknown) => sendEvent("blocked_changed", data);
       s.events.on("event", onEvent);
       s.events.on("todos", onTodos);
       s.events.on("rate_limit", onRateLimit);
@@ -207,6 +210,7 @@ sessions.get("/:id/stream", async (c) => {
       s.events.on("completion_request", onCompletionRequest);
       s.events.on("completion_resolved", onCompletionResolved);
       s.events.on("completed_changed", onCompletedChanged);
+      s.events.on("blocked_changed", onBlockedChanged);
 
       const heartbeat = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
@@ -226,6 +230,7 @@ sessions.get("/:id/stream", async (c) => {
         s.events.off("completion_request", onCompletionRequest);
         s.events.off("completion_resolved", onCompletionResolved);
         s.events.off("completed_changed", onCompletedChanged);
+        s.events.off("blocked_changed", onBlockedChanged);
         try { controller.close(); } catch { /* already closed */ }
       };
 
@@ -319,6 +324,33 @@ sessions.post("/:id/complete", async (c) => {
   }
 
   const ok = await markSessionCompleted(workspacePath, id, body.completed);
+  if (!ok) {
+    return c.json({ error: "session not found" }, 404);
+  }
+  return c.json({ ok: true });
+});
+
+// POST /api/sessions/:id/blocked
+// Body: { workspace: string[] | "slug/chain", blocked: boolean }
+// Mark/unmark a session as blocked — its completion is waiting on something
+// external. Blocked sessions move out of "Active Sessions" into the separate
+// "Blocked" list in the sidebar.
+sessions.post("/:id/blocked", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.raw.json() as {
+    workspace?: string | string[];
+    blocked?: boolean;
+  };
+
+  if (typeof body.blocked !== "boolean") {
+    return c.json({ error: "`blocked` (boolean) is required" }, 400);
+  }
+  const workspacePath = workspacePathFromBody(body);
+  if (!workspacePath) {
+    return c.json({ error: "workspace is required" }, 400);
+  }
+
+  const ok = await markSessionBlocked(workspacePath, id, body.blocked);
   if (!ok) {
     return c.json({ error: "session not found" }, 404);
   }
