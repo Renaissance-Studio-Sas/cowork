@@ -1063,9 +1063,20 @@ async function findRunningSessions(): Promise<Array<{ workspacePath: string[]; i
   }
   for (const d of dirents) {
     if (!d.isDirectory()) continue;
-    // Skip sessions already in the registry — they're still live (preserved
-    // via globalThis during HMR) and don't need resume.
-    if (registry.has(d.name)) continue;
+    // Skip sessions that are GENUINELY live in the registry (HMR preserves
+    // them via globalThis with an active query) — they don't need resume.
+    //
+    // But a registry entry is NOT proof of liveness on a cold boot: when the
+    // browser's SSE stream reconnects right as the server comes up, it
+    // on-demand restores the session it's viewing as a NON-live placeholder
+    // (closed streams, placeholder query, state="stopped"). If that beats this
+    // deferred boot pass, a bare `registry.has()` skip would strand the very
+    // session the user is looking at — it never auto-resumes. So only skip
+    // live-writable states; "stopped"/"error" placeholders still need a real
+    // resume (resumeSession is coalesced, so a concurrent on-demand resume
+    // can't double-spawn the SDK).
+    const live = registry.get(d.name);
+    if (live && live.state !== "stopped" && live.state !== "error") continue;
     const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
     try {
       const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
