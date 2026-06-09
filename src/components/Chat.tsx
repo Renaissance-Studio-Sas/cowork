@@ -1161,46 +1161,45 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
           {(session.model || session.runtime || rateLimit || !isRenaming) && (
             <div className="mt-2 px-1 flex items-center gap-2">
               <div
-                className="flex-1 min-w-0 flex items-center gap-2 flex-wrap text-[11px] leading-none select-none"
+                className="flex-1 min-w-0 flex flex-col gap-1 text-[11px] leading-none select-none"
                 style={{ color: "var(--text-soft)" }}
               >
-                {(session.model || session.runtime) && (
-                  <span className="inline-flex items-center gap-1 shrink-0">
-                    <ModelPicker
-                      session={session}
-                      disabled={state === "running"}
-                      onChanged={onChange}
-                    />
-                    {session.runtime === "cloud" && (
-                      <span
-                        className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
-                        title="Running on Cloudflare Containers (via /api/agent)"
-                      >
-                        cloud
-                      </span>
-                    )}
-                    <EffortPicker
-                      session={session}
-                      disabled={state === "running"}
-                      onChanged={onChange}
-                    />
-                  </span>
-                )}
-                {(session.model || session.runtime) && rateLimit && (
-                  <span className="opacity-40">·</span>
-                )}
-                <UsageIndicator info={rateLimit} />
-                {fallbackActive && (
-                  <>
-                    {rateLimit && <span className="opacity-40">·</span>}
-                    <span
-                      className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border shrink-0"
-                      style={{ borderColor: "var(--warn, #d97706)", color: "var(--warn, #d97706)" }}
-                      title="Claude subscription usage limit reached — running on the Anthropic API key (metered). Switches back automatically when the limit resets."
-                    >
-                      API fallback
+                <div className="flex items-center gap-2 flex-wrap">
+                  {(session.model || session.runtime) && (
+                    <span className="inline-flex items-center gap-1 shrink-0">
+                      <ModelPicker
+                        session={session}
+                        disabled={state === "running"}
+                        onChanged={onChange}
+                      />
+                      {session.runtime === "cloud" && (
+                        <span
+                          className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
+                          title="Running on Cloudflare Containers (via /api/agent)"
+                        >
+                          cloud
+                        </span>
+                      )}
+                      <EffortPicker
+                        session={session}
+                        disabled={state === "running"}
+                        onChanged={onChange}
+                      />
                     </span>
-                  </>
+                  )}
+                  {(session.model || session.runtime) && rateLimit && (
+                    <span className="opacity-40">·</span>
+                  )}
+                  <UsageIndicator info={rateLimit} />
+                </div>
+                {fallbackActive && (
+                  <span
+                    className="self-start px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border"
+                    style={{ borderColor: "var(--warn, #d97706)", color: "var(--warn, #d97706)" }}
+                    title="Claude subscription usage limit reached — running on the Anthropic API key (metered). Switches back automatically when the limit resets."
+                  >
+                    API fallback
+                  </span>
                 )}
               </div>
               {!isRenaming && (
