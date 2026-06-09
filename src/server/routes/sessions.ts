@@ -14,6 +14,9 @@ import {
   sendInput,
   sendInputWithFiles,
   interrupt,
+  setSessionModel,
+  listSessionModels,
+  setSessionEffort,
   resolvePermission,
   resolveQuestion,
   renameSession,
@@ -21,6 +24,7 @@ import {
   markSessionSeen,
   type FileAttachmentInfo,
 } from "@/lib/sessions";
+import type { EffortLevel } from "@/lib/types";
 import { extractTodosFromMessages } from "@/lib/todos";
 import { isVisibleSDKMessage } from "@/components/chat/utils";
 import { decodeWorkspacePath } from "@/lib/routes";
@@ -417,6 +421,57 @@ sessions.post("/:id/interrupt", async (c) => {
   const ok = await interrupt(id);
   if (!ok) return c.json({ error: "session not found" }, 404);
   return c.json({ ok: true });
+});
+
+// List the models this session can switch to (the runtime's live model list).
+// Empty array when the runtime pins its own model or the agent process isn't
+// alive to answer — the UI then just shows the current model, non-editable.
+sessions.get("/:id/models", async (c) => {
+  const id = c.req.param("id");
+  const models = await listSessionModels(id);
+  return c.json({ models });
+});
+
+// Switch the model used for subsequent turns. Body: { model: string | null }
+// (null clears the pin → runtime default). Only allowed when the session isn't
+// actively generating — switching mid-turn would race the in-flight response.
+sessions.post("/:id/model", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.raw.json().catch(() => ({})) as { model?: string | null };
+  if (!("model" in body) || (typeof body.model !== "string" && body.model !== null)) {
+    return c.json({ error: "body must include `model` (string or null)" }, 400);
+  }
+  const ok = await setSessionModel(id, body.model);
+  if (!ok) {
+    return c.json(
+      { error: "session not found, or it is currently running (stop it first to change the model)" },
+      409,
+    );
+  }
+  return c.json({ ok: true, model: body.model });
+});
+
+// Switch the thinking/reasoning effort for subsequent turns. Body:
+// { effort: "low"|"medium"|"high"|"xhigh"|"max"|null } (null → runtime default).
+// Only allowed when the session isn't actively generating.
+sessions.post("/:id/effort", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.raw.json().catch(() => ({})) as { effort?: string | null };
+  const VALID = ["low", "medium", "high", "xhigh", "max"];
+  if (!("effort" in body) || (body.effort !== null && !VALID.includes(body.effort as string))) {
+    return c.json(
+      { error: "body must include `effort` (one of low|medium|high|xhigh|max, or null)" },
+      400,
+    );
+  }
+  const ok = await setSessionEffort(id, body.effort as EffortLevel | null);
+  if (!ok) {
+    return c.json(
+      { error: "session not found, or it is currently running (stop it first to change the effort)" },
+      409,
+    );
+  }
+  return c.json({ ok: true, effort: body.effort });
 });
 
 // Resolve a tool-use approval the agent's `canUseTool` callback is awaiting.

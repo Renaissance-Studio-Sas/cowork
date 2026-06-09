@@ -98,6 +98,13 @@ export function MessageStream({
       // synthetic user message containing the full summary. Collapse it into a
       // small "Session compacted" pill so the chat isn't dominated by it.
       const isCompactionSummary = text.startsWith("This session is being continued from a previous conversation that ran out of context.");
+      // The SDK acknowledges a mid-session model/effort switch by injecting a
+      // `<local-command-stdout>Set model to <id></local-command-stdout>` user
+      // message (the same plumbing the CLI's /model command uses). Surface it
+      // as a small note rather than a raw user bubble showing the tag.
+      const settingSwitchMatch = text.match(/^<local-command-stdout>\s*Set (model|effort) to (.+?)\s*<\/local-command-stdout>$/);
+      // Any other local-command echo is CLI plumbing the user never typed — hide it.
+      const isLocalCommandEcho = /^<local-command-(?:stdout|stderr)>[\s\S]*<\/local-command-(?:stdout|stderr)>$/.test(text);
       if (isResumePrompt) {
         flush();
         items.push({ kind: "system-info", key: `sr-${i}`, text: "Session resumed after server restart." });
@@ -107,6 +114,12 @@ export function MessageStream({
       } else if (isCompactionSummary) {
         flush();
         items.push({ kind: "system-compaction", key: `cp-${i}`, summary: text });
+      } else if (settingSwitchMatch) {
+        flush();
+        const label = settingSwitchMatch[1] === "effort" ? "Effort" : "Model";
+        items.push({ kind: "system-info", key: `set-${i}`, text: `${label} switched to ${settingSwitchMatch[2]}.` });
+      } else if (isLocalCommandEcho) {
+        // Hidden — CLI plumbing, nothing to render.
       } else if (text) {
         flush();
         items.push({ kind: "user", key: `u-${i}`, text });

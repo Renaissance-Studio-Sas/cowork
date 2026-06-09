@@ -41,6 +41,8 @@ import type {
   AgentMcpServer,
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
+  AgentModelInfo,
+  AgentEffortLevel,
 } from "../agent-runtime";
 import type { WorkbenchTool, ToolCallResult } from "../workbench-tools/types";
 
@@ -473,6 +475,12 @@ class RemoteAgentQuery implements AgentQuery {
   async mcpServerStatus(): Promise<AgentMcpServerStatus[]> {
     return [];
   }
+
+  // The remote runner pins the model at provision time; no mid-session switch.
+  // The session layer still persists the choice for the next turn.
+  async setModel(_model?: string): Promise<void> {}
+  async supportedModels(): Promise<AgentModelInfo[]> { return []; }
+  async setEffort(_effort: AgentEffortLevel | null): Promise<void> {}
 }
 
 export const remoteRuntime: AgentRuntime = {

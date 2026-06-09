@@ -20,6 +20,8 @@ import type {
   PermissionResult,
   McpServerConfig,
   McpSetServersResult,
+  ModelInfo,
+  EffortLevel,
 } from "@anthropic-ai/claude-agent-sdk";
 
 // What the runtime emits during a turn. Today this is exactly Claude's
@@ -58,6 +60,14 @@ export interface AgentMcpServerStatus {
 }
 
 export type AgentSetMcpServersResult = McpSetServersResult;
+
+// One selectable model, as reported by the runtime. Mirrors the Claude SDK's
+// ModelInfo (id `value`, human label `displayName`, plus capability flags).
+// Non-Claude runtimes return an empty list — they pin their own model.
+export type AgentModelInfo = ModelInfo;
+
+// Thinking/reasoning effort level. Mirrors the Claude SDK's EffortLevel.
+export type AgentEffortLevel = EffortLevel;
 
 // Options passed to AgentRuntime.query(). Mirrors Claude SDK's query options
 // but exposed under our own type so other runtimes don't have to depend on
@@ -109,6 +119,21 @@ export interface AgentQuery extends AsyncIterable<AgentEvent> {
   close(): void;
   setMcpServers(servers: Record<string, AgentMcpServer>): Promise<AgentSetMcpServersResult>;
   mcpServerStatus(): Promise<AgentMcpServerStatus[]>;
+  // Switch the model used for subsequent turns. Only meaningful while the
+  // underlying agent process is alive and waiting for input (between turns);
+  // mid-turn callers should gate on session state. Pass undefined to fall back
+  // to the runtime default. Runtimes that pin their own model no-op.
+  setModel(model?: string): Promise<void>;
+  // The models this runtime can switch to right now. Empty when the runtime
+  // doesn't expose a choice (Gemini/remote/cloud) or the agent process is no
+  // longer alive to answer.
+  supportedModels(): Promise<AgentModelInfo[]>;
+  // Change the thinking/reasoning effort for subsequent turns. Same liveness
+  // caveat as setModel — only lands while the agent process is alive between
+  // turns; the session layer also persists it for the next resume. Pass null
+  // to clear the pin and fall back to the runtime default. Runtimes without an
+  // effort knob no-op.
+  setEffort(effort: AgentEffortLevel | null): Promise<void>;
 }
 
 // A runtime backend (Claude, Gemini, Codex). Stateless — query() spawns a

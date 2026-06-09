@@ -20,6 +20,8 @@ import {
 } from "./chat/cards";
 import { ContinueComposer } from "./chat/ContinueComposer";
 import { UsageIndicator } from "./chat/UsageIndicator";
+import { ModelPicker } from "./chat/ModelPicker";
+import { EffortPicker } from "./chat/EffortPicker";
 import type { SDKMessageLite, PendingQuestionItem, RateLimitInfoLite } from "./chat/types";
 
 interface UploadedFile {
@@ -1149,11 +1151,12 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                 style={{ color: "var(--text-soft)" }}
               >
                 {(session.model || session.runtime) && (
-                  <span
-                    className="inline-flex items-center gap-1 shrink-0"
-                    title={session.model ? `Model: ${session.model}` : `Runtime: ${session.runtime}`}
-                  >
-                    <span className="font-mono">{session.model ?? session.runtime}</span>
+                  <span className="inline-flex items-center gap-1 shrink-0">
+                    <ModelPicker
+                      session={session}
+                      disabled={state === "running"}
+                      onChanged={onChange}
+                    />
                     {session.runtime === "cloud" && (
                       <span
                         className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border border-current opacity-70"
@@ -1162,12 +1165,11 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                         cloud
                       </span>
                     )}
-                    <span
-                      className="font-mono opacity-70"
-                      title={session.effort ? `Thinking effort: ${session.effort}` : "Thinking effort: high (SDK default)"}
-                    >
-                      ({session.effort ?? "high"})
-                    </span>
+                    <EffortPicker
+                      session={session}
+                      disabled={state === "running"}
+                      onChanged={onChange}
+                    />
                   </span>
                 )}
                 {(session.model || session.runtime) && rateLimit && (

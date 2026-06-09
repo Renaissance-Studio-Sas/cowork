@@ -61,7 +61,18 @@ export function isVisibleSDKMessage(event: unknown): boolean {
   if (e.type === "user") {
     // Tool_result echoes have no visible text → MessageStream renders nothing.
     const content = typeof e.message === "object" ? e.message?.content : undefined;
-    return extractText(content).trim().length > 0;
+    const text = extractText(content).trim();
+    if (!text) return false;
+    // Local-command echoes (CLI plumbing) don't render as user bubbles. The
+    // mid-session model/effort-switch acks are the exception — MessageStream
+    // turns them into a small "… switched to …" note, so they stay visible.
+    if (
+      /^<local-command-(?:stdout|stderr)>[\s\S]*<\/local-command-(?:stdout|stderr)>$/.test(text)
+      && !/^<local-command-stdout>\s*Set (?:model|effort) to /.test(text)
+    ) {
+      return false;
+    }
+    return true;
   }
   if (e.type === "assistant") {
     const msg = typeof e.message === "object" ? e.message : undefined;

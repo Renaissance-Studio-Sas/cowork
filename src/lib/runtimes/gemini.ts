@@ -41,6 +41,8 @@ import type {
   AgentMcpServer,
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
+  AgentModelInfo,
+  AgentEffortLevel,
   AgentCanUseTool,
   AgentPermissionResult,
 } from "../agent-runtime";
@@ -650,6 +652,11 @@ class GeminiAgentQuery implements AgentQuery {
 
     return statuses;
   }
+
+  // Gemini pins its own model (chosen at query() time); no mid-session switch.
+  async setModel(): Promise<void> {}
+  async supportedModels(): Promise<AgentModelInfo[]> { return []; }
+  async setEffort(_effort: AgentEffortLevel | null): Promise<void> {}
 }
 
 export const geminiRuntime: AgentRuntime = {

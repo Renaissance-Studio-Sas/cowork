@@ -46,6 +46,8 @@ import type {
   AgentMcpServer,
   AgentSetMcpServersResult,
   AgentMcpServerStatus,
+  AgentModelInfo,
+  AgentEffortLevel,
 } from "../agent-runtime";
 import type { WorkbenchTool, ToolCallResult } from "../workbench-tools/types";
 
@@ -716,6 +718,21 @@ class CloudAgentQuery implements AgentQuery {
 
   async mcpServerStatus(): Promise<AgentMcpServerStatus[]> {
     return [];
+  }
+
+  async setModel(_model?: string): Promise<void> {
+    // The cloud runner pins the model server-side; switching mid-session is
+    // not exposed here. The session layer still persists the choice for the
+    // next turn.
+  }
+
+  async supportedModels(): Promise<AgentModelInfo[]> {
+    return [];
+  }
+
+  async setEffort(_effort: AgentEffortLevel | null): Promise<void> {
+    // The cloud runner pins effort server-side; the session layer still
+    // persists the choice for the next turn.
   }
 }
 

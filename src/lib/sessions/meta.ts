@@ -70,6 +70,52 @@ export async function updateMeta(
   }
 }
 
+// Read-modify-write meta.json for a session that may NOT be live in the
+// registry (e.g. an idle session restored from disk, before any resume). Same
+// per-session serialization + atomic .tmp/rename as updateMeta, but keyed only
+// by id — no RuntimeSession or workspace lookup needed. Returns true on a
+// successful write. Used by setSessionModel so a model change to an idle
+// session persists and is picked up by the next resume.
+export async function updateMetaById(
+  sessionId: string,
+  mutate: (meta: Record<string, unknown>) => void,
+): Promise<boolean> {
+  const prev = metaWriteQueue.get(sessionId) ?? Promise.resolve();
+  let ok = false;
+  const next = prev.then(async () => {
+    try {
+      const metaPath = path.join(sessionDir(sessionId), "meta.json");
+      const tmpPath = metaPath + ".tmp";
+      const meta = JSON.parse(await fs.readFile(metaPath, "utf8")) as Record<string, unknown>;
+      mutate(meta);
+      await fs.writeFile(tmpPath, JSON.stringify(meta, null, 2));
+      await fs.rename(tmpPath, metaPath);
+      ok = true;
+    } catch {
+      /* best effort — meta drift is reconciled on boot */
+    }
+  });
+  metaWriteQueue.set(sessionId, next);
+  try {
+    await next;
+  } finally {
+    if (metaWriteQueue.get(sessionId) === next) metaWriteQueue.delete(sessionId);
+  }
+  return ok;
+}
+
+// Lightweight read of a session's meta.json by id alone (flat storage — no
+// workspace needed). Returns null when the session has no meta on disk.
+export async function readMetaById(
+  sessionId: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    return JSON.parse(await fs.readFile(path.join(sessionDir(sessionId), "meta.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 // Persist the SDK session ID to meta.json so the session can be resumed
 // after server restart.
 export async function persistSdkSessionId(s: RuntimeSession): Promise<void> {

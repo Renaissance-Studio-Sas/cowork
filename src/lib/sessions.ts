@@ -22,6 +22,7 @@ import type {
   AgentPermissionResult as PermissionResult,
   AgentQuery,
   AgentQueryOptions,
+  AgentModelInfo,
 } from "./agent-runtime";
 import { getRuntime } from "./runtimes";
 
@@ -43,6 +44,8 @@ import {
   persistPendingPromptFlag,
   persistOwnerPid,
   readMetaRaw,
+  readMetaById,
+  updateMetaById,
 } from "./sessions/meta";
 import {
   buildWorkspacePlanningTools,
@@ -2381,6 +2384,102 @@ export async function interrupt(id: string): Promise<boolean> {
     // SDK interrupt failed — fall back to force-stop
     return forceStop(id);
   }
+}
+
+// The models a session can switch to right now, as reported by its runtime
+// (Claude returns the CLI's live model list; other runtimes return []). Returns
+// [] when the session isn't in memory or its agent process is no longer alive
+// to answer the control request.
+// Latest Claude models, used when no live agent process can answer
+// supportedModels() — i.e. an idle session restored from disk, whose SDK
+// subprocess isn't running until the next turn. The aliases always resolve to
+// the newest model of each family, so this list stays current without pinning
+// dated IDs.
+const FALLBACK_CLAUDE_MODELS: AgentModelInfo[] = [
+  { value: "opus", displayName: "Claude Opus (latest)", description: "Most capable — best for complex, multi-step work." },
+  { value: "sonnet", displayName: "Claude Sonnet (latest)", description: "Faster and cheaper; strong general coding." },
+  { value: "haiku", displayName: "Claude Haiku (latest)", description: "Fastest and most economical for simple tasks." },
+];
+
+export async function listSessionModels(id: string): Promise<AgentModelInfo[]> {
+  const s = registry.get(id);
+  if (s) {
+    // Prefer the runtime's live list (accurate IDs + capability flags).
+    try {
+      const live = await s.q.supportedModels();
+      if (live.length > 0) return live;
+    } catch {
+      /* dead/idle SDK — fall through to the static fallback below */
+    }
+    return s.runtime === "claude" ? FALLBACK_CLAUDE_MODELS : [];
+  }
+  // Not live in memory (restored-from-disk / idle): read the runtime from meta
+  // to decide whether a switchable list applies, then serve the static fallback.
+  const meta = await readMetaById(id);
+  if (!meta) return [];
+  const runtime = (meta.runtime as string | undefined) ?? "claude";
+  return runtime === "claude" ? FALLBACK_CLAUDE_MODELS : [];
+}
+
+// Switch the model for subsequent turns. Persists the choice to meta.json so it
+// survives restarts and is picked up by resumeSession's options, AND — when the
+// agent process is alive and idle — applies it live via the runtime's setModel
+// control request so the very next turn uses it without a resume.
+//
+// Gated by the caller to the not-running states: changing the model mid-turn
+// would race the in-flight response, so the route only allows it when the
+// session isn't actively generating. Pass null to clear the pin and fall back
+// to the runtime default.
+export async function setSessionModel(id: string, model: string | null): Promise<boolean> {
+  const s = registry.get(id);
+  if (s) {
+    // Don't switch out from under an in-flight turn.
+    if (s.state === "running") return false;
+
+    s.model = model;
+    await updateMeta(s, (meta) => { meta.model = model; });
+
+    // Apply to the live agent process when one is alive (idle, between turns).
+    // If the SDK is dead (restored placeholder query), this throws harmlessly —
+    // the persisted meta.model above ensures the next resume picks it up.
+    try {
+      await s.q.setModel(model ?? undefined);
+    } catch {
+      /* no live process / control request unsupported — meta persist is enough */
+    }
+    return true;
+  }
+
+  // Not live in memory (idle session restored from disk): persist the choice to
+  // meta.json by id so the next resume's options pick it up. Returns false if
+  // the session has no meta on disk (unknown id).
+  return updateMetaById(id, (meta) => { meta.model = model; });
+}
+
+// Switch the thinking/reasoning effort for subsequent turns. Mirrors
+// setSessionModel: persists to meta.json (so it survives restart and is picked
+// up by resumeSession's options) and — when the agent process is alive and
+// idle — applies it live via the runtime's setEffort control request so the
+// next turn uses it without a resume. Pass null to clear the pin → runtime
+// default ('high'). Refused while the session is actively generating.
+export async function setSessionEffort(id: string, effort: EffortLevel | null): Promise<boolean> {
+  const s = registry.get(id);
+  if (s) {
+    if (s.state === "running") return false;
+
+    s.effort = effort;
+    await updateMeta(s, (meta) => { meta.effort = effort; });
+
+    try {
+      await s.q.setEffort(effort);
+    } catch {
+      /* no live process / unsupported — meta persist is enough */
+    }
+    return true;
+  }
+
+  // Not live in memory: persist by id for the next resume.
+  return updateMetaById(id, (meta) => { meta.effort = effort; });
 }
 
 // Force-stop a session that's stuck. Unlike interrupt(), this doesn't try to
