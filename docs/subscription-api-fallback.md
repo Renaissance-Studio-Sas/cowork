@@ -1,12 +1,15 @@
 # Subscription → API auto-fallback
 
-Status: **implemented + live-tested** (cloud runtime only). cloud-agent deployed
-2026-06-09 (worker version 9a238480); fallback verified end-to-end against the
-deployed worker via the `simulateQuota` test hook (switch→API, API answered,
-switch-back→subscription). cowork is NOT yet configured with a key in prod — set
-`ANTHROPIC_FALLBACK_API_KEY` to arm it.
-Scope: `cloud` runtime (cloud-agent worker + container runner). The `remote`
-(Docker controller) and `gemini` runtimes are untouched.
+Status: **implemented + live-tested** on both the cloud and local runtimes.
+cloud-agent deployed 2026-06-09 (worker version 9a238480); cloud path verified
+end-to-end against the deployed worker via the `simulateQuota` hook (switch→API,
+API answered, switch-back→subscription). Local `claude` runtime verified via the
+in-process `COWORK_SIMULATE_QUOTA` hook (switch→API, conversation resumed, API
+answered). NOT armed until `ANTHROPIC_FALLBACK_API_KEY` is set on the cowork
+server (and the dev server restarted — env is read at process start).
+Scope: the `cloud` runtime (cloud-agent worker + container runner) AND the local
+`claude` runtime (`src/lib/runtimes/claude.ts`, used by the dev server). The
+`remote` (Docker controller) and `gemini` runtimes are untouched.
 
 ## The problem
 
@@ -29,9 +32,15 @@ var. The catch is that the env is read when the CLI subprocess spawns, so a
 switch only takes effect on a **fresh `query()`** — we restart the SDK query
 (resuming the conversation by id) so the new subprocess picks up the change.
 
-All the switching logic lives in the **runner** (`cloud-agent/image/src/server.mjs`),
-which owns the SDK query lifecycle. cowork only passes the key/cap down and
-renders the status notes; the cloud-agent worker + DO are pure plumbing.
+For the **cloud** runtime the switching logic lives in the **runner**
+(`cloud-agent/image/src/server.mjs`), which owns the SDK query lifecycle; cowork
+passes the key/cap down and renders the status notes. For the **local `claude`**
+runtime the same logic is mirrored in-process in `FallbackClaudeQuery`
+(`src/lib/runtimes/claude.ts`): it wraps the SDK query, detects quota, and
+rebuilds the query with the API key in the SDK's per-query `env` (so the dev
+server's global `process.env` is never mutated — concurrent sessions don't
+interfere) plus `resume` + replay of the failed turn. Both paths emit the same
+`provider_switched` event the chat renders.
 
 ## Behavior
 
@@ -89,11 +98,16 @@ re-launched into a fresh container keeps the fallback configured.
 
 ## Testing
 
-A `simulateQuota` flag on POST /sessions (test hook, like `dryRun`) makes the
-runner synthesize a usage-limit hit on the first turn — exercises the switch
-without a real limit. `/tmp/fallback_test.mjs` drives the deployed gateway with
-it (create session → stream SSE → assert switch→API→switch-back). Disabled
-unless a fallback key is also present, so it's inert in normal use.
+Both runtimes have a synthetic max-out hook so the switch can be exercised
+without a real limit, gated on a fallback key being present (inert otherwise):
+
+- **cloud**: `simulateQuota: true` on POST /sessions (like `dryRun`). Driver:
+  `fallback_test.mjs` — create session → stream SSE → assert
+  switch→API→switch-back.
+- **local**: `COWORK_SIMULATE_QUOTA=1` env on the cowork process. Driver:
+  `local_fallback_test.mts` (run with `tsx`) — instantiates the runtime, forces
+  a hit on the first result, asserts switch→API and that the resumed API turn
+  answers.
 
 ## Open items
 
