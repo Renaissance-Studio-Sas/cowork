@@ -155,6 +155,20 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
   // the small usage indicator below the composer. null until the SDK reports.
   const [rateLimit, setRateLimit] = useState<RateLimitInfoLite | null>(null);
 
+  // Whether the agent is currently failed over to the Anthropic API key because
+  // the Claude subscription hit its usage limit. Derived from the latest
+  // `provider_switched` event in the stream (provider "api" = on the fallback
+  // key, "subscription" = back on the Max plan). Drives the "API fallback" badge
+  // shown next to the usage indicator so it's clear the agent is still working,
+  // just on metered API billing.
+  const fallbackActive = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i] as { type?: string; subtype?: string; provider?: string };
+      if (m.type === "system" && m.subtype === "provider_switched") return m.provider === "api";
+    }
+    return false;
+  }, [messages]);
+
   // Lazy loading state
   const [historyMeta, setHistoryMeta] = useState<{ total: number; hasMore: boolean; offset: number } | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -1176,6 +1190,18 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
                   <span className="opacity-40">·</span>
                 )}
                 <UsageIndicator info={rateLimit} />
+                {fallbackActive && (
+                  <>
+                    {rateLimit && <span className="opacity-40">·</span>}
+                    <span
+                      className="px-1 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide border shrink-0"
+                      style={{ borderColor: "var(--warn, #d97706)", color: "var(--warn, #d97706)" }}
+                      title="Claude subscription usage limit reached — running on the Anthropic API key (metered). Switches back automatically when the limit resets."
+                    >
+                      API fallback
+                    </span>
+                  </>
+                )}
               </div>
               {!isRenaming && (
                 <div className="shrink-0 flex items-center gap-2">
