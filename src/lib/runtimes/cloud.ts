@@ -104,6 +104,24 @@ function authHeader(): string {
   return `__gateway_session=${getCredentials().cookie}`;
 }
 
+// Optional Anthropic API key to fail over to when the user's Claude
+// subscription is maxed out. When set, it's forwarded to the cloud-agent runner
+// at session create; the runner holds it and only activates it on a usage-limit
+// hit, switching back to the subscription once its window resets. Unset = the
+// agent runs purely on the subscription (the previous behavior).
+function fallbackApiKey(): string | null {
+  const k = process.env.ANTHROPIC_FALLBACK_API_KEY?.trim();
+  return k ? k : null;
+}
+
+// Optional USD spend cap for the fallback API key (e.g. "5" = stop billing the
+// key once a session has spent ~$5 on it). Unset/invalid = unlimited. Only
+// meaningful when ANTHROPIC_FALLBACK_API_KEY is also set.
+function fallbackMaxUsd(): number | null {
+  const v = Number(process.env.ANTHROPIC_FALLBACK_MAX_USD);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
 // Per-user cowork cloud-drive (Cowork shared workspace mounted at /home/cowork
 // inside the cloud-agent container). The name is derived from the caller email
 // so each user gets a stable, private workspace: marco@rowads.studio →
@@ -532,6 +550,8 @@ class CloudAgentQuery implements AgentQuery {
           message: firstMessage,
           workbenchTools: wb?.specs ?? [],
           ...(workspaceId ? { workspaceId } : {}),
+          ...(fallbackApiKey() ? { fallbackApiKey: fallbackApiKey() } : {}),
+          ...(fallbackApiKey() && fallbackMaxUsd() ? { fallbackMaxUsd: fallbackMaxUsd() } : {}),
         }),
       });
       if (!r.ok) {

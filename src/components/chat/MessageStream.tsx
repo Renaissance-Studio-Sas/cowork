@@ -227,6 +227,11 @@ export function MessageStream({
           key: `ap-${i}`,
           text: "Claude is not logged in — preparing sign-in…",
         });
+      } else if (sysMsg.subtype === "provider_switched" && sysMsg.message) {
+        // The runner failed over between the Claude subscription and the
+        // Anthropic API key (subscription maxed out, or its window reset).
+        flush();
+        items.push({ kind: "system-info", key: `ps-${i}`, text: sysMsg.message });
       }
     }
   });
