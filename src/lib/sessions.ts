@@ -1137,7 +1137,14 @@ export async function autoResumeRunningSessions(): Promise<{ resumed: number; fa
 
 async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
   const candidates = await findRunningSessions();
-  if (candidates.length === 0) return { resumed: 0, failed: 0 };
+  if (candidates.length === 0) {
+    // No resumable candidates, but there may still be orphaned sessions stuck
+    // at finalState="running" on disk (parked on a pending user decision, a
+    // remote container, or a missing transcript). Reconcile them so they don't
+    // show a zombie "running" badge — see reconcileOrphanedRunningSessions.
+    await reconcileOrphanedRunningSessions();
+    return { resumed: 0, failed: 0 };
+  }
   console.log(`[auto-resume] Found ${candidates.length} session(s) to resume`);
 
   let resumed = 0;
@@ -1169,8 +1176,58 @@ async function doAutoResume(): Promise<{ resumed: number; failed: number }> {
       console.error(`[auto-resume] Failed to resume ${c.id}:`, (err as Error).message);
     }
   }
+  // Sweep anything still marked running/resuming on disk that we didn't bring
+  // into the live registry — orphans we deliberately skipped or that failed to
+  // resume. Runs under the auto-resume lock so only one worker does it.
+  await reconcileOrphanedRunningSessions();
   console.log(`[auto-resume] Done: ${resumed} resumed, ${skipped} skipped (owned elsewhere), ${failed} failed`);
   return { resumed, failed };
+}
+
+// A session whose meta.json says finalState="running" (or "resuming") but
+// which is NOT in the live registry after the boot auto-resume pass is an
+// orphan: its prior worker died and we did not revive its agent. This happens
+// when the session was parked on a pending user decision at restart time
+// (AskUserQuestion / ExitPlanMode — excluded from auto-resume because the
+// in-memory card is gone), when it's a remote (Docker) session, when its SDK
+// transcript is missing, or when resume failed. Left as-is, the sidebar reads
+// finalState and shows a misleading "running" badge for a session with no live
+// agent, with a "pending" indicator for a card that no longer exists.
+//
+// Reconcile them to "stopped" so they read as cleanly resumable. The user's
+// next message routes through resumeSession (state "stopped" → resume path),
+// which re-injects a synthetic tool_result for any dangling tool_use (e.g. the
+// unanswered AskUserQuestion) before continuing — so no context is lost.
+async function reconcileOrphanedRunningSessions(): Promise<number> {
+  let dirents: import("node:fs").Dirent[];
+  try {
+    dirents = await fs.readdir(SESSIONS_ROOT, { withFileTypes: true });
+  } catch { return 0; }
+  let fixed = 0;
+  for (const d of dirents) {
+    if (!d.isDirectory() || registry.has(d.name)) continue;
+    const metaPath = path.join(SESSIONS_ROOT, d.name, "meta.json");
+    let meta: Record<string, unknown>;
+    try { meta = JSON.parse(await fs.readFile(metaPath, "utf8")); }
+    catch { continue; }
+    if (meta.finalState !== "running" && meta.finalState !== "resuming") continue;
+    // Don't touch a session another *live* worker owns (multi-worker Next.js):
+    // it's not in our registry but its owner is actively running it and will
+    // re-persist "running". Only a dead/own owner means a true orphan.
+    const ownerPid = typeof meta.ownerPid === "number" ? meta.ownerPid : null;
+    if (ownerPid !== null && ownerPid !== process.pid && isPidAlive(ownerPid)) continue;
+    meta.finalState = "stopped";
+    // The pending card was in-memory only and is gone; clear the flag so the
+    // sidebar doesn't show a "pending" badge on a stopped session.
+    meta.hasPendingPrompt = false;
+    // ownerPid points at the dead prior worker — drop it so it can't be
+    // mistaken for a live owner.
+    delete meta.ownerPid;
+    try { await fs.writeFile(metaPath, JSON.stringify(meta, null, 2)); fixed++; }
+    catch { /* best effort */ }
+  }
+  if (fixed > 0) console.log(`[auto-resume] reconciled ${fixed} orphaned running session(s) → stopped`);
+  return fixed;
 }
 
 export interface StartSessionParams {
