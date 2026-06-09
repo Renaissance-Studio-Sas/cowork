@@ -964,11 +964,17 @@ async function doRestoreSession(
     seq: history.length,
     streamingText: "",
     // A restored session has closed streams and a placeholder query, so the
-    // runtime state must be "stopped" regardless of what meta.json says —
+    // runtime state must be a terminal one regardless of what meta.json says —
     // sendInput dispatches by state, and only "stopped"/"error" routes through
     // resumeSession (which re-opens streams). If we left state as "idle" here,
     // the next user message would silently write to closed streams.
-    state: "stopped",
+    //
+    // Preserve a persisted "error" finalState: both "stopped" and "error" route
+    // through resumeSession identically, but the UI only offers the Retry button
+    // on "error". Collapsing it to "stopped" here is what made the Retry button
+    // vanish whenever an errored session fell out of the live registry (server
+    // restart, dev HMR reload, idle eviction) and was reloaded from disk.
+    state: meta.finalState === "error" ? "error" : "stopped",
     pendingPermissions,
     pendingQuestions,
     pendingCompletions,
