@@ -2453,6 +2453,7 @@ export async function interrupt(id: string): Promise<boolean> {
 // the newest model of each family, so this list stays current without pinning
 // dated IDs.
 const FALLBACK_CLAUDE_MODELS: AgentModelInfo[] = [
+  { value: "claude-fable-5", displayName: "Claude Fable 5", description: "Mythos-class — state-of-the-art capability; ~2× Opus pricing." },
   { value: "opus", displayName: "Claude Opus (latest)", description: "Most capable — best for complex, multi-step work." },
   { value: "sonnet", displayName: "Claude Sonnet (latest)", description: "Faster and cheaper; strong general coding." },
   { value: "haiku", displayName: "Claude Haiku (latest)", description: "Fastest and most economical for simple tasks." },
