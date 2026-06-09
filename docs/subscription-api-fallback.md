@@ -72,7 +72,9 @@ rate-limit events stream through and quota errors surface exactly as before.
 
 ## Config
 
-cowork server env (`.env.local`):
+cowork server env. **Put these in `.env`, not `.env.local`** — the Node dev
+server loads only `.env` (`process.loadEnvFile()` in `src/server/index.ts`), and
+reads it once at startup, so restart the dev server after changing them.
 
 | Var | Meaning |
 |---|---|
