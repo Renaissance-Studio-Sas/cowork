@@ -4,6 +4,7 @@ import { Link, usePathname, useRouter, useSearchParams } from "@/lib/navigation"
 import { useEffect, useState } from "react";
 import type { SessionSummaryDTO, WorkspaceDTO } from "@/lib/types";
 import { isPending, useWorkspace } from "@/lib/workspace-context";
+import { CLOUD_PREFIX } from "@/lib/sources";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { WorkingIndicator } from "./WorkingIndicator";
 import {
@@ -17,6 +18,7 @@ const COLLAPSED_KEY = "wb-workspaces-collapsed";
 const RECENT_COLLAPSED_KEY = "wb-recent-sessions-collapsed";
 const BACKLOG_COLLAPSED_KEY = "wb-backlog-sessions-collapsed";
 const ROOT_COLLAPSED_KEY = "wb-workspaces-section-collapsed";
+const CLOUD_COLLAPSED_KEY = "wb-cloud-workspaces-section-collapsed";
 
 // Key a workspace's collapsed-state in localStorage by its full slug-chain so
 // every node in the tree (top-level or nested) gets a unique entry.
@@ -48,6 +50,7 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
   // top-of-mind one, so it stays out of the way until the user expands it.
   const [backlogCollapsed, setBacklogCollapsed] = useState(true);
   const [rootCollapsed, setRootCollapsed] = useState(false);
+  const [cloudCollapsed, setCloudCollapsed] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [renaming, setRenaming] = useState<{ path: string[] } | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -69,6 +72,7 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
       // Default-collapsed: only expand if the user previously expanded it.
       setBacklogCollapsed(localStorage.getItem(BACKLOG_COLLAPSED_KEY) !== "false");
       setRootCollapsed(localStorage.getItem(ROOT_COLLAPSED_KEY) === "true");
+      setCloudCollapsed(localStorage.getItem(CLOUD_COLLAPSED_KEY) === "true");
     } catch { /* ignore */ }
   }, []);
 
@@ -96,10 +100,23 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
     try { localStorage.setItem(ROOT_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
   };
 
+  const updateCloudCollapsed = (value: boolean) => {
+    setCloudCollapsed(value);
+    try { localStorage.setItem(CLOUD_COLLAPSED_KEY, String(value)); } catch { /* ignore */ }
+  };
+
   const visibleWorkspaces = [...workspaces].sort((a, b) => {
     if (a.status !== b.status) return a.status === "active" ? -1 : 1;
     return a.slug.localeCompare(b.slug);
   });
+
+  // Split the flat list back out by source — the backend returns local then
+  // cloud workspaces in one array (see listWorkspaces in fs.ts). Each renders
+  // under its own foldable section header so the two roots stay visually
+  // distinct. Local is the primary tree (carries the global pending badge);
+  // cloud is its own self-contained directory.
+  const localWorkspaces = visibleWorkspaces.filter((w) => w.source !== "cloud");
+  const cloudWorkspaces = visibleWorkspaces.filter((w) => w.source === "cloud");
 
   // Session counts for a workspace by its slug-chain. Looks at every session
   // whose workspacePath matches this chain exactly (no descendants).
@@ -417,72 +434,172 @@ export function SidebarNav({ onNewWorkspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Workspaces */}
-        <div className="group flex items-center gap-1 px-1 py-1.5">
-          <button
-            onClick={() => updateRootCollapsed(!rootCollapsed)}
-            className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
-            title={rootCollapsed ? "Expand" : "Collapse"}
-          >
-            <svg
-              width="18" height="18" viewBox="0 0 24 24"
-              className={`text-[var(--muted)] transition-transform ${rootCollapsed ? "" : "rotate-90"}`}
-              fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-              aria-hidden
-            ><path d="M9 6l6 6-6 6" /></svg>
-          </button>
-          <span className="flex-1 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
-            Workspaces
-          </span>
-          {pendingCount > 0 && (
-            <span className="text-[10px] text-[var(--warn)] pulse whitespace-nowrap" title={`${pendingCount} pending session(s)`}>
-              ●{pendingCount}
-            </span>
-          )}
-          <span
-            role="button" tabIndex={0}
-            onClick={() => onNewWorkspace([])}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onNewWorkspace([]);
-              }
-            }}
-            className="text-[var(--muted)] hover:text-[var(--text)] text-[16px] leading-none px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--panel-2)] transition cursor-pointer"
-            title="New workspace"
-          >+</span>
-        </div>
-        {!rootCollapsed && visibleWorkspaces.length === 0 && (
-          <div className="px-3 py-4 text-[12.5px] text-[var(--muted)]">No workspaces yet.</div>
-        )}
+        {/* Local Workspaces — the user's repo tree (carries the global pending
+            badge). */}
+        <WorkspaceSection
+          label="Workspaces"
+          list={localWorkspaces}
+          isCollapsed={rootCollapsed}
+          onToggleCollapsed={updateRootCollapsed}
+          newParentPath={[]}
+          newTitle="New workspace"
+          emptyText="No workspaces yet."
+          pendingCount={pendingCount}
+          selectedPath={selectedPath}
+          collapsed={collapsed}
+          renaming={renaming}
+          renameValue={renameValue}
+          dragOver={dragOver}
+          sessionsAt={sessionsAt}
+          sessionsAtOrUnder={sessionsAtOrUnder}
+          onToggleNodeCollapsed={updateCollapsed}
+          onWorkspaceMenu={openWorkspaceMenu}
+          onNewChild={(parentPath) => onNewWorkspace(parentPath)}
+          onRenameValueChange={setRenameValue}
+          onRenameCommit={commitRename}
+          onRenameCancel={() => setRenaming(null)}
+          onDragOverPath={setDragOver}
+          onDropOnPath={moveWorkspaceTo}
+        />
 
-        {!rootCollapsed && visibleWorkspaces.map((ws) => (
-          <WorkspaceNode
-            key={ws.slug}
-            workspace={ws}
-            path={[ws.slug]}
-            depth={0}
-            selectedPath={selectedPath}
-            collapsed={collapsed}
-            renaming={renaming}
-            renameValue={renameValue}
-            dragOver={dragOver}
-            sessionsAt={sessionsAt}
-            sessionsAtOrUnder={sessionsAtOrUnder}
-            onToggleCollapsed={updateCollapsed}
-            onContextMenu={openWorkspaceMenu}
-            onNewChild={(parentPath) => onNewWorkspace(parentPath)}
-            onRenameValueChange={setRenameValue}
-            onRenameCommit={commitRename}
-            onRenameCancel={() => setRenaming(null)}
-            onDragOverPath={setDragOver}
-            onDropOnPath={moveWorkspaceTo}
-          />
-        ))}
+        {/* Cloud Workspaces — a separate, self-contained directory (see
+            CLOUD_WORKSPACES_DIR in fs.ts). New ones are created under the
+            `@cloud` source sentinel. */}
+        <WorkspaceSection
+          label="Cloud Workspaces"
+          list={cloudWorkspaces}
+          isCollapsed={cloudCollapsed}
+          onToggleCollapsed={updateCloudCollapsed}
+          newParentPath={[CLOUD_PREFIX]}
+          newTitle="New cloud workspace"
+          emptyText="No cloud workspaces yet."
+          selectedPath={selectedPath}
+          collapsed={collapsed}
+          renaming={renaming}
+          renameValue={renameValue}
+          dragOver={dragOver}
+          sessionsAt={sessionsAt}
+          sessionsAtOrUnder={sessionsAtOrUnder}
+          onToggleNodeCollapsed={updateCollapsed}
+          onWorkspaceMenu={openWorkspaceMenu}
+          onNewChild={(parentPath) => onNewWorkspace(parentPath)}
+          onRenameValueChange={setRenameValue}
+          onRenameCommit={commitRename}
+          onRenameCancel={() => setRenaming(null)}
+          onDragOverPath={setDragOver}
+          onDropOnPath={moveWorkspaceTo}
+        />
       </div>
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
     </aside>
+  );
+}
+
+interface WorkspaceSectionProps {
+  /** Section header label (rendered uppercase). */
+  label: string;
+  /** Top-level workspaces belonging to this source. */
+  list: WorkspaceDTO[];
+  /** Collapsed state of the whole section. */
+  isCollapsed: boolean;
+  onToggleCollapsed: (value: boolean) => void;
+  /** Parent path passed to "+" — `[]` for local, `[CLOUD_PREFIX]` for cloud. */
+  newParentPath: string[];
+  newTitle: string;
+  emptyText: string;
+  /** Pending-session badge shown by the header (local section only). */
+  pendingCount?: number;
+  // Passthrough to each WorkspaceNode.
+  selectedPath: string[];
+  collapsed: Record<string, boolean>;
+  renaming: { path: string[] } | null;
+  renameValue: string;
+  dragOver: string | null;
+  sessionsAt: (path: string[]) => SessionSummaryDTO[];
+  sessionsAtOrUnder: (path: string[]) => SessionSummaryDTO[];
+  onToggleNodeCollapsed: (path: string[], value: boolean) => void;
+  onWorkspaceMenu: (e: React.MouseEvent, path: string[]) => void;
+  onNewChild: (parentPath: string[]) => void;
+  onRenameValueChange: (v: string) => void;
+  onRenameCommit: () => void;
+  onRenameCancel: () => void;
+  onDragOverPath: (key: string | null) => void;
+  onDropOnPath: (fromPath: string[], toParentPath: string[]) => void;
+}
+
+// A foldable sidebar section grouping one source's top-level workspaces under a
+// header with a collapse toggle and a "new workspace" (+) action. Local and
+// cloud sources each render one of these (see SidebarNav).
+function WorkspaceSection({
+  label, list, isCollapsed, onToggleCollapsed, newParentPath, newTitle, emptyText,
+  pendingCount = 0, selectedPath, collapsed, renaming, renameValue, dragOver,
+  sessionsAt, sessionsAtOrUnder, onToggleNodeCollapsed, onWorkspaceMenu, onNewChild,
+  onRenameValueChange, onRenameCommit, onRenameCancel, onDragOverPath, onDropOnPath,
+}: WorkspaceSectionProps) {
+  return (
+    <>
+      <div className="group flex items-center gap-1 px-1 py-1.5">
+        <button
+          onClick={() => onToggleCollapsed(!isCollapsed)}
+          className="w-6 h-6 flex items-center justify-center rounded hover:bg-[var(--panel)] shrink-0"
+          title={isCollapsed ? "Expand" : "Collapse"}
+        >
+          <svg
+            width="18" height="18" viewBox="0 0 24 24"
+            className={`text-[var(--muted)] transition-transform ${isCollapsed ? "" : "rotate-90"}`}
+            fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+            aria-hidden
+          ><path d="M9 6l6 6-6 6" /></svg>
+        </button>
+        <span className="flex-1 text-[11px] uppercase tracking-wider font-semibold text-[var(--muted)]">
+          {label}
+        </span>
+        {pendingCount > 0 && (
+          <span className="text-[10px] text-[var(--warn)] pulse whitespace-nowrap" title={`${pendingCount} pending session(s)`}>
+            ●{pendingCount}
+          </span>
+        )}
+        <span
+          role="button" tabIndex={0}
+          onClick={() => onNewChild(newParentPath)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onNewChild(newParentPath);
+            }
+          }}
+          className="text-[var(--muted)] hover:text-[var(--text)] text-[16px] leading-none px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--panel-2)] transition cursor-pointer"
+          title={newTitle}
+        >+</span>
+      </div>
+      {!isCollapsed && list.length === 0 && (
+        <div className="px-3 py-4 text-[12.5px] text-[var(--muted)]">{emptyText}</div>
+      )}
+      {!isCollapsed && list.map((ws) => (
+        <WorkspaceNode
+          key={ws.path.join("/")}
+          workspace={ws}
+          path={ws.path}
+          depth={0}
+          selectedPath={selectedPath}
+          collapsed={collapsed}
+          renaming={renaming}
+          renameValue={renameValue}
+          dragOver={dragOver}
+          sessionsAt={sessionsAt}
+          sessionsAtOrUnder={sessionsAtOrUnder}
+          onToggleCollapsed={onToggleNodeCollapsed}
+          onContextMenu={onWorkspaceMenu}
+          onNewChild={onNewChild}
+          onRenameValueChange={onRenameValueChange}
+          onRenameCommit={onRenameCommit}
+          onRenameCancel={onRenameCancel}
+          onDragOverPath={onDragOverPath}
+          onDropOnPath={onDropOnPath}
+        />
+      ))}
+    </>
   );
 }
 
@@ -509,7 +626,9 @@ interface WorkspaceNodeProps {
 }
 
 // Recursive sidebar node: header row for this workspace + nested rows for its
-// children. Each level indents 12px so deep nesting reads cleanly. Drag-and-
+// children. Rows are indented 12px past their depth so even top-level
+// workspaces sit nested under their section header. Each level indents a
+// further 12px so deep nesting reads cleanly. Drag-and-
 // drop reparents a workspace under whichever node accepts the drop.
 function WorkspaceNode({
   workspace, path, depth, selectedPath, collapsed, renaming, renameValue, dragOver,
@@ -564,7 +683,7 @@ function WorkspaceNode({
             }
           } catch { /* ignore */ }
         }}
-        style={{ paddingLeft: depth * 12 }}
+        style={{ paddingLeft: 12 + depth * 12 }}
         className={`w-full flex items-center gap-1 px-1 py-1.5 rounded-md group transition cursor-pointer ${isDragOver ? "bg-[var(--accent-soft)] ring-2 ring-[var(--accent)]" : ""} ${isSelected ? "bg-[var(--panel-2)]" : "hover:bg-[var(--panel)]"}`}
         draggable={!isRenaming}
         onDragStart={(e) => {

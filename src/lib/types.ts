@@ -1,6 +1,12 @@
 // Shared types for the agent-workbench app
 
+import type { WorkspaceSource } from "./sources";
+
 export interface WorkspaceDTO {
+  // Which root this workspace lives in — "local" (<WORKSPACE_ROOT>/workspaces)
+  // or "cloud" (the separate cloud directory). Lets the sidebar split the tree
+  // into "Local workspaces" / "Cloud workspaces" sections.
+  source: WorkspaceSource;
   slug: string;
   folderName: string;
   // Full slug-chain from the root workspace down to this one (own slug

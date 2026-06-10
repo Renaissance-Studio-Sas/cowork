@@ -34,7 +34,8 @@ import {
   readSessionEvents,
   registerSessionLog,
 } from "./cloud-events";
-import { getWorkspace, workspaceDir, WORKSPACE_ROOT, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
+import { getWorkspace, workspaceDir, WORKSPACE_ROOT, CLOUD_WORKSPACES_DIR, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
+import { sourceOf } from "./sources";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
 import {
@@ -816,19 +817,20 @@ export async function listAllSessions(): Promise<SessionSummary[]> {
   return out;
 }
 
-// Read a historical session's events from the D1 cowork-sessions-marco table.
-// The workspacePath arg is used only for the workspace existence check —
-// events themselves are keyed solely by session id.
+// Read a historical session's events. Events are keyed SOLELY by session id
+// (the flat SESSIONS_ROOT), so `workspacePath` is vestigial here. We do NOT
+// gate on the workspace still existing: a session whose workspace was renamed,
+// moved, or deleted must keep its readable history — returning null because the
+// workspace lookup failed would silently blank the whole transcript. The real
+// "no such session" signal is a missing session dir, surfaced as null below.
 //
 // Pagination: offset is from the END (offset=0 = most recent `limit` events).
 export async function readSessionHistory(
-  workspacePath: string[],
+  _workspacePath: string[],
   id: string,
   limit?: number,
   offset: number = 0,
 ): Promise<{ events: unknown[]; total: number; hasMore: boolean } | null> {
-  const ws = await getWorkspace(workspacePath);
-  if (!ws) return null;
   const eventsPath = path.join(sessionDir(id), "events.jsonl");
   // Tell the file backend where this stopped session's log lives, then read.
   registerSessionLog(id, eventsPath);
@@ -877,15 +879,22 @@ async function doRestoreSession(
   const existing = registry.get(id);
   if (existing) return existing;
 
-  const ws = await getWorkspace(workspacePath);
-  if (!ws) return null;
+  // NOTE: we deliberately do NOT require the workspace to still exist. A
+  // session's history + meta are fully self-contained in its own folder, keyed
+  // by id; gating restore on getWorkspace() meant that renaming, moving, or
+  // deleting a workspace silently blanked the history of every session under
+  // it (the SSE stream would 404 and the chat panel render empty). The real
+  // "no such session" signal is a missing meta.json, handled below.
+  // Resuming such an orphaned session still validates the workspace (it needs
+  // one for prompt/MCP context — see doResumeSession), but VIEWING is allowed.
 
   // Sessions live flat in SESSIONS_ROOT — the directory no longer encodes
   // the workspace, only the session id. The workspace path comes from meta.
   const dir = sessionDir(id);
-  // The agent's runtime cwd is always the workspace root (see startSession
-  // comment). Stored on the RuntimeSession so resume keeps it consistent.
-  const cwd = WORKSPACE_ROOT;
+  // The agent's runtime cwd is the source root of its workspace (local →
+  // WORKSPACE_ROOT, cloud → cloud root; see cwdForWorkspace). Stored on the
+  // RuntimeSession so resume keeps it consistent.
+  const cwd = cwdForWorkspace(workspacePath);
 
   // Read meta.json
   const metaPath = path.join(dir, "meta.json");
@@ -1301,8 +1310,9 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
   // identity + path is supplied via the system prompt (see
   // sessions/prompts.ts). Session persistence (events.jsonl, meta.json) lives
   // in a flat SESSIONS_ROOT (see fs.ts) — meta.json carries the workspace
-  // path so the directory name doesn't need to encode it.
-  const cwd = WORKSPACE_ROOT;
+  // path so the directory name doesn't need to encode it. Local workspaces
+  // run at WORKSPACE_ROOT; cloud workspaces at the cloud root (cwdForWorkspace).
+  const cwd = cwdForWorkspace(p.workspacePath);
   const dir = sessionDir(id);
   await fs.mkdir(dir, { recursive: true });
 
@@ -2194,21 +2204,49 @@ export async function sendInputWithFiles(
   return true;
 }
 
-// Path to the SDK transcript jsonl for a given session ID at WORKSPACE_ROOT
-// (the cwd every session uses). Mirrors the Claude SDK's encoding scheme:
-// `~/.claude/projects/<cwd-with-slashes-replaced-by-dashes>/<sid>.jsonl`.
-function sdkTranscriptPath(sdkSessionId: string): string {
-  const encoded = WORKSPACE_ROOT.replaceAll("/", "-");
+// The agent cwd for a session, derived from its workspace's source: local
+// workspaces run at WORKSPACE_ROOT (so the repo's CLAUDE.md / skills / scripts
+// are in scope); cloud workspaces run at the cloud root (its own self-contained
+// tree + optional CLAUDE.md). Derived from the workspace path — never from a
+// session's stored cwd — so it's correct even for pre-refactor sessions.
+export function cwdForWorkspace(workspacePath: string[]): string {
+  return sourceOf(workspacePath) === "cloud" ? CLOUD_WORKSPACES_DIR : WORKSPACE_ROOT;
+}
+
+// Path to the SDK transcript jsonl for a given session ID. Mirrors the Claude
+// SDK's encoding scheme: `~/.claude/projects/<cwd-with-slashes-replaced-by-
+// dashes>/<sid>.jsonl`. The cwd is the session's actual run directory (the
+// source root), so cloud sessions resolve under their own encoded path.
+function sdkTranscriptPath(sdkSessionId: string, cwd: string): string {
+  const encoded = cwd.replaceAll("/", "-");
   return path.join(os.homedir(), ".claude", "projects", encoded, `${sdkSessionId}.jsonl`);
 }
 
-async function sdkTranscriptExists(sdkSessionId: string): Promise<boolean> {
+async function sdkTranscriptExists(sdkSessionId: string, cwd: string): Promise<boolean> {
   try {
-    await fs.access(sdkTranscriptPath(sdkSessionId));
+    await fs.access(sdkTranscriptPath(sdkSessionId, cwd));
     return true;
   } catch {
     return false;
   }
+}
+
+// Resolve the cwd whose encoded transcript dir actually holds this session's
+// jsonl, so resume reads from where the transcript really is. Prefer the
+// workspace-derived cwd, but fall back to WORKSPACE_ROOT: sessions whose
+// transcript was written before the cloud-cwd split ran under WORKSPACE_ROOT
+// regardless of source, and must keep resuming. Returns the matching cwd, or
+// null if no transcript is found (caller starts a fresh SDK conversation).
+async function resolveTranscriptCwd(
+  sdkSessionId: string,
+  preferredCwd: string,
+): Promise<string | null> {
+  const candidates =
+    preferredCwd === WORKSPACE_ROOT ? [WORKSPACE_ROOT] : [preferredCwd, WORKSPACE_ROOT];
+  for (const cwd of candidates) {
+    if (await sdkTranscriptExists(sdkSessionId, cwd)) return cwd;
+  }
+  return null;
 }
 
 // Resume a stopped session. Re-uses the SDK's `resume` mechanism when the
@@ -2284,7 +2322,16 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
   // those runtimes the on-disk check is a false alarm — skip it (no scary
   // "couldn't resume" notice, don't clear their session id).
   const isLocalSdkRuntime = s.runtime === "claude";
-  const canResume = isLocalSdkRuntime && !!s.sdkSessionId && (await sdkTranscriptExists(s.sdkSessionId));
+  // The cwd the agent runs at (source-derived). For resume we also confirm the
+  // SDK transcript is actually on disk under it — resolveTranscriptCwd returns
+  // the dir that holds it (falling back to WORKSPACE_ROOT for pre-split
+  // transcripts), or null if it's gone.
+  const agentCwd = cwdForWorkspace(s.workspacePath);
+  const resumeCwd =
+    isLocalSdkRuntime && s.sdkSessionId
+      ? await resolveTranscriptCwd(s.sdkSessionId, agentCwd)
+      : null;
+  const canResume = resumeCwd !== null;
   const lostTranscript = isLocalSdkRuntime && !!s.sdkSessionId && !canResume;
   if (lostTranscript) {
     s.sdkSessionId = null;
@@ -2354,10 +2401,10 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
     s.q = createAgentQuery(s.runtime, {
       prompt: s.input,
       options: {
-        // s.cwd is set to WORKSPACE_ROOT for new sessions; for old
-        // sessions resumed from disk, force-override since their stored
-        // cwd may be the workspace folder (pre-refactor).
-        cwd: WORKSPACE_ROOT,
+        // Run at the source-derived cwd (never the session's stored cwd,
+        // which may be a pre-refactor workspace folder). When resuming, use
+        // the dir that actually holds the transcript so the SDK finds it.
+        cwd: resumeCwd ?? agentCwd,
         ...(canResume ? { resume: s.sdkSessionId! } : {}),
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { relocateSessionsForWorkspace } from "./sessions";
+import { CLOUD_PREFIX, sourceOf, type WorkspaceSource } from "./sources";
 
 // Workspace root: the user's own repo / folder that contains `workspaces/`
 // plus any shared resources (CLAUDE.md, skills/, scripts/, etc.). Agents get
@@ -26,6 +27,46 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
 // Child workspaces are sibling subfolders that themselves contain a
 // workspace.json — they're elided from artifact listings.
 export const WORKSPACES_DIR = path.join(WORKSPACE_ROOT, "workspaces");
+
+// Second workspace root: "cloud" workspaces live in a directory *outside*
+// WORKSPACE_ROOT. Defaults to ~/Documents/Cowork/Cloud; override with
+// COWORK_CLOUD_DIR. Unlike local workspaces (which sit inside the user's repo),
+// cloud workspaces form their own self-contained tree with their own optional
+// CLAUDE.md — agent sessions started in a cloud workspace run with cwd set to
+// this directory (see cwdForWorkspace in src/lib/sessions.ts).
+export const CLOUD_WORKSPACES_DIR = process.env.COWORK_CLOUD_DIR
+  ? path.resolve(process.env.COWORK_CLOUD_DIR)
+  : path.join(process.env.HOME || os.homedir(), "Documents", "Cowork", "Cloud");
+
+// On-disk root directory for each source. A workspace's public slug-chain
+// carries the `@cloud` sentinel as its first segment for cloud workspaces (see
+// src/lib/sources.ts); `folderPath` stays relative to the source root with no
+// sentinel, so the sentinel never appears on disk.
+const SOURCE_DIRS: Record<WorkspaceSource, string> = {
+  local: WORKSPACES_DIR,
+  cloud: CLOUD_WORKSPACES_DIR,
+};
+
+// Split a public slug-chain into its source + the inner chain relative to that
+// source's root (sentinel stripped). `["@cloud","A","B"]` → cloud / ["A","B"];
+// `["A","B"]` → local / ["A","B"]; `["@cloud"]` → cloud / [] (the cloud root).
+function splitSource(slugPath: string[]): { source: WorkspaceSource; inner: string[] } {
+  const source = sourceOf(slugPath);
+  const inner = source === "cloud" ? slugPath.slice(1) : slugPath;
+  return { source, inner };
+}
+
+// Re-add the source sentinel to an inner chain to form the public slug-chain.
+function publicPath(source: WorkspaceSource, inner: string[]): string[] {
+  return source === "cloud" ? [CLOUD_PREFIX, ...inner] : inner;
+}
+
+// On-disk root directory for a source. Defaults to the local root when the
+// source is missing/unknown — workspaces built before the `source` field was
+// threaded through (or by callers that don't set it) are local by definition.
+function rootDirFor(source: WorkspaceSource | undefined): string {
+  return SOURCE_DIRS[source ?? "local"] ?? WORKSPACES_DIR;
+}
 
 // Flat directory holding ALL session data — one folder per session id, no
 // per-workspace nesting. Each session's meta.json records its own workspace
@@ -67,6 +108,9 @@ export interface Brief {
 // `C` whose ancestor chain is `["A", "B"]`. The repo's old 2-level
 // convention (projects → tasks) becomes one of many possible depths.
 export interface Workspace {
+  // Which root this workspace lives in. Derivable from `path[0]` but stored
+  // explicitly so callers (and the DTO) don't have to re-parse the sentinel.
+  source: WorkspaceSource;
   slug: string;            // bare slug, without any archived suffix
   folderName: string;      // basename on disk (may carry ARCHIVED_SUFFIX)
   // Full slug-chain from the top-level workspace down to and including this
@@ -86,9 +130,10 @@ export interface Workspace {
   children: Workspace[];
 }
 
-// Resolved on-disk directory for a workspace.
+// Resolved on-disk directory for a workspace. `folderPath` is relative to the
+// workspace's own source root (no sentinel), so resolution is just root + path.
 export function workspaceDir(ws: Workspace): string {
-  return path.join(WORKSPACES_DIR, ...ws.folderPath);
+  return path.join(rootDirFor(ws.source), ...ws.folderPath);
 }
 
 // Legacy prefix pattern. Folders created before the switch to the
@@ -158,6 +203,9 @@ function sanitizeName(s: string): string {
   while (out.toLowerCase().endsWith(ARCHIVED_SUFFIX.toLowerCase())) {
     out = out.slice(0, -ARCHIVED_SUFFIX.length).trimEnd();
   }
+  // Reserve the `@cloud` source sentinel — a real workspace can't be named it,
+  // or it would shadow the cloud root in slug-chain resolution.
+  if (out.toLowerCase() === CLOUD_PREFIX.toLowerCase()) out = "";
   return out.slice(0, 80);
 }
 
@@ -212,11 +260,17 @@ function nowIso(): string {
 }
 
 export async function ensureWorkspace(): Promise<void> {
-  await fs.mkdir(WORKSPACES_DIR, { recursive: true });
-  // Bootstrap a default `Inbox/` catch-all ONLY when the workspace has no
+  // Make sure both source roots exist so each section is browsable. The cloud
+  // root may be a brand-new directory the user just pointed us at.
+  await Promise.all([
+    fs.mkdir(WORKSPACES_DIR, { recursive: true }),
+    fs.mkdir(CLOUD_WORKSPACES_DIR, { recursive: true }),
+  ]);
+  // Bootstrap a default `Inbox/` catch-all ONLY when the LOCAL root has no
   // workspaces at all (fresh install). Once the user has any workspace, we
   // never auto-create — they're free to rename, delete, or replace the
-  // catch-all.
+  // catch-all. The cloud root is left empty (the user maps it to their own
+  // directory) and just shows "No cloud workspaces yet." when empty.
   let hasAny = false;
   try {
     const entries = await fs.readdir(WORKSPACES_DIR, { withFileTypes: true });
@@ -233,15 +287,17 @@ export async function ensureWorkspace(): Promise<void> {
   });
 }
 
-// Recursively list workspaces under a parent folder on disk. `parentFolderPath`
-// is the list of ancestor folder names (with archived suffix preserved where
-// applicable) leading down to the directory whose children we're listing —
-// empty for the top-level.
+// Recursively list workspaces under a parent folder on disk. `rootDir` is the
+// source root the listing is anchored to; `parentFolderPath` is the list of
+// ancestor folder names (root-relative, with archived suffix preserved) and
+// `parentSlugPath` is the matching PUBLIC slug-chain (carrying the `@cloud`
+// sentinel for the cloud source) — both empty/`[CLOUD_PREFIX]` at the top.
 async function listChildrenAt(
+  rootDir: string,
   parentFolderPath: string[],
   parentSlugPath: string[],
 ): Promise<Workspace[]> {
-  const dir = path.join(WORKSPACES_DIR, ...parentFolderPath);
+  const dir = path.join(rootDir, ...parentFolderPath);
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -255,14 +311,15 @@ async function listChildrenAt(
     const parsed = parseFolderName(e.name);
     const folderPath = [...parentFolderPath, e.name];
     const slugPath = [...parentSlugPath, parsed.slug];
-    const wsDir = path.join(WORKSPACES_DIR, ...folderPath);
+    const wsDir = path.join(rootDir, ...folderPath);
     // Authoritative workspace check: presence of workspace.json. Without it
     // a subfolder is an artifact directory (e.g. a `files/` legacy dir, an
     // exported assets bundle, etc.) and must not appear in the workspace tree.
     if (!(await dirIsWorkspace(wsDir))) continue;
     const brief = await readBrief(path.join(wsDir, WORKSPACE_BRIEF_FILENAME));
-    const children = await listChildrenAt(folderPath, slugPath);
+    const children = await listChildrenAt(rootDir, folderPath, slugPath);
     out.push({
+      source: sourceOf(slugPath),
       slug: parsed.slug,
       folderName: e.name,
       path: slugPath,
@@ -282,10 +339,18 @@ async function listChildrenAt(
   return deduped;
 }
 
-// All top-level workspaces with their child trees materialized.
+// Top-level workspaces (with child trees) for a single source.
+async function listSource(source: WorkspaceSource): Promise<Workspace[]> {
+  return listChildrenAt(rootDirFor(source), [], publicPath(source, []));
+}
+
+// All top-level workspaces from BOTH sources, with their child trees
+// materialized. Local first, then cloud — the sidebar splits them back out by
+// `source` into its "Local workspaces" / "Cloud workspaces" sections.
 export async function listWorkspaces(): Promise<Workspace[]> {
   await ensureWorkspace();
-  return listChildrenAt([], []);
+  const [local, cloud] = await Promise.all([listSource("local"), listSource("cloud")]);
+  return [...local, ...cloud];
 }
 
 // Walk a workspace tree looking for the workspace at `slugPath`. Slug
@@ -304,11 +369,16 @@ function findInTree(tree: Workspace[], slugPath: string[]): Workspace | null {
 }
 
 // Resolve a workspace by its slug-chain — e.g. `["HR", "pay-contractors"]`
-// returns what used to be task `pay-contractors` of project `HR`. A single-
-// element path returns a top-level workspace.
+// returns what used to be task `pay-contractors` of project `HR`, and
+// `["@cloud","Inbox"]` the cloud workspace "Inbox". We resolve only the
+// relevant source's tree and match against the inner (sentinel-stripped) chain,
+// since the tree nodes carry bare slugs. An empty inner chain (`["@cloud"]`
+// alone, or `[]`) has no workspace to return.
 export async function getWorkspace(slugPath: string[]): Promise<Workspace | null> {
-  const tree = await listWorkspaces();
-  return findInTree(tree, slugPath);
+  const { source, inner } = splitSource(slugPath);
+  if (inner.length === 0) return null;
+  const tree = await listSource(source);
+  return findInTree(tree, inner);
 }
 
 // Create a workspace at `parentPath` (empty for a top-level workspace) with
@@ -321,8 +391,12 @@ export async function createWorkspace(
   const clean = sanitizeName(slug);
   if (!clean) throw new Error("invalid name");
 
-  let parentDir = WORKSPACES_DIR;
-  if (parentPath.length > 0) {
+  // `parentPath` is a PUBLIC chain. Split off the source: an empty inner chain
+  // (`[]` → local root, or `["@cloud"]` → cloud root) creates a top-level
+  // workspace in that source; otherwise it's a child of the named parent.
+  const { source, inner } = splitSource(parentPath);
+  let parentDir = rootDirFor(source);
+  if (inner.length > 0) {
     const parent = await getWorkspace(parentPath);
     if (!parent) throw new Error(`unknown parent workspace ${parentPath.join("/")}`);
     parentDir = workspaceDir(parent);
@@ -336,7 +410,7 @@ export async function createWorkspace(
     details: brief.details ?? "",
     createdAt: brief.createdAt ?? nowIso(),
   });
-  const created = await getWorkspace([...parentPath, clean]);
+  const created = await getWorkspace(publicPath(source, [...inner, clean]));
   if (!created) throw new Error("created workspace not found");
   return created;
 }
@@ -417,8 +491,18 @@ export async function moveWorkspace(
     throw new Error("cannot move a workspace under itself");
   }
 
-  let destDir = WORKSPACES_DIR;
-  if (toParentPath.length > 0) {
+  // Local and cloud roots are different (possibly cross-device) filesystems —
+  // fs.rename across them fails (EXDEV), and the slug-chain identity would
+  // change source mid-move. Disallow it; the user can recreate instead.
+  if (sourceOf(slugPath) !== sourceOf(toParentPath)) {
+    throw new Error("cannot move between local and cloud workspaces");
+  }
+
+  // Destination directory: the source root when targeting a top-level slot
+  // (`[]` local or `["@cloud"]` cloud), else the named parent's folder.
+  const { source: destSource, inner: destInner } = splitSource(toParentPath);
+  let destDir = rootDirFor(destSource);
+  if (destInner.length > 0) {
     const dest = await getWorkspace(toParentPath);
     if (!dest) throw new Error(`unknown destination ${toParentPath.join("/")}`);
     destDir = workspaceDir(dest);
@@ -427,8 +511,8 @@ export async function moveWorkspace(
   // Slug collision resolution — sibling workspaces (any status) at the
   // destination define the namespace.
   let finalSlug = ws.slug;
-  const siblings = toParentPath.length === 0
-    ? await listWorkspaces()
+  const siblings = destInner.length === 0
+    ? await listSource(destSource)
     : (await getWorkspace(toParentPath))!.children;
   if (siblings.find((s) => s.slug === finalSlug)) {
     let i = 2;
