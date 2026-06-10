@@ -19,7 +19,7 @@ import type { SessionState } from "../session-state-machine";
 // talks to the cloud-agent worker on Cloudflare (app.rowads.studio/api/agent/*)
 // and authenticates via the rw CLI's stored session cookie. Stored in
 // meta.json so resume after a server restart picks the same runtime.
-export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
+export type SessionRuntime = "claude" | "gemini" | "cloud";
 
 // Thinking effort level. Mirrors the Claude Agent SDK's EffortLevel
 // (see @anthropic-ai/claude-agent-sdk). Passed to query() as `effort` and

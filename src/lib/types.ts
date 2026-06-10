@@ -14,7 +14,7 @@ export interface WorkspaceDTO {
   children: WorkspaceDTO[];
 }
 
-export type SessionRuntime = "claude" | "gemini" | "remote" | "cloud";
+export type SessionRuntime = "claude" | "gemini" | "cloud";
 
 // Thinking effort level. Matches @anthropic-ai/claude-agent-sdk's EffortLevel
 // and the Claude Code CLI's /model command labels.

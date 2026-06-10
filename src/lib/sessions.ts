@@ -647,9 +647,9 @@ export function getSessionQuery(id: string): AgentQuery | null {
   return s.q;
 }
 
-// Forward a POST to the underlying runner of a remote session. Used by API
+// Forward a POST to the underlying runner of a cloud session. Used by API
 // routes that need to talk to runner-only endpoints (e.g. /auth-code for the
-// inline /login flow). Returns null if the session isn't a remote one or has
+// inline /login flow). Returns null if the session isn't a cloud one or has
 // no live runner — the route then 404s.
 export async function relayRemoteRunner(
   sessionId: string,
@@ -657,8 +657,8 @@ export async function relayRemoteRunner(
   body: unknown,
 ): Promise<{ status: number; body: unknown } | null> {
   const s = registry.get(sessionId);
-  if (!s || (s.runtime !== "remote" && s.runtime !== "cloud") || !s.q) return null;
-  // RemoteAgentQuery + CloudAgentQuery both expose relayToRunner(); other
+  if (!s || s.runtime !== "cloud" || !s.q) return null;
+  // CloudAgentQuery exposes relayToRunner(); other
   // AgentQuery shapes don't. Duck-type the method off the AgentQuery so we
   // don't need a runtime cast.
   const q = s.q as unknown as {
@@ -685,16 +685,8 @@ export async function relayRemoteRunner(
 function createAgentQuery(
   runtime: SessionRuntime,
   opts: Record<string, unknown>,
-  context?: { workspacePath: string[] },
 ): AgentQuery {
-  // The remote runtime needs the workspace identity to forward to the
-  // controller (the cwd alone is just the workspace root). Inject here so
-  // callers don't have to remember which runtimes need which extras.
-  const withRemote =
-    runtime === "remote" && context
-      ? { ...opts, remote: { workspacePath: context.workspacePath } }
-      : opts;
-  return getRuntime(runtime).query(withRemote as unknown as AgentQueryOptions);
+  return getRuntime(runtime).query(opts as unknown as AgentQueryOptions);
 }
 
 // Debug helper to inspect the session registry
@@ -1087,9 +1079,6 @@ async function findRunningSessions(): Promise<Array<{ workspacePath: string[]; i
       // "resuming" = the previous worker died mid-resume (set right before
       // spawn, cleared on first event). Without this case we'd strand any
       // session whose autoResume itself was interrupted.
-      // Remote (Docker) sessions are also skipped: their container is
-      // orphaned after a cowork restart and auto-resume would spawn a fresh
-      // container per session at boot — slow, noisy, and dependent on Docker.
       // Sessions parked on a user decision (pending permission / question /
       // completion at restart time) are also skipped: the parked tool call
       // lived in-memory only and is gone, so resuming would just blow away
@@ -1101,7 +1090,6 @@ async function findRunningSessions(): Promise<Array<{ workspacePath: string[]; i
         resumable
         && !meta.hasPendingPrompt
         && meta.sdkSessionId
-        && meta.runtime !== "remote"
         && Array.isArray(meta.workspace)
         && meta.workspace.length > 0
       ) {
@@ -1411,9 +1399,7 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
       ...(p.model ? { model: p.model } : {}),
       ...(p.effort ? { effort: p.effort } : {}),
     },
-    // RemoteRuntime needs the workspace to provision a container against the
-    // right folder. Other runtimes ignore this block.
-  }, { workspacePath: p.workspacePath });
+  });
 
   const now = new Date();
   const session: RuntimeSession = {
@@ -2384,7 +2370,7 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
         ...(s.model ? { model: s.model } : {}),
         ...(s.effort ? { effort: s.effort } : {}),
       },
-    }, { workspacePath: s.workspacePath });
+    });
 
     // Check if there are pending tool_uses without tool_results.
     // If so, inject synthetic tool_results first so the conversation is valid.

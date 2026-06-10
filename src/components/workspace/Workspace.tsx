@@ -1448,7 +1448,6 @@ function SessionsColumn(props: SessionsColumnProps) {
           >
             <option value="claude">Claude</option>
             <option value="gemini">Gemini</option>
-            <option value="remote">Remote (Docker)</option>
             <option value="cloud">Claude (Cloud)</option>
           </select>
           <span className="text-[10.5px] text-[var(--muted)]">Effort:</span>
@@ -1457,7 +1456,7 @@ function SessionsColumn(props: SessionsColumnProps) {
             onChange={(e) => onEffort(e.target.value as EffortLevel | "")}
             className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1.5 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer disabled:opacity-50"
             title="Thinking effort (Claude only)"
-            disabled={runtime !== "claude" && runtime !== "remote"}
+            disabled={runtime !== "claude"}
           >
             <option value="">default</option>
             <option value="low">low</option>
