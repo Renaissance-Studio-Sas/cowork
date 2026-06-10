@@ -122,28 +122,59 @@ function fallbackMaxUsd(): number | null {
   return Number.isFinite(v) && v > 0 ? v : null;
 }
 
-// Per-user cowork cloud-drive (Cowork shared workspace mounted at /home/cowork
-// inside the cloud-agent container). The name is derived from the caller email
-// so each user gets a stable, private workspace: marco@rowads.studio →
-// `cowork-marco`. Must satisfy the cloud-drive NAME_RE (1-64 chars, [A-Za-z0-9_-]).
-function coworkWorkspaceName(email: string): string {
+// Per-user cloud-drives. Names are derived from the caller email so each user
+// gets stable, private drives: marco@rowads.studio → `cowork-marco` (workspace
+// tree, mounted at /workspace/<email>/ inside the cloud-agent container) and
+// `home-marco` (the agent's $HOME at /home/agent — credentials/profile that
+// travel across sessions). Must satisfy the cloud-drive NAME_RE (1-64 chars,
+// [A-Za-z0-9_-]).
+function emailSlug(email: string): string {
   const local = email.split("@")[0] ?? email;
-  const slug = local.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^-+|-+$/g, "");
-  return `cowork-${slug || "user"}`;
+  return local.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^-+|-+$/g, "") || "user";
+}
+function coworkWorkspaceName(email: string): string {
+  return `cowork-${emailSlug(email)}`;
+}
+function homeWorkspaceName(email: string): string {
+  return `home-${emailSlug(email)}`;
 }
 
 // Default CLAUDE.md seeded into a freshly-created cowork workspace. This is the
 // shared workspace's project memory (distinct from the agent-operations CLAUDE.md
 // baked into the cloud-agent image) — the user edits it over time and it lives
-// at /home/cowork/CLAUDE.md inside the container.
+// at /workspace/<email>/CLAUDE.md inside the container.
 const DEFAULT_COWORK_CLAUDE_MD = `# Cowork workspace
 
-This is your shared Cowork workspace, mounted at \`/home/cowork\` in every cloud
-agent you launch. Files here are live-synced and persist across sessions.
+This is your personal Cowork workspace, mounted at \`/workspace/<your-email>/\`
+in every cloud agent you launch. Files here are live-synced and persist across
+sessions.
 
-Use this file to capture standing context for your agents: who you are, what
-you're working on, conventions to follow. Everything in this folder is shared
-with each agent and survives restarts.
+Use this file for conventions agents should follow when working in this
+workspace. Standing context about YOU (who you are, preferences, current
+focus) belongs in Context.md next to this file.
+`;
+
+// Default Context.md seeded next to CLAUDE.md. The cloud-agent image's
+// orientation doc tells agents to read /workspace/<email>/Context.md at
+// session start and keep it current. (cloud-agent also seeds this in-container
+// for pre-existing drives; this seed covers fresh drives without a session.)
+const DEFAULT_CONTEXT_MD = (email: string) => `# Context — ${email}
+
+Standing context about this user. Agents: read this at the start of a session,
+and append/update it when you learn something durable (role, preferences,
+ongoing projects, conventions). Keep it short — this is a briefing, not a log.
+
+## Who
+
+(not filled in yet — ask, or fill in as you learn)
+
+## Preferences
+
+-
+
+## Current focus
+
+-
 `;
 
 interface CloudDriveWorkspace {
@@ -151,23 +182,19 @@ interface CloudDriveWorkspace {
   name: string;
 }
 
-// Ensure the caller's per-user cowork cloud-drive exists, creating + seeding it
-// on first use, and return its workspace id (for `workspaceId` on session create).
-// Idempotent: if the workspace already exists we just return its id. Failures are
-// surfaced to the caller, which treats a missing workspaceId as "no shared mount"
-// (the container still boots with an empty /home/cowork — non-fatal).
-async function ensureCoworkWorkspace(gateway: string): Promise<string> {
-  const { email } = getCredentials();
-  if (!email) {
-    throw new Error(
-      "cloud runtime: no caller email in ~/.rw/credentials.json — cannot derive the cowork workspace name. Run `rw auth login`.",
-    );
-  }
-  const name = coworkWorkspaceName(email);
+// Ensure a cloud-drive named `name` exists (creating + seeding it on first
+// use) and return its id. Idempotent: if the drive already exists we just
+// return its id. Failures are surfaced to the caller, which treats a missing
+// id as "no mount" (the container still boots — non-fatal).
+async function ensureDrive(
+  gateway: string,
+  name: string,
+  seeds: Array<{ name: string; content: string }>,
+): Promise<string> {
   const base = `${gateway}/api/cloud-drive`;
   const headers = { "content-type": "application/json", cookie: authHeader() };
 
-  // 1. Look for an existing workspace by name (list is already ACL-scoped to us).
+  // 1. Look for an existing drive by name (list is already ACL-scoped to us).
   const listRes = await fetch(`${base}/workspaces`, { headers });
   if (!listRes.ok) {
     throw new Error(`cloud-drive GET /workspaces failed (${listRes.status}): ${await listRes.text().catch(() => "")}`);
@@ -195,30 +222,59 @@ async function ensureCoworkWorkspace(gateway: string): Promise<string> {
   }
   const created = (await createRes.json()) as { id: string; root: string };
 
-  // 3. Seed CLAUDE.md: create an empty doc node, then write v0 → v1 via CAS.
-  //    Best-effort — a seed failure leaves a usable (empty) workspace, so we
+  // 3. Seed files: create an empty doc node, then write v0 → v1 via CAS.
+  //    Best-effort — a seed failure leaves a usable (empty) drive, so we
   //    log and continue rather than failing the whole session boot.
-  try {
-    const docRes = await fetch(`${base}/workspaces/${created.id}/docs`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ parent_id: created.root, name: "CLAUDE.md" }),
-    });
-    if (docRes.ok) {
-      const doc = (await docRes.json()) as { id: string };
-      await fetch(`${base}/workspaces/${created.id}/nodes/${doc.id}/content`, {
-        method: "PUT",
-        headers: { "content-type": "text/markdown", cookie: authHeader(), "If-Match": '"0"' },
-        body: DEFAULT_COWORK_CLAUDE_MD,
+  for (const seed of seeds) {
+    try {
+      const docRes = await fetch(`${base}/workspaces/${created.id}/docs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ parent_id: created.root, name: seed.name }),
       });
-    } else {
-      console.warn(`[cloud] seed CLAUDE.md: doc create failed (${docRes.status})`);
+      if (docRes.ok) {
+        const doc = (await docRes.json()) as { id: string };
+        await fetch(`${base}/workspaces/${created.id}/nodes/${doc.id}/content`, {
+          method: "PUT",
+          headers: { "content-type": "text/markdown", cookie: authHeader(), "If-Match": '"0"' },
+          body: seed.content,
+        });
+      } else {
+        console.warn(`[cloud] seed ${seed.name}: doc create failed (${docRes.status})`);
+      }
+    } catch (e) {
+      console.warn(`[cloud] seed ${seed.name} failed: ${(e as Error).message}`);
     }
-  } catch (e) {
-    console.warn(`[cloud] seed CLAUDE.md failed: ${(e as Error).message}`);
   }
 
   return created.id;
+}
+
+function requireEmail(): string {
+  const { email } = getCredentials();
+  if (!email) {
+    throw new Error(
+      "cloud runtime: no caller email in ~/.rw/credentials.json — cannot derive cloud-drive names. Run `rw auth login`.",
+    );
+  }
+  return email;
+}
+
+// The caller's cowork workspace drive (mounted at /workspace/<email>/).
+async function ensureCoworkWorkspace(gateway: string): Promise<string> {
+  const email = requireEmail();
+  return ensureDrive(gateway, coworkWorkspaceName(email), [
+    { name: "CLAUDE.md", content: DEFAULT_COWORK_CLAUDE_MD },
+    { name: "Context.md", content: DEFAULT_CONTEXT_MD(email) },
+  ]);
+}
+
+// The caller's home drive (mounted at /home/agent, the agent's $HOME, with
+// `.claude` + caches carved out by the cloud-agent's sync daemon). Created
+// empty — it fills up organically as agents log into tools (~/.ssh,
+// ~/.config/gh, ~/.config/gcloud, …).
+async function ensureHomeWorkspace(gateway: string): Promise<string> {
+  return ensureDrive(gateway, homeWorkspaceName(requireEmail()), []);
 }
 
 // Strip non-serializable fields from cowork's options blob. Same shape as
@@ -526,16 +582,24 @@ class CloudAgentQuery implements AgentQuery {
         return session;
       }
 
-      // Ensure the caller's per-user cowork cloud-drive exists (create + seed
-      // on first use) and attach it at /home/cowork via `workspaceId`. The
-      // cloud-agent warm-restores it from the workspace snapshot on container
-      // start. Non-fatal: if provisioning fails we boot without a shared mount
-      // (empty /home/cowork) rather than blocking the session.
+      // Ensure the caller's per-user cloud-drives exist (create + seed on
+      // first use): the cowork workspace drive attaches at
+      // /workspace/<email>/ via `workspaceId`, and the home drive at
+      // /home/agent (the agent's $HOME — persistent credentials/profile) via
+      // `homeWorkspaceId`. The cloud-agent warm-restores both from their
+      // snapshots on container start. Non-fatal: if provisioning fails we
+      // boot without that mount rather than blocking the session.
       let workspaceId: string | undefined;
+      let homeWorkspaceId: string | undefined;
       try {
         workspaceId = await ensureCoworkWorkspace(gateway);
       } catch (e) {
-        console.warn(`[cloud] cowork workspace provisioning failed, booting without /home/cowork: ${(e as Error).message}`);
+        console.warn(`[cloud] cowork workspace provisioning failed, booting without /workspace mount: ${(e as Error).message}`);
+      }
+      try {
+        homeWorkspaceId = await ensureHomeWorkspace(gateway);
+      } catch (e) {
+        console.warn(`[cloud] home drive provisioning failed, booting with ephemeral $HOME: ${(e as Error).message}`);
       }
 
       const r = await fetch(`${gateway}/api/agent/sessions`, {
@@ -550,6 +614,7 @@ class CloudAgentQuery implements AgentQuery {
           message: firstMessage,
           workbenchTools: wb?.specs ?? [],
           ...(workspaceId ? { workspaceId } : {}),
+          ...(homeWorkspaceId ? { homeWorkspaceId } : {}),
           ...(fallbackApiKey() ? { fallbackApiKey: fallbackApiKey() } : {}),
           ...(fallbackApiKey() && fallbackMaxUsd() ? { fallbackMaxUsd: fallbackMaxUsd() } : {}),
         }),
