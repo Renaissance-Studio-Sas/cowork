@@ -8,9 +8,26 @@ import {
   getWorkspace,
   WORKSPACE_BRIEF_FILENAME,
   WORKSPACE_ROOT,
+  WORKSPACES_DIR,
   workspaceDir,
   type Brief,
 } from "../fs";
+
+// Operating-context file loaded into every session's system prompt verbatim at
+// session start (and re-applied on resume). Lives at the root of the local
+// workspaces dir — `<COWORK_LOCAL_DIR>/Context.md` (e.g. ~/Documents/Cowork/
+// Local/Context.md). Holds the standing context (people, accounts, conventions)
+// the agent should always have, so we inject it rather than asking it to read.
+const CONTEXT_FILENAME = "Context.md";
+
+async function readOperatingContext(): Promise<string | null> {
+  try {
+    const raw = (await fs.readFile(path.join(WORKSPACES_DIR, CONTEXT_FILENAME), "utf8")).trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null; // no Context.md — nothing to inject
+  }
+}
 
 // Build the per-session system prompt. Always returns a prompt (never
 // undefined) so the agent always knows what workspace it's working in and
@@ -89,6 +106,22 @@ turns out wrong later, call \`set_session_title\` to override it.
 
   const apiPath = workspacePath.map(encodeURIComponent).join("/");
 
+  // Standing operating context (Local/Context.md), injected verbatim so it's
+  // always in scope without the agent having to discover and read it.
+  const operatingContext = await readOperatingContext();
+  const contextBlock = operatingContext
+    ? `## Operating context
+
+The following is your standing operating context (people, accounts, tools, and
+conventions). It is always in scope — treat it as authoritative background.
+
+${operatingContext}
+
+---
+
+`
+    : "";
+
   const append = `
 You are working in the **cowork agent workbench** on ${where}.
 
@@ -96,7 +129,7 @@ Your working directory is the workspace root. Repo-level conventions are
 in **CLAUDE.md** / **GEMINI.md** at the workspace root — read those if you
 haven't already.
 
-${pathLine}
+${contextBlock}${pathLine}
 
 When you write output files for this workspace, put them directly in the
 workspace folder shown above (artifacts live alongside the workspace.json
