@@ -9,7 +9,7 @@ import { FileDropZone, AttachmentPreview, filesToAttachments, type FileAttachmen
 import { WorkingIndicator } from "./WorkingIndicator";
 import { useStickyDraft } from "./chat/useStickyDraft";
 import { MessageStream } from "./chat/MessageStream";
-import { extractText, isVisibleSDKMessage } from "./chat/utils";
+import { extractText, isVisibleSDKMessage, currentToolLabel } from "./chat/utils";
 import { Markdown } from "./chat/Markdown";
 import {
   PlanApprovalCard,
@@ -961,12 +961,17 @@ export function Chat({ session, onChange, onBack, brief, embedded = false, openA
           {messages.length === 0 && !streamingText && pendingSends.length === 0 && (
             <div className="text-[var(--muted)] text-[13px]">Waiting for the agent to start…</div>
           )}
-          {isWorking && !streamingText && (
-            <div className="flex items-center gap-2 text-[13px] text-[var(--accent)] pl-1">
-              <WorkingIndicator size={14} />
-              <span>Working<span className="dots" aria-hidden /></span>
-            </div>
-          )}
+          {isWorking && !streamingText && (() => {
+            const workingLabel = currentToolLabel(messages) ?? "Working";
+            return (
+              <div className="flex items-center gap-2 text-[13px] text-[var(--accent)] pl-1">
+                <WorkingIndicator size={14} />
+                <span className="truncate max-w-[680px]" title={workingLabel}>
+                  {workingLabel}<span className="dots" aria-hidden />
+                </span>
+              </div>
+            );
+          })()}
         </div>
       </div>
 

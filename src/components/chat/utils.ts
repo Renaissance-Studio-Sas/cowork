@@ -1,6 +1,8 @@
 // Small helpers shared across the chat UI. Kept dependency-light so they can
 // be imported by leaf components without dragging the whole render pipeline.
 
+import type { Part } from "./types";
+
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -96,6 +98,51 @@ export function isVisibleSDKMessage(event: unknown): boolean {
     return false;
   }
   return false;
+}
+
+// Label for the "Working…" indicator. While the agent is working with no
+// streamed text, the last message is the assistant's in-flight tool_use (its
+// tool_result hasn't echoed back yet) — so we can name the tool that's
+// currently running. Prefer the per-call `description` the model wrote for
+// this call (Bash, Agent/Task, etc. carry one); otherwise fall back to a
+// prettified tool name. Returns null when no tool is in flight (the agent is
+// thinking between steps), so the caller shows the generic "Working".
+export function currentToolLabel(messages: unknown[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as {
+      type?: string;
+      parent_tool_use_id?: string | null;
+      message?: { content?: unknown; model?: string };
+    };
+    // Subagent turns render in their own transcript, not the parent chat.
+    if (m.parent_tool_use_id) continue;
+    // Synthetic assistant messages are SDK status carriers, not real output.
+    if (m.type === "assistant" && m.message?.model === "<synthetic>") continue;
+    // The first "real" message from the end decides: only an assistant message
+    // whose trailing part is a tool_use means a tool is still in flight. A
+    // user/result/text message means the agent has moved on → generic label.
+    if (m.type !== "assistant") return null;
+    const parts = (m.message?.content as Part[] | undefined) ?? [];
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const p = parts[j];
+      if (p.type === "text" && typeof p.text === "string" && p.text.trim()) return null;
+      if (p.type === "tool_use") {
+        const desc = (p.input as { description?: unknown } | undefined)?.description;
+        if (typeof desc === "string" && desc.trim()) return desc.trim();
+        return prettifyToolName(p.name as string);
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+// `mcp__workbench-comments__list_comments` → `list comments`; `WebFetch` →
+// `WebFetch`. A readable fallback when a tool_use carries no description.
+function prettifyToolName(name: string | undefined): string {
+  if (!name) return "Working";
+  const mcp = name.match(/^mcp__.+__(.+)$/);
+  return (mcp ? mcp[1] : name).replace(/_/g, " ");
 }
 
 export function sluggifyName(s: string): string {
