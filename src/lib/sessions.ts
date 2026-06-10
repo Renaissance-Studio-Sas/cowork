@@ -34,7 +34,7 @@ import {
   readSessionEvents,
   registerSessionLog,
 } from "./cloud-events";
-import { getWorkspace, workspaceDir, WORKSPACE_ROOT, CLOUD_WORKSPACES_DIR, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
+import { getWorkspace, workspaceDir, extraAgentDirs, WORKSPACE_ROOT, CLOUD_WORKSPACES_DIR, SESSIONS_ROOT, sessionDir, reconcileSessionsOnDisk } from "./fs";
 import { sourceOf } from "./sources";
 import { buildContextSystemPrompt, generateSessionLabel } from "./sessions/prompts";
 import { extractTodosFromMessages } from "./todos";
@@ -1392,6 +1392,9 @@ export async function startSession(p: StartSessionParams): Promise<RuntimeSessio
     prompt: input,
     options: {
       cwd,
+      // Grant the relocated local workspaces dir when it lives outside cwd
+      // (COWORK_LOCAL_DIR); empty in the default in-repo layout.
+      additionalDirectories: extraAgentDirs(),
       // Localhost personal use — full trust by default. We still listen for
       // end_turn to flip awaiting_input.
       permissionMode: p.permissionMode ?? "bypassPermissions",
@@ -2405,6 +2408,9 @@ async function doResumeSession(s: RuntimeSession, newMessage: string, caller: st
         // which may be a pre-refactor workspace folder). When resuming, use
         // the dir that actually holds the transcript so the SDK finds it.
         cwd: resumeCwd ?? agentCwd,
+        // See startSession — grant the relocated local workspaces dir when it
+        // lives outside cwd (COWORK_LOCAL_DIR); empty in the default layout.
+        additionalDirectories: extraAgentDirs(),
         ...(canResume ? { resume: s.sdkSessionId! } : {}),
         permissionMode: s.permissionMode,
         settingSources: ["project", "user"],

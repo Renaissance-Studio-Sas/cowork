@@ -26,7 +26,15 @@ export const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT
 // Artifacts live as direct children of the workspace dir (no `files/` wrapper).
 // Child workspaces are sibling subfolders that themselves contain a
 // workspace.json — they're elided from artifact listings.
-export const WORKSPACES_DIR = path.join(WORKSPACE_ROOT, "workspaces");
+//
+// Defaults to <WORKSPACE_ROOT>/workspaces (workspaces live inside the repo);
+// override with COWORK_LOCAL_DIR to relocate them anywhere on disk (e.g.
+// ~/Documents/Cowork/Local). When relocated outside WORKSPACE_ROOT, agent
+// sessions still run with cwd = WORKSPACE_ROOT (for the repo's CLAUDE.md /
+// skills / scripts) and reach their artifacts via extraAgentDirs() below.
+export const WORKSPACES_DIR = process.env.COWORK_LOCAL_DIR
+  ? path.resolve(process.env.COWORK_LOCAL_DIR)
+  : path.join(WORKSPACE_ROOT, "workspaces");
 
 // Second workspace root: "cloud" workspaces live in a directory *outside*
 // WORKSPACE_ROOT. Defaults to ~/Documents/Cowork/Cloud; override with
@@ -134,6 +142,17 @@ export interface Workspace {
 // workspace's own source root (no sentinel), so resolution is just root + path.
 export function workspaceDir(ws: Workspace): string {
   return path.join(rootDirFor(ws.source), ...ws.folderPath);
+}
+
+// Directories an agent needs granted beyond its cwd. Local sessions run with
+// cwd = WORKSPACE_ROOT (so the repo's CLAUDE.md / skills / scripts are in
+// scope); when COWORK_LOCAL_DIR relocates the local workspaces dir outside the
+// repo, the agent also needs access to that dir to read/write its artifacts.
+// Returns [] in the default layout (workspaces inside WORKSPACE_ROOT), so it's
+// a no-op unless the dir was actually moved.
+export function extraAgentDirs(): string[] {
+  const rel = path.relative(WORKSPACE_ROOT, WORKSPACES_DIR);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel)) ? [] : [WORKSPACES_DIR];
 }
 
 // Legacy prefix pattern. Folders created before the switch to the

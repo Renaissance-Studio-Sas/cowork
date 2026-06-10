@@ -23,6 +23,14 @@ import {
 // where `projects/<workspace-path>/` is reachable. We tell the agent the
 // EXPLICIT relative path to the workspace folder so file operations go to
 // the right place.
+// A workspace path the agent can use directly from its cwd (WORKSPACE_ROOT):
+// the relative path when the target is inside the repo, else the absolute path
+// (avoids fragile `../`-escaping hints when COWORK_LOCAL_DIR is outside it).
+function pathHintFor(absDir: string): string {
+  const rel = path.relative(WORKSPACE_ROOT, absDir);
+  return rel.startsWith("..") || path.isAbsolute(rel) ? absDir : rel;
+}
+
 export async function buildContextSystemPrompt(
   workspacePath: string[],
   currentTitle?: string,
@@ -35,18 +43,22 @@ export async function buildContextSystemPrompt(
   const ancestors: Array<{ label: string; relPath: string; brief: Brief | null }> = [];
   let folderRel: string | null = null;
   if (ws) {
-    folderRel = path.relative(WORKSPACE_ROOT, workspaceDir(ws));
+    // Path the agent should use to reach the workspace from its cwd
+    // (WORKSPACE_ROOT). Relative when the workspace dir lives inside the repo;
+    // absolute when COWORK_LOCAL_DIR has relocated it outside (a `../`-escaping
+    // relative path would be fragile, so hand the agent the absolute path).
+    folderRel = pathHintFor(workspaceDir(ws));
     // Walk down the slug chain to read each ancestor's brief in turn — gives
     // the agent the full breadcrumb context, not just the leaf.
     for (let i = 1; i <= workspacePath.length; i++) {
       const partial = workspacePath.slice(0, i);
       const node = await getWorkspace(partial).catch(() => null);
       if (!node) continue;
-      const rel = path.relative(WORKSPACE_ROOT, workspaceDir(node));
-      const brief = await readBriefIfExists(path.join(WORKSPACE_ROOT, rel, WORKSPACE_BRIEF_FILENAME));
+      const absNode = workspaceDir(node);
+      const brief = await readBriefIfExists(path.join(absNode, WORKSPACE_BRIEF_FILENAME));
       ancestors.push({
         label: partial.join(" > "),
-        relPath: path.join(rel, WORKSPACE_BRIEF_FILENAME),
+        relPath: path.join(pathHintFor(absNode), WORKSPACE_BRIEF_FILENAME),
         brief,
       });
     }
@@ -56,7 +68,7 @@ export async function buildContextSystemPrompt(
   const where = `workspace **${breadcrumb}**`;
 
   const pathLine = folderRel
-    ? `Workspace folder (relative to workspace root): \`${folderRel}/\``
+    ? `Workspace folder (path is relative to your working directory unless absolute): \`${folderRel}/\``
     : `Workspace folder: (unknown — workspace ${breadcrumb} not found on disk)`;
 
   // One brief block per ancestor, top-down.
