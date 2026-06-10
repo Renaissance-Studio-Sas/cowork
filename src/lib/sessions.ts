@@ -1539,6 +1539,23 @@ function backoffDelay(attempt: number): number {
   return Math.min(2000 * Math.pow(2, attempt), 32000);
 }
 
+// The CLI acknowledges control requests (set_model / apply_flag_settings for
+// effort, and other slash-command plumbing) by injecting a synthetic `user`
+// message whose content is a `<local-command-stdout>…</local-command-stdout>`
+// (or `…-stderr…`) wrapper — e.g. "Set model to claude-fable-5". These are NOT
+// turn boundaries: a real turn is driven by sendInput/resumeSession, which set
+// "running" before pumping. Treating the echo as a turn-start flips an idle
+// session to "running" with no `result` to ever bring it back, leaving it
+// stuck "working" after a model/effort switch. Detect it so pumpEvents can skip
+// the state transition (the message still flows to history; the client renders
+// the model/effort switch as a small inline note — see MessageStream.tsx).
+function isLocalCommandEcho(msg: SDKMessage): boolean {
+  if ((msg as { type?: string }).type !== "user") return false;
+  const content = (msg as { message?: { content?: unknown } }).message?.content;
+  return typeof content === "string"
+    && /^<local-command-(?:stdout|stderr)>[\s\S]*<\/local-command-(?:stdout|stderr)>$/.test(content);
+}
+
 // Re-derive the todo list from the FULL in-memory history and emit a `todos`
 // event when it changes. Deriving over the complete history (not a paginated
 // window) is the whole point — it keeps the task panel coherent no matter how
@@ -1724,8 +1741,13 @@ async function pumpEvents(s: RuntimeSession) {
         }
       } else if (msg.type === "assistant" || msg.type === "user") {
         // Buffered in-flight messages arriving after an interrupt must not
-        // resurrect "running" over the user's stop.
-        if (s.state !== "running" && !s.interrupted) setState(s, "running");
+        // resurrect "running" over the user's stop. A local-command echo
+        // (e.g. the "Set model to …" ack the CLI injects after a model/effort
+        // switch) is not a turn boundary either — flipping to "running" here
+        // would strand an idle session as "working" with no result to clear it.
+        if (s.state !== "running" && !s.interrupted && !isLocalCommandEcho(msg)) {
+          setState(s, "running");
+        }
       }
     }
     // Query completed successfully — reset retry counter
