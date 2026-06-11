@@ -5,6 +5,12 @@ import { useRouter } from "@/lib/navigation";
 import { handleComposerEnter, handleComposerPaste } from "@/lib/composer";
 import { encodeWorkspacePath, workspaceSessionRoute } from "@/lib/routes";
 
+interface ModelInfoLite {
+  value: string;
+  displayName: string;
+  description?: string;
+}
+
 function sluggify(s: string): string {
   // The folder name *is* the display name — preserve case + spaces, strip
   // only filesystem-unsafe chars. Server-side sanitizeName does the same.
@@ -242,6 +248,25 @@ function KickoffShell({
   const [draft, setDraft] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Optional model pin chosen before the session starts. "" = runtime default.
+  const [models, setModels] = useState<ModelInfoLite[]>([]);
+  const [model, setModel] = useState("");
+
+  // Load the models the new session can start on. Empty list → hide the picker.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/models");
+        if (!r.ok) return;
+        const data = (await r.json()) as { models?: ModelInfoLite[] };
+        if (!cancelled) setModels(data.models ?? []);
+      } catch {
+        /* leave the picker hidden on failure */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const send = async () => {
     const text = draft.trim();
@@ -252,7 +277,7 @@ function KickoffShell({
       const r = await fetch("/api/plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildBody(text)),
+        body: JSON.stringify({ ...buildBody(text), ...(model ? { model } : {}) }),
       });
       const j = await r.json();
       const workspacePath: string[] | undefined = j.workspacePath;
@@ -278,6 +303,22 @@ function KickoffShell({
       footer={
         <>
           <button onClick={onSwitch} className="mr-auto text-[12.5px] text-[var(--accent)] hover:underline">{switchLabel}</button>
+          {models.length > 0 && (
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              title="Model for this session"
+              className="font-mono text-[12px] bg-[var(--panel)] border border-[var(--border)] rounded-lg px-2 py-2 outline-none focus:border-[var(--accent)] cursor-pointer max-w-[200px]"
+              style={{ color: "var(--text-soft)" }}
+            >
+              <option value="">Default model</option>
+              {models.map((m) => (
+                <option key={m.value} value={m.value} title={m.description}>
+                  {m.displayName}
+                </option>
+              ))}
+            </select>
+          )}
           <button onClick={onClose} className="text-[13px] text-[var(--text-soft)] px-3 py-2 hover:bg-[var(--panel-2)] rounded-lg">Cancel</button>
         </>
       }

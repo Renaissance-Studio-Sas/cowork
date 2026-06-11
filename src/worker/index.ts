@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { type ProxyBindings } from "./lib/proxy";
+import { proxy, type ProxyBindings } from "./lib/proxy";
 import { comments } from "./routes/comments";
 import { workspace } from "./routes/workspace";
 import { files } from "./routes/files";
@@ -30,6 +30,10 @@ type Bindings = ProxyBindings & {
 const app = new Hono<{ Bindings: Bindings }>();
 
 app.get("/api/health", (c) => c.json({ ok: true, service: "cowork" }));
+
+// Models for the new-session composer's picker — forwarded to the backend's
+// static list (mirrors src/server/app.ts).
+app.get("/api/models", proxy);
 
 app.route("/api/comments", comments);
 app.route("/api/workspace", workspace);

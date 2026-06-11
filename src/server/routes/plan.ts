@@ -28,6 +28,10 @@ plan.post("/", async (c) => {
 
   try {
     const parentPath: string[] | undefined = Array.isArray(body.parent) ? body.parent : undefined;
+    // Optional model pin chosen in the composer; ignore non-strings / blanks so
+    // the runtime default applies.
+    const model: string | undefined =
+      typeof body.model === "string" && body.model.trim() ? body.model : undefined;
 
     // Nested-workspace planning: parent exists; the session lives in it.
     if (parentPath && parentPath.length > 0) {
@@ -39,6 +43,7 @@ plan.post("/", async (c) => {
         workspacePath: parentPath,
         firstMessage: body.message,
         planning: true,
+        model,
       });
       return c.json({ id: s.id, workspacePath: parentPath });
     }
@@ -53,6 +58,7 @@ plan.post("/", async (c) => {
       workspacePath: stub.path,
       firstMessage: body.message,
       planning: true,
+      model,
     });
     return c.json({ id: s.id, workspacePath: stub.path });
   } catch (err) {

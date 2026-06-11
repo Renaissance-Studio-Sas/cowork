@@ -2537,6 +2537,14 @@ const FALLBACK_CLAUDE_MODELS: AgentModelInfo[] = [
   { value: "haiku", displayName: "Claude Haiku (latest)", description: "Fastest and most economical for simple tasks." },
 ];
 
+// The model list offered before a session exists (the new-session composer's
+// picker). No agent process is running yet, so we serve the same static Claude
+// fallback used for idle sessions — the aliases resolve to the newest model of
+// each family, so this stays current without pinning dated IDs.
+export function listDefaultModels(): AgentModelInfo[] {
+  return FALLBACK_CLAUDE_MODELS;
+}
+
 export async function listSessionModels(id: string): Promise<AgentModelInfo[]> {
   const s = registry.get(id);
   if (s) {
