@@ -24,6 +24,13 @@ import {
 // Shared types and helpers
 // ---------------------------------------------------------------------------
 
+// A switchable model as served by GET /api/models (the pre-session list).
+interface ModelInfoLite {
+  value: string;
+  displayName: string;
+  description?: string;
+}
+
 const PAGE_SIZE = 20;
 const MIN_COLUMN_FRACTION = 0.2;
 const MAX_COLUMN_FRACTION = 0.8;
@@ -557,8 +564,27 @@ export function Workspace({ workspacePath }: WorkspaceProps) {
   const [starting, setStarting] = useState(false);
   const [runtime, setRuntime] = useState<SessionRuntime>("claude");
   const [effort, setEffort] = useState<EffortLevel | "">("");
+  // Optional model pin for the new session. "" = runtime default. The list is
+  // the same static Claude fallback the new-workspace composer offers.
+  const [model, setModel] = useState("");
+  const [models, setModels] = useState<ModelInfoLite[]>([]);
   const [newAttachments, setNewAttachments] = useState<FileAttachment[]>([]);
   const [startError, setStartError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/models");
+        if (!r.ok) return;
+        const data = (await r.json()) as { models?: ModelInfoLite[] };
+        if (!cancelled) setModels(data.models ?? []);
+      } catch {
+        /* leave the picker hidden on failure */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const addNewAttachments = useCallback((files: FileAttachment[]) => {
     setNewAttachments((prev) => [...prev, ...files]);
@@ -607,6 +633,7 @@ export function Workspace({ workspacePath }: WorkspaceProps) {
         body: JSON.stringify({
           message: draft.trim() || "(attached files)",
           runtime,
+          ...(model && runtime !== "gemini" ? { model } : {}),
           ...(effort ? { effort } : {}),
           ...(artifactExpanded ? { openArtifact: artifactPath } : {}),
           ...(uploadedFiles.length > 0 ? { files: uploadedFiles } : {}),
@@ -828,6 +855,9 @@ export function Workspace({ workspacePath }: WorkspaceProps) {
             onRuntime={setRuntime}
             effort={effort}
             onEffort={setEffort}
+            model={model}
+            onModel={setModel}
+            models={models}
           />
         }
       />
@@ -1182,6 +1212,9 @@ interface SessionsColumnProps {
   onRuntime: (r: SessionRuntime) => void;
   effort: EffortLevel | "";
   onEffort: (e: EffortLevel | "") => void;
+  model: string;
+  onModel: (m: string) => void;
+  models: ModelInfoLite[];
 }
 
 function SessionsColumn(props: SessionsColumnProps) {
@@ -1193,6 +1226,7 @@ function SessionsColumn(props: SessionsColumnProps) {
     draft, onDraft, onStart, starting,
     attachments, onAttach, onRemoveAttachment, startError, onStartError,
     runtime, onRuntime, effort, onEffort,
+    model, onModel, models,
   } = props;
 
   const [showAllSessions, setShowAllSessions] = useState(false);
@@ -1450,6 +1484,23 @@ function SessionsColumn(props: SessionsColumnProps) {
             <option value="gemini">Gemini</option>
             <option value="cloud">Claude (Cloud)</option>
           </select>
+          {models.length > 0 && (
+            <>
+              <span className="text-[10.5px] text-[var(--muted)]">Model:</span>
+              <select
+                value={model}
+                onChange={(e) => onModel(e.target.value)}
+                className="text-[10.5px] bg-transparent text-[var(--muted)] border border-[var(--border)] rounded px-1.5 py-0.5 outline-none focus:border-[var(--accent)] focus:text-[var(--text)] cursor-pointer disabled:opacity-50"
+                title="Model (Claude only)"
+                disabled={runtime === "gemini"}
+              >
+                <option value="">default</option>
+                {models.map((m) => (
+                  <option key={m.value} value={m.value} title={m.description}>{m.displayName}</option>
+                ))}
+              </select>
+            </>
+          )}
           <span className="text-[10.5px] text-[var(--muted)]">Effort:</span>
           <select
             value={effort}
